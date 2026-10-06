@@ -1,0 +1,17 @@
+[package]
+name = "kegon"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A native, Git-native terminal workspace, written in Rust."
+repository = "https://github.com/motoki-kentaro/Kegon"
+publish = false
+
+[dependencies]
+iced = { version = "0.14", features = ["svg"] }
+# Decodes the embedded application icon for the window.
+ico = "0.4"
+
+[build-dependencies]
+# Embeds the application icon into the Windows executable (see build.rs).
+winresource = "0.1"
