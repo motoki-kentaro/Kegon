@@ -87,11 +87,20 @@ To keep the scope focused, Kegon intentionally does **not** aim to be:
 
 Kegon is at the **very beginning** of development.
 
-- There is no working application yet.
-- The technology stack, including the choice of GUI, terminal emulation, PTY, and Git libraries, is **not yet decided**.
+- A proof-of-concept window exists. It shows the workbench layout (Activity Bar, Side Bar, terminal tab strip), but only as placeholders. No terminal, File Explorer, Search, or Git functionality is implemented yet.
+- The GUI toolkit has been chosen for the proof of concept: [iced](https://github.com/iced-rs/iced). See [docs/architecture/gui-stack.md](docs/architecture/gui-stack.md) for the reasoning.
+- The terminal emulation, PTY, and Git libraries are **not yet decided**.
 - The design described in this README may change as development progresses.
 
 This README serves as a statement of intent for the project.
+
+### Running the proof of concept
+
+Requires a recent stable Rust toolchain.
+
+```sh
+cargo run
+```
 
 ## About the name
 
