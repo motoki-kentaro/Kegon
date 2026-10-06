@@ -3,13 +3,22 @@
 
 mod app;
 mod app_icon;
+mod cli;
+mod i18n;
 mod icons;
 mod workbench;
 
 use app::Kegon;
 
 fn main() -> iced::Result {
-    iced::application(Kegon::default, Kegon::update, Kegon::view)
+    let (options, warnings) = cli::parse(std::env::args().skip(1));
+    for warning in warnings {
+        eprintln!("kegon: {warning}");
+    }
+
+    let locale = i18n::resolve(options.locale.as_deref(), i18n::os_preferences());
+
+    iced::application(move || Kegon::new(locale), Kegon::update, Kegon::view)
         .title(Kegon::title)
         .subscription(Kegon::subscription)
         .theme(|_: &Kegon| iced::Theme::Dark)

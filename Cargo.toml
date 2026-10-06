@@ -11,7 +11,15 @@ publish = false
 iced = { version = "0.14", features = ["svg"] }
 # Decodes the embedded application icon for the window.
 ico = "0.4"
+# Localization: Fluent bundles, locale tags, and the OS locale (see docs/architecture/i18n.md).
+fluent-bundle = "0.16"
+unic-langid = "0.9"
+sys-locale = "0.3"
 
 [build-dependencies]
 # Embeds the application icon into the Windows executable (see build.rs).
 winresource = "0.1"
+
+[dev-dependencies]
+# Lists the message IDs in a Fluent resource, for the i18n completeness tests.
+fluent-syntax = "0.12"

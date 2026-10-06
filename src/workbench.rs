@@ -22,24 +22,6 @@ pub enum ActivityItem {
 impl ActivityItem {
     /// All Activity Bar entries, in display order (top to bottom).
     pub const ALL: [Self; 3] = [Self::Explorer, Self::Search, Self::Git];
-
-    /// Human-readable name, used for tooltips and accessibility.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Explorer => "File Explorer",
-            Self::Search => "Search",
-            Self::Git => "Git",
-        }
-    }
-
-    /// Heading shown at the top of the Side Bar.
-    pub fn side_bar_title(self) -> &'static str {
-        match self {
-            Self::Explorer => "EXPLORER",
-            Self::Search => "SEARCH",
-            Self::Git => "SOURCE CONTROL",
-        }
-    }
 }
 
 /// Identifies a terminal tab independently of its position in the strip.
@@ -48,12 +30,12 @@ pub struct TabId(u64);
 
 /// A tab in the terminal tab strip.
 ///
-/// For now a tab is only a title. It is expected to own a terminal session
-/// once PTY support exists.
+/// For now a tab is only an identity. It is expected to own a terminal
+/// session once PTY support exists. The model holds no display text: the UI
+/// labels the tab with a localized default title.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalTab {
     pub id: TabId,
-    pub title: String,
 }
 
 /// The terminal tab strip.
@@ -68,10 +50,7 @@ pub struct TerminalTabs {
 impl TerminalTabs {
     fn new() -> Self {
         Self {
-            tabs: vec![TerminalTab {
-                id: TabId(0),
-                title: String::from("Terminal"),
-            }],
+            tabs: vec![TerminalTab { id: TabId(0) }],
             active: 0,
         }
     }
@@ -163,21 +142,34 @@ mod tests {
     fn explorer_is_selected_initially() {
         let workbench = Workbench::default();
         assert_eq!(workbench.active_activity(), ActivityItem::Explorer);
-        assert_eq!(workbench.active_activity().side_bar_title(), "EXPLORER");
     }
 
     #[test]
-    fn selecting_an_activity_changes_the_side_bar_title() {
+    fn selecting_an_activity_changes_the_active_activity() {
         let mut workbench = Workbench::default();
 
         workbench.select_activity(ActivityItem::Search);
-        assert_eq!(workbench.active_activity().side_bar_title(), "SEARCH");
+        assert_eq!(workbench.active_activity(), ActivityItem::Search);
 
         workbench.select_activity(ActivityItem::Git);
-        assert_eq!(
-            workbench.active_activity().side_bar_title(),
-            "SOURCE CONTROL"
-        );
+        assert_eq!(workbench.active_activity(), ActivityItem::Git);
+    }
+
+    /// The model must stay localization-neutral: display text belongs to the
+    /// UI layer and is resolved through the localizer. This guards against
+    /// string literals or i18n imports creeping into the model.
+    #[test]
+    fn model_holds_no_display_text() {
+        let source = include_str!("workbench.rs");
+        let model = &source[..source.find("#[cfg(test)]").expect("test module")];
+        let model_lines = model
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"));
+
+        for line in model_lines {
+            assert!(!line.contains('"'), "string literal in model: {line}");
+            assert!(!line.contains("i18n"), "i18n dependency in model: {line}");
+        }
     }
 
     #[test]
@@ -204,7 +196,6 @@ mod tests {
         let tabs = workbench.terminal_tabs();
 
         assert_eq!(tabs.iter().count(), 1);
-        assert_eq!(tabs.active().title, "Terminal");
         assert!(tabs.is_active(tabs.active().id));
     }
 
