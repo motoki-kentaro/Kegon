@@ -89,6 +89,7 @@ Kegon is at the **very beginning** of development.
 
 - A proof-of-concept window exists. It shows the workbench layout (Activity Bar, Side Bar, terminal tab strip), but only as placeholders. No terminal, File Explorer, Search, or Git functionality is implemented yet.
 - The GUI toolkit has been chosen for the proof of concept: [iced](https://github.com/iced-rs/iced). See [docs/architecture/gui-stack.md](docs/architecture/gui-stack.md) for the reasoning.
+- The UI is available in English (`en-US`) and Japanese (`ja-JP`). By default it follows the OS language. See [docs/architecture/i18n.md](docs/architecture/i18n.md).
 - The terminal emulation, PTY, and Git libraries are **not yet decided**.
 - The design described in this README may change as development progresses.
 
@@ -100,6 +101,13 @@ Requires a recent stable Rust toolchain.
 
 ```sh
 cargo run
+```
+
+To override the UI language:
+
+```sh
+cargo run -- --locale ja-JP
+cargo run -- --locale en-US
 ```
 
 ## About the name

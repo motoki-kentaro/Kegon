@@ -6,6 +6,7 @@ use iced::{
     Border, Center, Color, Element, Event, Fill, Font, Subscription, Theme, event, font, mouse,
 };
 
+use crate::i18n::{Locale, Localizer, MessageKey};
 use crate::icons::{ICON_SIZE, activity_icon};
 use crate::workbench::{ActivityItem, TabId, Workbench};
 
@@ -44,8 +45,10 @@ pub enum Message {
     SashReleased,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Kegon {
+    /// Fixed for the lifetime of the application; chosen at startup.
+    localizer: Localizer,
     workbench: Workbench,
     /// Whether the Side Bar sash is being dragged. This is transient
     /// interaction state, so it lives here rather than in [`Workbench`].
@@ -57,6 +60,16 @@ pub struct Kegon {
 }
 
 impl Kegon {
+    pub fn new(locale: Locale) -> Self {
+        Self {
+            localizer: Localizer::new(locale),
+            workbench: Workbench::default(),
+            resizing_side_bar: false,
+            hovered_activity: None,
+        }
+    }
+
+    /// The window title: the product name, which is not translated.
     pub fn title(&self) -> String {
         String::from("Kegon")
     }
@@ -166,7 +179,8 @@ impl Kegon {
                 .on_enter(Message::ActivityHovered(item))
                 .on_exit(Message::ActivityUnhovered(item));
 
-            tooltip(entry, tooltip_label(item.label()), tooltip::Position::Right).into()
+            let label = self.localizer.text(activity_label(item));
+            tooltip(entry, tooltip_label(label), tooltip::Position::Right).into()
         });
 
         container(column(items))
@@ -177,16 +191,10 @@ impl Kegon {
     }
 
     fn side_bar(&self) -> Element<'_, Message> {
-        let item = self.workbench.active_activity();
-
-        let placeholder = match item {
-            ActivityItem::Explorer => "File Explorer is not implemented yet.",
-            ActivityItem::Search => "Project-wide search is not implemented yet.",
-            ActivityItem::Git => "Git integration is not implemented yet.",
-        };
+        let (title, placeholder) = side_bar_text(self.workbench.active_activity());
 
         let header = container(
-            text(item.side_bar_title())
+            text(self.localizer.text(title))
                 .size(11)
                 .font(Font {
                     weight: font::Weight::Bold,
@@ -201,7 +209,7 @@ impl Kegon {
         let content = column![
             header,
             container(
-                text(placeholder)
+                text(self.localizer.text(placeholder))
                     .size(UI_TEXT_SIZE)
                     .color(palette::TEXT_MUTED)
             )
@@ -242,15 +250,11 @@ impl Kegon {
     fn main_area(&self) -> Element<'_, Message> {
         let tab_strip = self.tab_strip();
 
-        let active = self.workbench.terminal_tabs().active();
         let placeholder = column![
-            text(format!("{} (placeholder)", active.title))
+            text(self.localizer.text(MessageKey::MainPlaceholderTitle))
                 .size(UI_TEXT_SIZE + 2.0)
                 .color(palette::TEXT),
-            text("Terminal sessions are not implemented yet.")
-                .size(UI_TEXT_SIZE)
-                .color(palette::TEXT_MUTED),
-            text("ターミナルはまだ実装されていません。")
+            text(self.localizer.text(MessageKey::MainPlaceholderBody))
                 .size(UI_TEXT_SIZE)
                 .color(palette::TEXT_MUTED),
         ]
@@ -269,9 +273,10 @@ impl Kegon {
 
         let tab_buttons = tabs.iter().map(|tab| {
             let is_active = tabs.is_active(tab.id);
+            let title = self.localizer.text(MessageKey::TerminalTabDefaultTitle);
 
             button(
-                container(text(&tab.title).size(UI_TEXT_SIZE))
+                container(text(title).size(UI_TEXT_SIZE))
                     .height(Fill)
                     .align_y(Center),
             )
@@ -283,7 +288,8 @@ impl Kegon {
         });
 
         // Creating sessions is out of scope for now: the button has no
-        // `on_press`, which also renders it as disabled.
+        // `on_press`, which also renders it as disabled. The "+" is a symbol,
+        // not text, so it is not localized.
         let new_tab = tooltip(
             button(container(text("+").size(16)).center(Fill))
                 .width(TAB_STRIP_HEIGHT)
@@ -293,7 +299,7 @@ impl Kegon {
                     text_color: palette::TEXT_MUTED,
                     ..button::Style::default()
                 }),
-            tooltip_label("New Terminal (not implemented yet)"),
+            tooltip_label(self.localizer.text(MessageKey::TerminalNewTabTooltip)),
             tooltip::Position::Bottom,
         );
 
@@ -362,7 +368,34 @@ fn tab_style(is_active: bool, status: button::Status) -> button::Style {
     }
 }
 
-fn tooltip_label(label: &str) -> Element<'_, Message> {
+/// Tooltip text for an Activity Bar entry.
+fn activity_label(item: ActivityItem) -> MessageKey {
+    match item {
+        ActivityItem::Explorer => MessageKey::ActivityExplorer,
+        ActivityItem::Search => MessageKey::ActivitySearch,
+        ActivityItem::Git => MessageKey::ActivityGit,
+    }
+}
+
+/// Side Bar heading and placeholder body for an Activity Bar entry.
+fn side_bar_text(item: ActivityItem) -> (MessageKey, MessageKey) {
+    match item {
+        ActivityItem::Explorer => (
+            MessageKey::SideBarExplorerTitle,
+            MessageKey::SideBarExplorerPlaceholder,
+        ),
+        ActivityItem::Search => (
+            MessageKey::SideBarSearchTitle,
+            MessageKey::SideBarSearchPlaceholder,
+        ),
+        ActivityItem::Git => (
+            MessageKey::SideBarGitTitle,
+            MessageKey::SideBarGitPlaceholder,
+        ),
+    }
+}
+
+fn tooltip_label<'a>(label: String) -> Element<'a, Message> {
     container(text(label).size(UI_TEXT_SIZE).color(palette::TEXT))
         .padding([4, 8])
         .style(|_: &Theme| {
@@ -423,6 +456,19 @@ mod tests {
     }
 
     #[test]
+    fn each_activity_has_its_own_messages() {
+        let keys: std::collections::HashSet<_> = ActivityItem::ALL
+            .into_iter()
+            .flat_map(|item| {
+                let (title, placeholder) = side_bar_text(item);
+                [activity_label(item), title, placeholder]
+            })
+            .collect();
+
+        assert_eq!(keys.len(), ActivityItem::ALL.len() * 3);
+    }
+
+    #[test]
     fn activity_icon_color_reflects_state() {
         assert_eq!(activity_icon_color(false, false), palette::ICON_INACTIVE);
         assert_eq!(activity_icon_color(false, true), palette::ICON_HOVERED);
@@ -432,7 +478,7 @@ mod tests {
 
     #[test]
     fn hover_tracks_the_entry_under_the_pointer() {
-        let mut app = Kegon::default();
+        let mut app = Kegon::new(Locale::EnUs);
 
         app.update(Message::ActivityHovered(ActivityItem::Search));
         assert_eq!(app.hovered_activity, Some(ActivityItem::Search));
@@ -449,7 +495,7 @@ mod tests {
 
     #[test]
     fn activity_messages_update_the_workbench() {
-        let mut app = Kegon::default();
+        let mut app = Kegon::new(Locale::EnUs);
 
         app.update(Message::ActivitySelected(ActivityItem::Git));
         assert_eq!(app.workbench.active_activity(), ActivityItem::Git);
@@ -457,7 +503,7 @@ mod tests {
 
     #[test]
     fn sash_drag_resizes_the_side_bar_only_while_pressed() {
-        let mut app = Kegon::default();
+        let mut app = Kegon::new(Locale::EnUs);
         let initial = app.workbench.side_bar_width();
 
         app.update(Message::SashDragged(350.0));
