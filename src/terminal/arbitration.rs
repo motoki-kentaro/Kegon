@@ -5,6 +5,8 @@ use crate::command::{CommandContext, CommandId, KeyChord, KeybindingResolver};
 /// Target ownership route for an input event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputRoute {
+    /// Input is owned by native modal dialog.
+    Modal,
     /// Input is owned by IME composition (preedit or commit).
     Ime,
     /// Input is owned by a Kegon application command.
@@ -13,19 +15,25 @@ pub enum InputRoute {
     Terminal,
 }
 
-/// Arbitrates input events between IME, Kegon Commands, and Terminal input fallthrough.
+/// Arbitrates input events between native Modals, IME, Kegon Commands, and Terminal input fallthrough.
 #[derive(Debug, Clone)]
 pub struct InputArbiter;
 
 impl InputArbiter {
-    /// Arbitrate a keyboard event given the active context, key event data, and keybinding resolver.
+    /// Arbitrate a keyboard event given the active context, key event data, IME state, and modal state.
     pub fn arbitrate_key_event(
         resolver: &KeybindingResolver,
         context: CommandContext,
         logical_key: &iced::keyboard::key::Key,
         modifiers: iced::keyboard::Modifiers,
         is_ime_composing: bool,
+        is_modal_open: bool,
     ) -> InputRoute {
+        // 0. Modal precedence: if a modal dialog is open, it owns all keyboard input
+        if is_modal_open || context == CommandContext::Modal {
+            return InputRoute::Modal;
+        }
+
         // 1. IME precedence: if active composition is ongoing, IME owns keyboard input
         if is_ime_composing {
             return InputRoute::Ime;
@@ -50,6 +58,20 @@ mod tests {
     use iced::keyboard::{Modifiers, key};
 
     #[test]
+    fn modal_open_takes_precedence() {
+        let resolver = KeybindingResolver::default_for_platform(Platform::Windows);
+        let route = InputArbiter::arbitrate_key_event(
+            &resolver,
+            CommandContext::Workbench,
+            &key::Key::Character("e".into()),
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            false,
+            true, // Modal is open
+        );
+        assert_eq!(route, InputRoute::Modal);
+    }
+
+    #[test]
     fn bound_kegon_command_routes_to_command() {
         let resolver = KeybindingResolver::default_for_platform(Platform::Windows);
         let route = InputArbiter::arbitrate_key_event(
@@ -57,6 +79,7 @@ mod tests {
             CommandContext::Workbench,
             &key::Key::Character("e".into()),
             Modifiers::COMMAND | Modifiers::SHIFT,
+            false,
             false,
         );
         assert_eq!(
@@ -76,6 +99,7 @@ mod tests {
             &key::Key::Character("d".into()),
             Modifiers::COMMAND,
             false,
+            false,
         );
         assert_eq!(route_d, InputRoute::Terminal);
 
@@ -85,6 +109,7 @@ mod tests {
             CommandContext::TerminalFocused,
             &key::Key::Named(key::Named::Enter),
             Modifiers::SHIFT,
+            false,
             false,
         );
         assert_eq!(route_shift_enter, InputRoute::Terminal);
@@ -99,6 +124,7 @@ mod tests {
             &key::Key::Character("e".into()),
             Modifiers::COMMAND | Modifiers::SHIFT,
             true, // IME active
+            false,
         );
         assert_eq!(route, InputRoute::Ime);
     }

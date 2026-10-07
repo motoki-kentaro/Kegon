@@ -74,10 +74,11 @@ pub fn process_key_event_with_resolver(
         logical_key,
         modifiers,
         false,
+        false,
     );
 
     match route {
-        InputRoute::Ime => InputAction::Ignore,
+        InputRoute::Modal | InputRoute::Ime => InputAction::Ignore,
         InputRoute::Command(command) => match command {
             CommandId::WorkbenchExplorerFocus => {
                 InputAction::WorkbenchShortcut(ActivityItem::Explorer)
@@ -96,6 +97,7 @@ pub fn process_key_event_with_resolver(
                 }
             }
             CommandId::TerminalPaste => InputAction::PasteFromClipboard,
+            CommandId::DialogConfirm | CommandId::DialogCancel => InputAction::Ignore,
         },
         InputRoute::Terminal => {
             let input_evt = TerminalInputEvent::press(

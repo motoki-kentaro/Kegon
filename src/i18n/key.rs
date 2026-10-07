@@ -8,6 +8,7 @@ macro_rules! message_keys {
     ($($variant:ident => $id:literal,)*) => {
         /// A Kegon UI message. See `assets/i18n/en-US.ftl` for the text.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[allow(dead_code)]
         pub enum MessageKey {
             $($variant,)*
         }
@@ -45,6 +46,18 @@ message_keys! {
 
     MainPlaceholderTitle => "main-placeholder-title",
     MainPlaceholderBody => "main-placeholder-body",
+
+    DialogSmokeQuestionTitle => "dialog-smoke-question-title",
+    DialogSmokeQuestionMessage => "dialog-smoke-question-message",
+    DialogSmokeWarningTitle => "dialog-smoke-warning-title",
+    DialogSmokeWarningMessage => "dialog-smoke-warning-message",
+
+    DialogActionCancel => "dialog-action-cancel",
+    DialogActionContinue => "dialog-action-continue",
+    DialogActionOk => "dialog-action-ok",
+    DialogActionClose => "dialog-action-close",
+    DialogActionDelete => "dialog-action-delete",
+    DialogActionExit => "dialog-action-exit",
 }
 
 #[cfg(test)]

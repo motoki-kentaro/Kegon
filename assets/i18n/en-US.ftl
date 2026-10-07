@@ -29,3 +29,18 @@ terminal-process-exited = Process exited with code { $code }.
 
 main-placeholder-title = Terminal (placeholder)
 main-placeholder-body = Terminal sessions are not implemented yet.
+
+## Confirmation Dialog
+
+dialog-smoke-question-title = Smoke Test Question
+dialog-smoke-question-message = Do you want to proceed with this test operation?
+dialog-smoke-warning-title = Smoke Test Warning
+dialog-smoke-warning-message = Warning: This test operation will perform a simulated destructive action.
+
+dialog-action-cancel = Cancel
+dialog-action-continue = Continue
+dialog-action-ok = OK
+dialog-action-close = Close
+dialog-action-delete = Delete
+dialog-action-exit = Exit
+

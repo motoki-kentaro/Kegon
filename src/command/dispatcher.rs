@@ -80,6 +80,7 @@ impl CommandDispatcher {
                     CommandOutcome::Ignored
                 }
             }
+            CommandId::DialogConfirm | CommandId::DialogCancel => CommandOutcome::Ignored,
         }
     }
 }
