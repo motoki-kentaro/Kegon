@@ -1,11 +1,14 @@
-//! Translation of iced keyboard events into terminal escape sequences and actions.
-
-use crate::command::{CommandContext, CommandId, KeyChord, KeybindingResolver, Platform};
+use crate::command::{CommandContext, CommandId, KeybindingResolver, Platform};
+use crate::terminal::arbitration::{InputArbiter, InputRoute};
+use crate::terminal::input_event::TerminalInputEvent;
+use crate::terminal::key_encoder::TerminalKeyEncoder;
+use crate::terminal::mode::TerminalKeyboardMode;
 use crate::workbench::ActivityItem;
 use iced::keyboard::{Modifiers, key};
 
 /// Result of processing a keyboard event in the terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum InputAction {
     /// Send escape sequence / bytes to the child process via PTY.
     SendToPty(Vec<u8>),
@@ -34,6 +37,7 @@ pub fn format_paste(text: &str, bracketed_paste: bool) -> Vec<u8> {
 }
 
 /// Processes a key press event and classifies it into an [`InputAction`].
+#[allow(dead_code)]
 pub fn process_key_event(
     physical_key: key::Physical,
     logical_key: &key::Key,
@@ -54,153 +58,63 @@ pub fn process_key_event(
 }
 
 /// Processes a key press event using a specific [`KeybindingResolver`].
+#[allow(dead_code)]
 pub fn process_key_event_with_resolver(
     resolver: &KeybindingResolver,
-    _physical_key: key::Physical,
+    physical_key: key::Physical,
     logical_key: &key::Key,
     modifiers: Modifiers,
     text: Option<&str>,
     has_selection: bool,
     app_cursor_keys: bool,
 ) -> InputAction {
-    // 1. Resolve command via KeybindingResolver
-    if let Some(chord) = KeyChord::from_iced(logical_key, modifiers)
-        && let Some(command) = resolver.resolve(CommandContext::TerminalFocused, &chord)
-    {
-        match command {
+    let route = InputArbiter::arbitrate_key_event(
+        resolver,
+        CommandContext::TerminalFocused,
+        logical_key,
+        modifiers,
+        false,
+    );
+
+    match route {
+        InputRoute::Ime => InputAction::Ignore,
+        InputRoute::Command(command) => match command {
             CommandId::WorkbenchExplorerFocus => {
-                return InputAction::WorkbenchShortcut(ActivityItem::Explorer);
+                InputAction::WorkbenchShortcut(ActivityItem::Explorer)
             }
-            CommandId::WorkbenchSearchFocus => {
-                return InputAction::WorkbenchShortcut(ActivityItem::Search);
-            }
+            CommandId::WorkbenchSearchFocus => InputAction::WorkbenchShortcut(ActivityItem::Search),
             CommandId::WorkbenchSourceControlFocus => {
-                return InputAction::WorkbenchShortcut(ActivityItem::Git);
+                InputAction::WorkbenchShortcut(ActivityItem::Git)
             }
-            CommandId::TerminalCopy => {
-                return InputAction::CopySelection;
-            }
-            CommandId::TerminalInterrupt => {
-                return InputAction::SendToPty(vec![0x03]);
-            }
+            CommandId::TerminalCopy => InputAction::CopySelection,
+            CommandId::TerminalInterrupt => InputAction::SendToPty(vec![0x03]),
             CommandId::TerminalCopyOrInterrupt => {
                 if has_selection {
-                    return InputAction::CopySelection;
+                    InputAction::CopySelection
                 } else {
-                    return InputAction::SendToPty(vec![0x03]);
+                    InputAction::SendToPty(vec![0x03])
                 }
             }
-            CommandId::TerminalPaste => {
-                return InputAction::PasteFromClipboard;
+            CommandId::TerminalPaste => InputAction::PasteFromClipboard,
+        },
+        InputRoute::Terminal => {
+            let input_evt = TerminalInputEvent::press(
+                logical_key.clone(),
+                physical_key,
+                modifiers,
+                text.map(String::from),
+            );
+            let mode = TerminalKeyboardMode {
+                app_cursor: app_cursor_keys,
+                ..Default::default()
+            };
+            if let Some(bytes) = TerminalKeyEncoder::encode(&input_evt, mode) {
+                InputAction::SendToPty(bytes)
+            } else {
+                InputAction::Ignore
             }
         }
     }
-
-    // 2. Handle Special Keys and Escape Sequences (Raw PTY Input)
-    match logical_key {
-        key::Key::Named(named) => {
-            if let Some(bytes) = map_named_key(*named, modifiers, app_cursor_keys) {
-                return InputAction::SendToPty(bytes);
-            }
-        }
-        key::Key::Character(c) => {
-            if modifiers.control() && !modifiers.shift() && !modifiers.alt() {
-                // Ctrl + letter (A-Z) => Control codes \x01 - \x1a
-                if let Some(first_char) = c.chars().next() {
-                    let ascii = first_char.to_ascii_uppercase();
-                    if ascii.is_ascii_uppercase() {
-                        let ctrl_byte = (ascii as u8) - b'A' + 1;
-                        return InputAction::SendToPty(vec![ctrl_byte]);
-                    }
-                }
-            } else if modifiers.alt() && !modifiers.control() {
-                // Alt + key => ESC prefix
-                let mut bytes = vec![0x1b];
-                bytes.extend_from_slice(c.as_bytes());
-                return InputAction::SendToPty(bytes);
-            }
-        }
-        _ => {}
-    }
-
-    // 3. Normal character input (from IME commit or standard typing)
-    if let Some(txt) = text
-        && !txt.is_empty()
-        && !modifiers.control()
-        && !modifiers.alt()
-    {
-        return InputAction::SendToPty(txt.as_bytes().to_vec());
-    }
-
-    InputAction::Ignore
-}
-
-fn map_named_key(
-    named: key::Named,
-    modifiers: Modifiers,
-    app_cursor_keys: bool,
-) -> Option<Vec<u8>> {
-    let bytes = match named {
-        key::Named::Enter => vec![b'\r'],
-        key::Named::Backspace => vec![0x7f],
-        key::Named::Tab => {
-            if modifiers.shift() {
-                b"\x1b[Z".to_vec()
-            } else {
-                vec![b'\t']
-            }
-        }
-        key::Named::Escape => vec![0x1b],
-        key::Named::ArrowUp => {
-            if app_cursor_keys {
-                b"\x1bOA".to_vec()
-            } else {
-                b"\x1b[A".to_vec()
-            }
-        }
-        key::Named::ArrowDown => {
-            if app_cursor_keys {
-                b"\x1bOB".to_vec()
-            } else {
-                b"\x1b[B".to_vec()
-            }
-        }
-        key::Named::ArrowRight => {
-            if app_cursor_keys {
-                b"\x1bOC".to_vec()
-            } else {
-                b"\x1b[C".to_vec()
-            }
-        }
-        key::Named::ArrowLeft => {
-            if app_cursor_keys {
-                b"\x1bOD".to_vec()
-            } else {
-                b"\x1b[D".to_vec()
-            }
-        }
-        key::Named::Home => b"\x1b[H".to_vec(),
-        key::Named::End => b"\x1b[F".to_vec(),
-        key::Named::PageUp => b"\x1b[5~".to_vec(),
-        key::Named::PageDown => b"\x1b[6~".to_vec(),
-        key::Named::Insert => b"\x1b[2~".to_vec(),
-        key::Named::Delete => b"\x1b[3~".to_vec(),
-        key::Named::F1 => b"\x1bOP".to_vec(),
-        key::Named::F2 => b"\x1bOQ".to_vec(),
-        key::Named::F3 => b"\x1bOR".to_vec(),
-        key::Named::F4 => b"\x1bOS".to_vec(),
-        key::Named::F5 => b"\x1b[15~".to_vec(),
-        key::Named::F6 => b"\x1b[17~".to_vec(),
-        key::Named::F7 => b"\x1b[18~".to_vec(),
-        key::Named::F8 => b"\x1b[19~".to_vec(),
-        key::Named::F9 => b"\x1b[20~".to_vec(),
-        key::Named::F10 => b"\x1b[21~".to_vec(),
-        key::Named::F11 => b"\x1b[23~".to_vec(),
-        key::Named::F12 => b"\x1b[24~".to_vec(),
-        _ => return None,
-    };
-
-    Some(bytes)
 }
 
 #[cfg(test)]

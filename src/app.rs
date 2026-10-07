@@ -12,12 +12,13 @@ use iced::{
     Border, Center, Color, Element, Event, Fill, Font, Subscription, Theme, event, font, mouse,
 };
 
-use crate::command::{CommandContext, CommandDispatcher, KeyChord, KeybindingResolver, Platform};
+use crate::command::{CommandContext, CommandDispatcher, KeybindingResolver, Platform};
 use crate::i18n::{FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{ICON_SIZE, activity_icon};
 use crate::terminal::{
-    DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, InputAction, SystemClipboard, TerminalEvent,
-    TerminalProgram, TerminalSession, calculate_grid_size, format_paste, process_key_event,
+    DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, InputArbiter, InputRoute, SystemClipboard,
+    TerminalEvent, TerminalInputEvent, TerminalKeyEncoder, TerminalProgram, TerminalSession,
+    calculate_grid_size,
 };
 use crate::workbench::{ActivityItem, TabId, Workbench};
 
@@ -218,53 +219,59 @@ impl Kegon {
                     CommandContext::Workbench
                 };
 
-                if let Some(chord) = KeyChord::from_iced(&logical_key, modifiers)
-                    && let Some(command_id) = self.keybinding_resolver.resolve(context, &chord)
-                {
-                    CommandDispatcher::dispatch(
-                        command_id,
-                        &mut self.workbench,
-                        self.terminal_session.as_ref(),
-                        &mut self.system_clipboard,
-                    );
-                    return;
-                }
+                let is_ime_composing = self.preedit_text.is_some();
+                let route = InputArbiter::arbitrate_key_event(
+                    &self.keybinding_resolver,
+                    context,
+                    &logical_key,
+                    modifiers,
+                    is_ime_composing,
+                );
 
+                match route {
+                    InputRoute::Ime => {}
+                    InputRoute::Command(command_id) => {
+                        CommandDispatcher::dispatch(
+                            command_id,
+                            &mut self.workbench,
+                            self.terminal_session.as_ref(),
+                            &mut self.system_clipboard,
+                        );
+                    }
+                    InputRoute::Terminal => {
+                        if self.terminal_focused
+                            && let Some(session) = &self.terminal_session
+                        {
+                            let input_evt = TerminalInputEvent::press(
+                                logical_key,
+                                physical_key,
+                                modifiers,
+                                text.map(|s| s.to_string()),
+                            );
+                            let mode = session.keyboard_mode();
+                            if let Some(bytes) = TerminalKeyEncoder::encode(&input_evt, mode) {
+                                session.write_input(bytes);
+                            }
+                        }
+                    }
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                physical_key,
+                key: logical_key,
+                modifiers,
+                ..
+            }) => {
                 if self.terminal_focused
                     && let Some(session) = &self.terminal_session
                 {
-                    let has_selection = session.has_selection();
-                    let app_cursor = session.is_app_cursor_keys();
-                    let action = process_key_event(
-                        physical_key,
-                        &logical_key,
-                        modifiers,
-                        text.as_deref(),
-                        has_selection,
-                        app_cursor,
-                    );
-
-                    match action {
-                        InputAction::WorkbenchShortcut(item) => {
-                            self.workbench.select_activity(item);
-                        }
-                        InputAction::CopySelection => {
-                            if let Some(selected_text) = session.copy_selection() {
-                                self.system_clipboard.set_text(selected_text);
-                                session.clear_selection();
-                            }
-                        }
-                        InputAction::PasteFromClipboard => {
-                            if let Some(pasted_text) = self.system_clipboard.get_text() {
-                                let formatted =
-                                    format_paste(&pasted_text, session.is_bracketed_paste());
-                                session.write_input(formatted);
-                            }
-                        }
-                        InputAction::SendToPty(bytes) => {
+                    let mode = session.keyboard_mode();
+                    if mode.report_event_types {
+                        let input_evt =
+                            TerminalInputEvent::release(logical_key, physical_key, modifiers);
+                        if let Some(bytes) = TerminalKeyEncoder::encode(&input_evt, mode) {
                             session.write_input(bytes);
                         }
-                        InputAction::Ignore => {}
                     }
                 }
             }
