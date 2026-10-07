@@ -5,7 +5,8 @@ mod path;
 mod precedence;
 mod store;
 
-pub use model::{ApplicationSettings, LocalePreference};
+#[allow(unused_imports)]
+pub use model::{AppearanceSettings, ApplicationSettings, LocalePreference};
 #[allow(unused_imports)]
 pub use path::{default_settings_dir, default_settings_file_path};
 pub use precedence::resolve_application_locale;
@@ -21,6 +22,7 @@ mod tests {
     fn default_locale_preference_is_system() {
         let settings = ApplicationSettings::default();
         assert_eq!(settings.locale, LocalePreference::System);
+        assert_eq!(settings.appearance.ui_font_family, None);
     }
 
     #[test]
@@ -33,14 +35,53 @@ mod tests {
 
         for (pref, expected_str) in cases {
             assert_eq!(pref.as_str(), expected_str);
-            let settings = ApplicationSettings { locale: pref };
+            let settings = ApplicationSettings {
+                locale: pref,
+                appearance: AppearanceSettings::default(),
+            };
             let serialized = toml::to_string_pretty(&settings).expect("should serialize");
             assert!(serialized.contains(expected_str));
 
             let deserialized: ApplicationSettings =
                 toml::from_str(&serialized).expect("should deserialize");
             assert_eq!(deserialized.locale, pref);
+            assert_eq!(deserialized.appearance.ui_font_family, None);
         }
+    }
+
+    #[test]
+    fn appearance_settings_serialization_round_trip() {
+        let settings = ApplicationSettings {
+            locale: LocalePreference::JaJp,
+            appearance: AppearanceSettings {
+                ui_font_family: Some("Noto Sans JP".into()),
+            },
+        };
+
+        let serialized = toml::to_string_pretty(&settings).expect("should serialize");
+        assert!(serialized.contains("ui_font_family = \"Noto Sans JP\""));
+
+        let deserialized: ApplicationSettings =
+            toml::from_str(&serialized).expect("should deserialize");
+        assert_eq!(deserialized.locale, LocalePreference::JaJp);
+        assert_eq!(
+            deserialized.appearance.ui_font_family.as_deref(),
+            Some("Noto Sans JP")
+        );
+    }
+
+    #[test]
+    fn legacy_locale_only_toml_loads_with_default_appearance() {
+        let temp_dir = tempfile_dir("legacy_toml");
+        let path = temp_dir.join("settings.toml");
+        let content = "locale = \"ja-JP\"\n";
+        fs::write(&path, content).unwrap();
+
+        let (settings, warning) = load_settings(Some(&path));
+        assert_eq!(settings.locale, LocalePreference::JaJp);
+        assert_eq!(settings.appearance.ui_font_family, None);
+        assert!(warning.is_none());
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
@@ -89,6 +130,7 @@ mod tests {
         let path = temp_dir.join("nested").join("settings.toml");
         let settings = ApplicationSettings {
             locale: LocalePreference::EnUs,
+            appearance: AppearanceSettings::default(),
         };
 
         assert!(save_settings(&settings, Some(&path)).is_ok());

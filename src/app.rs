@@ -21,7 +21,7 @@ use crate::dialog::{
     FontPicker, FontPickerFocus, FontPickerMode, FontPickerResult, render_font_picker_overlay,
     render_modal_overlay,
 };
-use crate::font::{FontCache, SystemFontCatalog};
+use crate::font::{FontCache, SystemFontCatalog, UiFontResolution, UiFontStatus, resolve_ui_font};
 use crate::i18n::{self, FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{ICON_SIZE, activity_icon};
 use crate::settings::{
@@ -103,6 +103,8 @@ pub enum Message {
     DialogSecondaryClicked,
     DialogBackdropClicked,
     SettingsLocaleChanged(LocalePreference),
+    SettingsChooseUiFontClicked,
+    SettingsResetUiFontClicked,
     FontPickerSearchChanged(String),
     FontPickerMonospaceToggled(bool),
     FontPickerCandidateSelected(usize),
@@ -148,6 +150,10 @@ pub struct Kegon {
     settings: ApplicationSettings,
     /// Process-level CLI locale override, if given (e.g. `--locale ja-JP`).
     cli_locale_override: Option<String>,
+    /// Active UI font applied to application chrome and workbench UI components.
+    active_ui_font: Font,
+    /// UI font resolution status.
+    ui_font_status: UiFontStatus,
 }
 
 impl std::fmt::Debug for Kegon {
@@ -158,6 +164,7 @@ impl std::fmt::Debug for Kegon {
             .field("terminal_focused", &self.terminal_focused)
             .field("modal", &self.modal)
             .field("settings", &self.settings)
+            .field("ui_font_status", &self.ui_font_status)
             .finish()
     }
 }
@@ -204,7 +211,11 @@ impl Kegon {
             last_font_picker_result: None,
             settings,
             cli_locale_override,
+            active_ui_font: Font::DEFAULT,
+            ui_font_status: UiFontStatus::SystemDefault,
         };
+
+        app.apply_ui_font_preference();
 
         if let Some(smoke) = smoke_dialog {
             let (kind, title, message, tone) = match smoke {
@@ -257,6 +268,28 @@ impl Kegon {
         self.localizer = Localizer::new(new_locale);
     }
 
+    /// Re-resolves and updates the active UI font based on current application settings.
+    fn apply_ui_font_preference(&mut self) {
+        if self.settings.appearance.ui_font_family.is_some() && self.font_catalog.is_none() {
+            self.font_catalog = Some(SystemFontCatalog::load_system());
+        }
+        let catalog_ref = self.font_catalog.as_ref();
+        let resolution = match (
+            self.settings.appearance.ui_font_family.as_deref(),
+            catalog_ref,
+        ) {
+            (Some(family), Some(catalog)) => {
+                resolve_ui_font(Some(family), catalog, &mut self.font_cache)
+            }
+            _ => UiFontResolution {
+                status: UiFontStatus::SystemDefault,
+                font: Font::DEFAULT,
+            },
+        };
+        self.active_ui_font = resolution.font;
+        self.ui_font_status = resolution.status;
+    }
+
     /// Opens a confirmation dialog. Returns true if opened, or false if a modal is already active.
     pub fn open_confirmation_dialog(&mut self, dialog: ConfirmationDialog) -> bool {
         if self.is_modal_open() {
@@ -278,7 +311,12 @@ impl Kegon {
                 self.font_catalog = Some(SystemFontCatalog::load_system());
             }
             let catalog = self.font_catalog.as_ref().unwrap().clone();
-            let picker = FontPicker::new(mode, catalog);
+            let mut picker = FontPicker::new(mode, catalog);
+            if mode == FontPickerMode::Ui
+                && let Some(family) = &self.settings.appearance.ui_font_family
+            {
+                picker.select_family(family);
+            }
             if let Some(candidate) = picker.highlighted_candidate() {
                 self.font_cache.get_or_load(candidate);
             }
@@ -373,6 +411,18 @@ impl Kegon {
                     self.apply_locale_preference();
                 }
             }
+            Message::SettingsChooseUiFontClicked => {
+                self.open_font_picker(FontPickerMode::Ui);
+            }
+            Message::SettingsResetUiFontClicked => {
+                let mut updated_settings = self.settings.clone();
+                updated_settings.appearance.ui_font_family = None;
+                if let Err(err) = save_settings(&updated_settings, None) {
+                    eprintln!("kegon: failed to save settings: {err}");
+                }
+                self.settings = updated_settings;
+                self.apply_ui_font_preference();
+            }
             Message::FontPickerSearchChanged(query) => {
                 if let Some(picker) = self.font_picker.as_mut() {
                     picker.set_search_query(query);
@@ -398,6 +448,19 @@ impl Kegon {
                 }
             }
             Message::FontPickerResultReceived(result) => {
+                if let FontPickerResult::Select(candidate) = &result
+                    && let Some(picker) = &self.font_picker
+                    && picker.mode == FontPickerMode::Ui
+                {
+                    let mut updated_settings = self.settings.clone();
+                    updated_settings.appearance.ui_font_family =
+                        Some(candidate.family_name.clone());
+                    if let Err(err) = save_settings(&updated_settings, None) {
+                        eprintln!("kegon: failed to save settings: {err}");
+                    }
+                    self.settings = updated_settings;
+                    self.apply_ui_font_preference();
+                }
                 self.close_font_picker(result);
             }
             Message::FontPickerBackdropClicked => {
@@ -682,6 +745,7 @@ impl Kegon {
                 content,
                 font_picker,
                 &self.localizer,
+                self.active_ui_font,
                 Message::FontPickerSearchChanged,
                 Message::FontPickerMonospaceToggled,
                 Message::FontPickerCandidateSelected,
@@ -693,6 +757,7 @@ impl Kegon {
                 content,
                 dialog,
                 &self.localizer,
+                self.active_ui_font,
                 |result| match result {
                     ConfirmationResult::Primary => Message::DialogPrimaryClicked,
                     ConfirmationResult::Secondary => Message::DialogSecondaryClicked,
@@ -754,7 +819,12 @@ impl Kegon {
             .on_exit(Message::ActivityUnhovered(item));
 
         let label = self.localizer.text(activity_label(item));
-        tooltip(entry, tooltip_label(label), tooltip::Position::Right).into()
+        tooltip(
+            entry,
+            tooltip_label(label, self.active_ui_font),
+            tooltip::Position::Right,
+        )
+        .into()
     }
 
     fn side_bar(&self) -> Element<'_, Message> {
@@ -766,7 +836,7 @@ impl Kegon {
                 .size(11)
                 .font(Font {
                     weight: font::Weight::Bold,
-                    ..Font::DEFAULT
+                    ..self.active_ui_font
                 })
                 .color(palette::TEXT),
         )
@@ -780,6 +850,7 @@ impl Kegon {
                     .text(MessageKey::SideBarSettingsLanguageLabel),
             )
             .size(UI_TEXT_SIZE)
+            .font(self.active_ui_font)
             .color(palette::TEXT);
 
             let options = vec![
@@ -807,9 +878,12 @@ impl Kegon {
             let picker = pick_list(options, selected, |opt| {
                 Message::SettingsLocaleChanged(opt.pref)
             })
+            .font(self.active_ui_font)
+            .text_size(UI_TEXT_SIZE)
+            .text_shaping(iced::widget::text::Shaping::Auto)
             .width(Fill);
 
-            let mut settings_col = column![label_text, picker].spacing(8);
+            let mut language_col = column![label_text, picker].spacing(8);
 
             if self.cli_locale_override.is_some() {
                 let note = text(
@@ -817,9 +891,67 @@ impl Kegon {
                         .text(MessageKey::SideBarSettingsCliOverrideNote),
                 )
                 .size(11.0)
+                .font(self.active_ui_font)
                 .color(palette::TEXT_MUTED);
-                settings_col = settings_col.push(note);
+                language_col = language_col.push(note);
             }
+
+            let appearance_header = text(
+                self.localizer
+                    .text(MessageKey::SideBarSettingsAppearanceTitle),
+            )
+            .size(11)
+            .font(Font {
+                weight: font::Weight::Bold,
+                ..self.active_ui_font
+            })
+            .color(palette::TEXT);
+
+            let ui_font_label = text(self.localizer.text(MessageKey::SideBarSettingsUiFontLabel))
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font)
+                .color(palette::TEXT);
+
+            let font_status_text = match &self.ui_font_status {
+                UiFontStatus::SystemDefault => {
+                    self.localizer.text(MessageKey::SideBarSettingsUiFontSystem)
+                }
+                UiFontStatus::Active(family) => family.clone(),
+                UiFontStatus::NotInstalled(family) | UiFontStatus::LoadFailed(family) => {
+                    let mut args = FluentArgs::new();
+                    args.set("family", family.clone());
+                    self.localizer
+                        .text_with(MessageKey::SideBarSettingsUiFontNotInstalled, &args)
+                }
+            };
+
+            let font_status_val = text(font_status_text)
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font)
+                .color(palette::TEXT_MUTED);
+
+            let choose_btn = button(
+                text(self.localizer.text(MessageKey::SideBarSettingsUiFontChoose))
+                    .size(UI_TEXT_SIZE)
+                    .font(self.active_ui_font),
+            )
+            .on_press(Message::SettingsChooseUiFontClicked);
+
+            let mut reset_btn = button(
+                text(self.localizer.text(MessageKey::SideBarSettingsUiFontReset))
+                    .size(UI_TEXT_SIZE)
+                    .font(self.active_ui_font),
+            );
+            if self.settings.appearance.ui_font_family.is_some() {
+                reset_btn = reset_btn.on_press(Message::SettingsResetUiFontClicked);
+            }
+
+            let btn_row = row![choose_btn, reset_btn].spacing(8);
+
+            let appearance_col =
+                column![appearance_header, ui_font_label, font_status_val, btn_row,].spacing(8);
+
+            let settings_col = column![language_col, Space::new().height(16), appearance_col];
 
             column![header, container(settings_col).padding([8, 20])].into()
         } else {
@@ -828,6 +960,7 @@ impl Kegon {
                 container(
                     text(self.localizer.text(placeholder_key))
                         .size(UI_TEXT_SIZE)
+                        .font(self.active_ui_font)
                         .color(palette::TEXT_MUTED)
                 )
                 .padding([8, 20]),
@@ -896,6 +1029,7 @@ impl Kegon {
                             .text_with(MessageKey::TerminalProcessExited, &args),
                     )
                     .size(UI_TEXT_SIZE)
+                    .font(self.active_ui_font)
                     .color(Color::from_rgb8(0xf1, 0x4c, 0x4c)),
                 )
                 .padding([6, 12])
@@ -911,9 +1045,11 @@ impl Kegon {
             let placeholder = column![
                 text(self.localizer.text(MessageKey::MainPlaceholderTitle))
                     .size(UI_TEXT_SIZE + 2.0)
+                    .font(self.active_ui_font)
                     .color(palette::TEXT),
                 text(self.localizer.text(MessageKey::MainPlaceholderBody))
                     .size(UI_TEXT_SIZE)
+                    .font(self.active_ui_font)
                     .color(palette::TEXT_MUTED),
             ]
             .spacing(6)
@@ -936,7 +1072,7 @@ impl Kegon {
             let title = self.localizer.text(MessageKey::TerminalTabDefaultTitle);
 
             button(
-                container(text(title).size(UI_TEXT_SIZE))
+                container(text(title).size(UI_TEXT_SIZE).font(self.active_ui_font))
                     .height(Fill)
                     .align_y(Center),
             )
@@ -948,7 +1084,7 @@ impl Kegon {
         });
 
         let new_tab = tooltip(
-            button(container(text("+").size(16)).center(Fill))
+            button(container(text("+").size(16).font(self.active_ui_font)).center(Fill))
                 .width(TAB_STRIP_HEIGHT)
                 .height(TAB_STRIP_HEIGHT)
                 .padding(0)
@@ -956,7 +1092,10 @@ impl Kegon {
                     text_color: palette::TEXT_MUTED,
                     ..button::Style::default()
                 }),
-            tooltip_label(self.localizer.text(MessageKey::TerminalNewTabTooltip)),
+            tooltip_label(
+                self.localizer.text(MessageKey::TerminalNewTabTooltip),
+                self.active_ui_font,
+            ),
             tooltip::Position::Bottom,
         );
 
@@ -1035,19 +1174,24 @@ fn side_bar_text(item: ActivityItem) -> (MessageKey, MessageKey) {
     }
 }
 
-fn tooltip_label<'a>(label: String) -> Element<'a, Message> {
-    container(text(label).size(UI_TEXT_SIZE).color(palette::TEXT))
-        .padding([4, 8])
-        .style(|_: &Theme| {
-            container::Style::default()
-                .background(palette::ACTIVITY_BAR)
-                .border(Border {
-                    color: palette::BORDER,
-                    width: 1.0,
-                    radius: 3.0.into(),
-                })
-        })
-        .into()
+fn tooltip_label<'a>(label: String, ui_font: Font) -> Element<'a, Message> {
+    container(
+        text(label)
+            .size(UI_TEXT_SIZE)
+            .font(ui_font)
+            .color(palette::TEXT),
+    )
+    .padding([4, 8])
+    .style(|_: &Theme| {
+        container::Style::default()
+            .background(palette::ACTIVITY_BAR)
+            .border(Border {
+                color: palette::BORDER,
+                width: 1.0,
+                radius: 3.0.into(),
+            })
+    })
+    .into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1293,5 +1437,38 @@ mod tests {
         app.update(Message::SettingsLocaleChanged(LocalePreference::JaJp));
         let updated_text = app.localizer.text(MessageKey::ActivitySettings);
         assert_eq!(updated_text, "設定");
+    }
+
+    #[test]
+    fn ui_font_settings_and_resolution() {
+        let mut settings = ApplicationSettings::default();
+        settings.appearance.ui_font_family = Some(String::from("Consolas"));
+
+        let app = Kegon::new(Locale::EnUs, settings, None, None, None);
+        assert!(matches!(
+            app.ui_font_status,
+            UiFontStatus::Active(_) | UiFontStatus::NotInstalled(_)
+        ));
+    }
+
+    #[test]
+    fn ui_font_choose_open_picker_and_reset() {
+        let mut settings = ApplicationSettings::default();
+        settings.appearance.ui_font_family = Some(String::from("Arial"));
+
+        let mut app = Kegon::new(Locale::EnUs, settings, None, None, None);
+        assert_eq!(app.settings.appearance.ui_font_family, Some("Arial".into()));
+
+        // Choose clicked opens font picker
+        app.update(Message::SettingsChooseUiFontClicked);
+        assert!(app.is_modal_open());
+        assert_eq!(app.font_picker.as_ref().unwrap().mode, FontPickerMode::Ui);
+
+        app.close_font_picker(FontPickerResult::Cancel);
+
+        // Reset clicked sets ui_font_family to None
+        app.update(Message::SettingsResetUiFontClicked);
+        assert_eq!(app.settings.appearance.ui_font_family, None);
+        assert_eq!(app.ui_font_status, UiFontStatus::SystemDefault);
     }
 }

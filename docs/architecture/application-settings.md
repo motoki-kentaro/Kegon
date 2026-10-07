@@ -7,14 +7,15 @@ Kegon provides a typed, persistent application settings foundation with runtime 
 
 ## Scope
 
-The initial scope of `ApplicationSettings` is deliberately limited to **Application Language**.
-Future settings (Themes, Fonts, Keybindings) will extend this architecture without breaking changes or migration friction.
+The scope of `ApplicationSettings` covers:
+- **Application Language** (`locale`)
+- **Appearance Settings** (`appearance.ui_font_family`)
 
-Non-goals for this issue:
+Future settings (Themes, Terminal Fonts, Keybindings) will extend this architecture without breaking changes or migration friction.
+
+Non-goals for current version:
 - Theme settings and Theme pickers (light/dark/system)
-- UI Font setting and Terminal Font setting
-- Font Picker, installed font enumeration, font preview, or font file bundling
-- Terminal geometry change settings
+- Terminal Font setting and cell geometry dynamic resizing
 - Keybinding editor or overrides
 - Project-level settings
 - Settings search or category tree
@@ -30,13 +31,27 @@ pub enum LocalePreference {
     JaJp,   // "ja-JP"
 }
 
+pub struct AppearanceSettings {
+    pub ui_font_family: Option<String>,
+}
+
 pub struct ApplicationSettings {
     pub locale: LocalePreference,
+    pub appearance: AppearanceSettings,
 }
 ```
 
-- **Default Preference**: `LocalePreference::System`. On missing configuration, Kegon resolves locale from the OS preferred UI languages, falling back to `en-US`.
-- **TOML Identifiers**: Saved in TOML using stable lower/kebab-case strings (`"system"`, `"en-US"`, `"ja-JP"`). Localized display text is never saved to `settings.toml`.
+- **Default Preference**: `locale: LocalePreference::System`, `ui_font_family: None` (System default font).
+- **TOML Identifiers**: Saved in TOML using stable lower/kebab-case strings and structured sections:
+  ```toml
+  locale = "system"
+
+  [appearance]
+  ui_font_family = "Segoe UI"
+  ```
+- **Font Family Saving Policy**: Only the clean family name string is saved (e.g. `"Segoe UI"`). Raw font file paths, `.ttf`/`.ttc` paths, and TTC indices are never written to `settings.toml`.
+- **Backward Compatibility**: Omitted `[appearance]` section or missing `ui_font_family` key defaults gracefully to `None` without modifying existing `settings.toml` files.
+- **Uninstalled Font Policy**: If a saved family string is missing on the host OS, `settings.toml` is **never** rewritten or deleted. The Settings UI indicates `{family} (not installed)` while preserving the configuration.
 
 ## Configuration Path Policy
 
