@@ -1731,11 +1731,13 @@ dependencies = [
  "dirs",
  "fluent-bundle",
  "fluent-syntax",
+ "fontdb",
  "iced",
  "ico",
  "serde",
  "sys-locale",
  "toml 0.8.23",
+ "ttf-parser",
  "unic-langid",
  "winresource",
 ]

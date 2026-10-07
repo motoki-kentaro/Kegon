@@ -50,3 +50,15 @@ dialog-action-close = Close
 dialog-action-delete = Delete
 dialog-action-exit = Exit
 
+## Font Picker
+
+font-picker-title-ui = UI Font
+font-picker-title-terminal = Terminal Font
+font-picker-search-placeholder = Search fonts...
+font-picker-monospace-only = Monospaced fonts only
+font-picker-preview-header = Preview
+font-picker-no-matching-fonts = No matching fonts
+font-picker-cancel = Cancel
+font-picker-select = Select
+
+

@@ -14,12 +14,14 @@ use iced::{
     Border, Center, Color, Element, Event, Fill, Font, Subscription, Theme, event, font, mouse,
 };
 
-use crate::cli::SmokeConfirmationDialog;
+use crate::cli::{SmokeConfirmationDialog, SmokeFontPicker};
 use crate::command::{CommandContext, CommandDispatcher, KeybindingResolver, Platform};
 use crate::dialog::{
     ActionTone, ConfirmationDialog, ConfirmationResult, DialogKind, FocusTarget, FocusedAction,
+    FontPicker, FontPickerFocus, FontPickerMode, FontPickerResult, render_font_picker_overlay,
     render_modal_overlay,
 };
+use crate::font::{FontCache, SystemFontCatalog};
 use crate::i18n::{self, FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{ICON_SIZE, activity_icon};
 use crate::settings::{
@@ -101,6 +103,11 @@ pub enum Message {
     DialogSecondaryClicked,
     DialogBackdropClicked,
     SettingsLocaleChanged(LocalePreference),
+    FontPickerSearchChanged(String),
+    FontPickerMonospaceToggled(bool),
+    FontPickerCandidateSelected(usize),
+    FontPickerResultReceived(FontPickerResult),
+    FontPickerBackdropClicked,
 }
 
 pub struct Kegon {
@@ -129,6 +136,14 @@ pub struct Kegon {
     modal: Option<ConfirmationDialog>,
     /// Result of the last closed dialog.
     last_dialog_result: Option<ConfirmationResult>,
+    /// Active font picker dialog, if any. Zero-or-one active modal policy.
+    font_picker: Option<FontPicker>,
+    /// System font catalog (loaded on demand when font picker is opened).
+    font_catalog: Option<SystemFontCatalog>,
+    /// Font bytes cache for runtime font previews.
+    font_cache: FontCache,
+    /// Result of the last closed font picker dialog.
+    last_font_picker_result: Option<FontPickerResult>,
     /// Persisted application settings model.
     settings: ApplicationSettings,
     /// Process-level CLI locale override, if given (e.g. `--locale ja-JP`).
@@ -153,6 +168,7 @@ impl Kegon {
         settings: ApplicationSettings,
         cli_locale_override: Option<String>,
         smoke_dialog: Option<SmokeConfirmationDialog>,
+        smoke_font_picker: Option<SmokeFontPicker>,
     ) -> Self {
         let (tx, rx) = channel();
         if let Ok(mut rx_guard) = TERMINAL_EVENT_RX.lock() {
@@ -182,6 +198,10 @@ impl Kegon {
             keybinding_resolver: KeybindingResolver::default_for_platform(Platform::current()),
             modal: None,
             last_dialog_result: None,
+            font_picker: None,
+            font_catalog: None,
+            font_cache: FontCache::default(),
+            last_font_picker_result: None,
             settings,
             cli_locale_override,
         };
@@ -211,6 +231,14 @@ impl Kegon {
             app.open_confirmation_dialog(dialog);
         }
 
+        if let Some(smoke_picker) = smoke_font_picker {
+            let mode = match smoke_picker {
+                SmokeFontPicker::Ui => FontPickerMode::Ui,
+                SmokeFontPicker::Terminal => FontPickerMode::Terminal,
+            };
+            app.open_font_picker(mode);
+        }
+
         app
     }
 
@@ -231,7 +259,7 @@ impl Kegon {
 
     /// Opens a confirmation dialog. Returns true if opened, or false if a modal is already active.
     pub fn open_confirmation_dialog(&mut self, dialog: ConfirmationDialog) -> bool {
-        if self.modal.is_some() {
+        if self.is_modal_open() {
             eprintln!("kegon: cannot open modal dialog; a modal is already active");
             false
         } else {
@@ -240,7 +268,26 @@ impl Kegon {
         }
     }
 
-    /// Closes the active modal dialog and restores focus according to dialog settings.
+    /// Opens a font picker dialog. Returns true if opened, or false if a modal is already active.
+    pub fn open_font_picker(&mut self, mode: FontPickerMode) -> bool {
+        if self.is_modal_open() {
+            eprintln!("kegon: cannot open font picker; a modal is already active");
+            false
+        } else {
+            if self.font_catalog.is_none() {
+                self.font_catalog = Some(SystemFontCatalog::load_system());
+            }
+            let catalog = self.font_catalog.as_ref().unwrap().clone();
+            let picker = FontPicker::new(mode, catalog);
+            if let Some(candidate) = picker.highlighted_candidate() {
+                self.font_cache.get_or_load(candidate);
+            }
+            self.font_picker = Some(picker);
+            true
+        }
+    }
+
+    /// Closes the active confirmation dialog and restores focus according to dialog settings.
     pub fn close_modal(&mut self, result: ConfirmationResult) {
         if let Some(dialog) = self.modal.take() {
             self.last_dialog_result = Some(result);
@@ -251,16 +298,30 @@ impl Kegon {
         }
     }
 
-    /// Returns the result of the last closed modal dialog, if any.
+    /// Closes the active font picker dialog.
+    pub fn close_font_picker(&mut self, result: FontPickerResult) {
+        if let Some(_picker) = self.font_picker.take() {
+            self.last_font_picker_result = Some(result);
+            self.terminal_focused = true;
+        }
+    }
+
+    /// Returns the result of the last closed confirmation dialog, if any.
     #[allow(dead_code)]
     pub fn last_dialog_result(&self) -> Option<ConfirmationResult> {
         self.last_dialog_result
     }
 
+    /// Returns the result of the last closed font picker dialog, if any.
+    #[allow(dead_code)]
+    pub fn last_font_picker_result(&self) -> Option<FontPickerResult> {
+        self.last_font_picker_result.clone()
+    }
+
     /// Returns whether a modal dialog is currently active.
     #[allow(dead_code)]
     pub fn is_modal_open(&self) -> bool {
-        self.modal.is_some()
+        self.modal.is_some() || self.font_picker.is_some()
     }
 
     pub fn update(&mut self, message: Message) {
@@ -282,7 +343,7 @@ impl Kegon {
             }
             Message::SashReleased => self.resizing_side_bar = false,
             Message::TerminalClicked => {
-                if self.modal.is_none() {
+                if !self.is_modal_open() {
                     self.terminal_focused = true;
                 }
             }
@@ -312,6 +373,36 @@ impl Kegon {
                     self.apply_locale_preference();
                 }
             }
+            Message::FontPickerSearchChanged(query) => {
+                if let Some(picker) = self.font_picker.as_mut() {
+                    picker.set_search_query(query);
+                    if let Some(candidate) = picker.highlighted_candidate() {
+                        self.font_cache.get_or_load(candidate);
+                    }
+                }
+            }
+            Message::FontPickerMonospaceToggled(_enabled) => {
+                if let Some(picker) = self.font_picker.as_mut() {
+                    picker.toggle_monospace_only();
+                    if let Some(candidate) = picker.highlighted_candidate() {
+                        self.font_cache.get_or_load(candidate);
+                    }
+                }
+            }
+            Message::FontPickerCandidateSelected(idx) => {
+                if let Some(picker) = self.font_picker.as_mut() {
+                    picker.select_index(idx);
+                    if let Some(candidate) = picker.highlighted_candidate() {
+                        self.font_cache.get_or_load(candidate);
+                    }
+                }
+            }
+            Message::FontPickerResultReceived(result) => {
+                self.close_font_picker(result);
+            }
+            Message::FontPickerBackdropClicked => {
+                // Backdrop clicks are intentionally ignored to avoid accidental dismissal.
+            }
         }
     }
 
@@ -339,7 +430,7 @@ impl Kegon {
                 text,
                 ..
             }) => {
-                let context = if self.modal.is_some() {
+                let context = if self.is_modal_open() {
                     CommandContext::Modal
                 } else if self.terminal_focused {
                     CommandContext::TerminalFocused
@@ -348,7 +439,7 @@ impl Kegon {
                 };
 
                 let is_ime_composing = self.preedit_text.is_some();
-                let is_modal_open = self.modal.is_some();
+                let is_modal_open = self.is_modal_open();
                 let route = InputArbiter::arbitrate_key_event(
                     &self.keybinding_resolver,
                     context,
@@ -360,7 +451,52 @@ impl Kegon {
 
                 match route {
                     InputRoute::Modal => {
-                        if let Some(dialog) = self.modal.as_mut() {
+                        if let Some(picker) = self.font_picker.as_mut() {
+                            match logical_key {
+                                keyboard::key::Key::Named(keyboard::key::Named::Enter) => {
+                                    let result = match picker.focus {
+                                        FontPickerFocus::CancelButton => {
+                                            Some(FontPickerResult::Cancel)
+                                        }
+                                        FontPickerFocus::MonospaceToggle => {
+                                            picker.toggle_monospace_only();
+                                            None
+                                        }
+                                        FontPickerFocus::SelectButton
+                                        | FontPickerFocus::CandidateList
+                                        | FontPickerFocus::SearchInput => {
+                                            picker.confirm_selection()
+                                        }
+                                    };
+                                    if let Some(res) = result {
+                                        self.close_font_picker(res);
+                                    }
+                                }
+                                keyboard::key::Key::Named(keyboard::key::Named::Escape) => {
+                                    self.close_font_picker(FontPickerResult::Cancel);
+                                }
+                                keyboard::key::Key::Named(keyboard::key::Named::Tab) => {
+                                    if modifiers.shift() {
+                                        picker.focus_previous();
+                                    } else {
+                                        picker.focus_next();
+                                    }
+                                }
+                                keyboard::key::Key::Named(keyboard::key::Named::ArrowUp) => {
+                                    picker.move_highlight_up();
+                                    if let Some(candidate) = picker.highlighted_candidate() {
+                                        self.font_cache.get_or_load(candidate);
+                                    }
+                                }
+                                keyboard::key::Key::Named(keyboard::key::Named::ArrowDown) => {
+                                    picker.move_highlight_down();
+                                    if let Some(candidate) = picker.highlighted_candidate() {
+                                        self.font_cache.get_or_load(candidate);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else if let Some(dialog) = self.modal.as_mut() {
                             match logical_key {
                                 keyboard::key::Key::Named(keyboard::key::Named::Enter) => {
                                     let result = match dialog.focused_action {
@@ -412,7 +548,7 @@ impl Kegon {
                 modifiers,
                 ..
             }) => {
-                if self.modal.is_none()
+                if !self.is_modal_open()
                     && self.terminal_focused
                     && let Some(session) = &self.terminal_session
                 {
@@ -427,7 +563,7 @@ impl Kegon {
                 }
             }
             Event::InputMethod(ime_event) => {
-                if self.modal.is_none()
+                if !self.is_modal_open()
                     && self.terminal_focused
                     && let Some(session) = &self.terminal_session
                 {
@@ -447,7 +583,7 @@ impl Kegon {
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                if self.modal.is_none() {
+                if !self.is_modal_open() {
                     let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + self.workbench.side_bar_width();
                     let term_y = TAB_STRIP_HEIGHT;
 
@@ -468,7 +604,7 @@ impl Kegon {
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 self.cursor_position = position;
-                if self.modal.is_none()
+                if !self.is_modal_open()
                     && self.mouse_dragging_selection
                     && let Some(session) = &self.terminal_session
                 {
@@ -482,12 +618,12 @@ impl Kegon {
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if self.modal.is_none() {
+                if !self.is_modal_open() {
                     self.mouse_dragging_selection = false;
                 }
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                if self.modal.is_none()
+                if !self.is_modal_open()
                     && let Some(session) = &self.terminal_session
                 {
                     let lines = match delta {
@@ -541,7 +677,18 @@ impl Kegon {
             body.into()
         };
 
-        if let Some(dialog) = &self.modal {
+        if let Some(font_picker) = &self.font_picker {
+            render_font_picker_overlay(
+                content,
+                font_picker,
+                &self.localizer,
+                Message::FontPickerSearchChanged,
+                Message::FontPickerMonospaceToggled,
+                Message::FontPickerCandidateSelected,
+                Message::FontPickerResultReceived,
+                Message::FontPickerBackdropClicked,
+            )
+        } else if let Some(dialog) = &self.modal {
             render_modal_overlay(
                 content,
                 dialog,
@@ -962,7 +1109,7 @@ mod tests {
     }
 
     fn new_test_app(locale: Locale) -> Kegon {
-        Kegon::new(locale, ApplicationSettings::default(), None, None)
+        Kegon::new(locale, ApplicationSettings::default(), None, None, None)
     }
 
     #[test]
@@ -1094,6 +1241,7 @@ mod tests {
             ApplicationSettings::default(),
             None,
             Some(SmokeConfirmationDialog::Question),
+            None,
         );
         assert!(app_q.is_modal_open());
 
@@ -1102,8 +1250,38 @@ mod tests {
             ApplicationSettings::default(),
             None,
             Some(SmokeConfirmationDialog::Warning),
+            None,
         );
         assert!(app_w.is_modal_open());
+    }
+
+    #[test]
+    fn smoke_font_picker_initialization() {
+        let app_ui = Kegon::new(
+            Locale::EnUs,
+            ApplicationSettings::default(),
+            None,
+            None,
+            Some(SmokeFontPicker::Ui),
+        );
+        assert!(app_ui.is_modal_open());
+        assert_eq!(
+            app_ui.font_picker.as_ref().unwrap().mode,
+            FontPickerMode::Ui
+        );
+
+        let app_term = Kegon::new(
+            Locale::EnUs,
+            ApplicationSettings::default(),
+            None,
+            None,
+            Some(SmokeFontPicker::Terminal),
+        );
+        assert!(app_term.is_modal_open());
+        assert_eq!(
+            app_term.font_picker.as_ref().unwrap().mode,
+            FontPickerMode::Terminal
+        );
     }
 
     #[test]

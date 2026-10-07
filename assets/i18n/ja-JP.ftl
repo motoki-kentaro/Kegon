@@ -49,3 +49,15 @@ dialog-action-close = 閉じる
 dialog-action-delete = 削除
 dialog-action-exit = 終了
 
+## Font Picker
+
+font-picker-title-ui = UI フォント
+font-picker-title-terminal = ターミナル フォント
+font-picker-search-placeholder = フォントを検索...
+font-picker-monospace-only = 等幅フォントのみ
+font-picker-preview-header = プレビュー
+font-picker-no-matching-fonts = 該当するフォントがありません
+font-picker-cancel = キャンセル
+font-picker-select = 選択
+
+

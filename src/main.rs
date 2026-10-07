@@ -6,6 +6,7 @@ mod app_icon;
 mod cli;
 mod command;
 mod dialog;
+mod font;
 mod i18n;
 mod icons;
 mod settings;
@@ -40,6 +41,7 @@ fn main() -> iced::Result {
                 settings.clone(),
                 cli_locale_override.clone(),
                 options.smoke_confirmation_dialog,
+                options.smoke_font_picker,
             )
         },
         Kegon::update,
