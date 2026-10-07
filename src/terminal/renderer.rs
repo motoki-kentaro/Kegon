@@ -83,6 +83,48 @@ fn convert_indexed_color(idx: u8, colors: &TerminalColors) -> Color {
     }
 }
 
+/// Computes effective foreground and background colors for a cell considering ANSI palette,
+/// `DIM`, `INVERSE`, and selection status.
+pub fn compute_cell_colors(
+    cell_fg: AnsiColor,
+    cell_bg: AnsiColor,
+    flags: Flags,
+    is_selected: bool,
+    colors: &TerminalColors,
+) -> (Color, Color) {
+    let mut fg = convert_color(cell_fg, true, colors);
+    let mut bg = convert_color(cell_bg, false, colors);
+
+    if flags.contains(Flags::DIM) {
+        fg.a *= 0.66;
+    }
+
+    if flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+
+    if is_selected {
+        bg = Color {
+            a: SELECTION_ALPHA,
+            ..colors.selection
+        };
+    }
+
+    (fg, bg)
+}
+
+/// Derives the iced [`Font`] attributes for a cell based on bold and italic flags.
+pub fn resolve_cell_font(base_font: Font, flags: Flags) -> Font {
+    let mut cell_font = base_font;
+    if flags.contains(Flags::BOLD) {
+        cell_font.weight = iced::font::Weight::Bold;
+    }
+    if flags.contains(Flags::ITALIC) {
+        cell_font.style = iced::font::Style::Italic;
+    }
+    cell_font
+}
+
 /// The iced [`Program`] responsible for rendering the terminal grid and preedit text.
 pub struct TerminalProgram<'a> {
     pub session: &'a TerminalSession,
@@ -109,11 +151,6 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         let metrics = &self.font_config.metrics;
         let font = self.font_config.font;
 
-        let selection = Color {
-            a: SELECTION_ALPHA,
-            ..colors.selection
-        };
-
         let mut frame = Frame::new(renderer, bounds.size());
 
         // Fill background
@@ -121,60 +158,114 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
         let term = self.session.term().lock();
         let content = term.renderable_content();
+        let cursor_point = content.cursor.point;
+        let mut cursor_cell_info: Option<(String, Flags)> = None;
 
-        // 1. Draw Cell Backgrounds & Characters
+        // 1. Draw Cell Backgrounds, Characters, and Text Line Attributes
         for cell in content.display_iter {
             let col = cell.point.column.0 as f32;
             let line = cell.point.line.0 as f32;
 
             let cell_pos = Point::new(col * metrics.cell_width, line * metrics.cell_height);
 
-            let mut fg = convert_color(cell.fg, true, colors);
-            let mut bg = convert_color(cell.bg, false, colors);
-
-            if cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-
             let is_selected = content.selection.is_some_and(|r| r.contains(cell.point));
-            if is_selected {
-                bg = selection;
-            }
+            let (fg, bg) = compute_cell_colors(cell.fg, cell.bg, cell.flags, is_selected, colors);
+
+            let is_wide = cell.flags.contains(Flags::WIDE_CHAR);
+            let cell_width = if is_wide {
+                metrics.cell_width * 2.0
+            } else {
+                metrics.cell_width
+            };
 
             // Draw custom background if non-default
             if bg != colors.background {
-                let cell_width = if cell.flags.contains(Flags::WIDE_CHAR) {
-                    metrics.cell_width * 2.0
-                } else {
-                    metrics.cell_width
-                };
                 frame.fill_rectangle(cell_pos, Size::new(cell_width, metrics.cell_height), bg);
             }
 
+            let is_wide_spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+            let is_hidden = cell.flags.contains(Flags::HIDDEN);
+
             // Draw character text unless wide char spacer or hidden
-            if !cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                && !cell.flags.contains(Flags::HIDDEN)
-                && cell.c != ' '
-                && cell.c != '\0'
-            {
+            if !is_wide_spacer && !is_hidden && cell.c != ' ' && cell.c != '\0' {
+                let mut content_str = cell.c.to_string();
+                if let Some(zw) = cell.zerowidth() {
+                    for &c in zw {
+                        content_str.push(c);
+                    }
+                }
+
+                if cell.point == cursor_point {
+                    cursor_cell_info = Some((content_str.clone(), cell.flags));
+                }
+
+                let cell_font = resolve_cell_font(font, cell.flags);
+
                 let text = Text {
-                    content: cell.c.to_string(),
+                    content: content_str,
                     position: cell_pos,
                     color: fg,
                     size: metrics.font_size.into(),
-                    font,
+                    font: cell_font,
                     align_x: Horizontal::Left.into(),
                     align_y: Vertical::Top,
-                    line_height: iced::widget::text::LineHeight::Relative(1.0),
-                    shaping: iced::widget::text::Shaping::Basic,
+                    line_height: iced::widget::text::LineHeight::Absolute(
+                        metrics.cell_height.into(),
+                    ),
+                    shaping: iced::widget::text::Shaping::Advanced,
                     max_width: f32::INFINITY,
                 };
                 frame.fill_text(text);
             }
+
+            // Draw text line attributes (underline, double underline, strikeout)
+            if !is_wide_spacer && !is_hidden {
+                if cell.flags.contains(Flags::UNDERLINE) {
+                    let line_y = cell_pos.y + metrics.cell_height - 1.5;
+                    let line_path = Path::line(
+                        Point::new(cell_pos.x, line_y),
+                        Point::new(cell_pos.x + cell_width, line_y),
+                    );
+                    frame.stroke(
+                        &line_path,
+                        canvas::Stroke::default().with_color(fg).with_width(1.0),
+                    );
+                } else if cell.flags.contains(Flags::DOUBLE_UNDERLINE) {
+                    let line_y1 = cell_pos.y + metrics.cell_height - 2.5;
+                    let line_y2 = cell_pos.y + metrics.cell_height - 1.0;
+                    let line_path1 = Path::line(
+                        Point::new(cell_pos.x, line_y1),
+                        Point::new(cell_pos.x + cell_width, line_y1),
+                    );
+                    let line_path2 = Path::line(
+                        Point::new(cell_pos.x, line_y2),
+                        Point::new(cell_pos.x + cell_width, line_y2),
+                    );
+                    frame.stroke(
+                        &line_path1,
+                        canvas::Stroke::default().with_color(fg).with_width(1.0),
+                    );
+                    frame.stroke(
+                        &line_path2,
+                        canvas::Stroke::default().with_color(fg).with_width(1.0),
+                    );
+                }
+
+                if cell.flags.contains(Flags::STRIKEOUT) {
+                    let line_y = cell_pos.y + metrics.cell_height * 0.5;
+                    let line_path = Path::line(
+                        Point::new(cell_pos.x, line_y),
+                        Point::new(cell_pos.x + cell_width, line_y),
+                    );
+                    frame.stroke(
+                        &line_path,
+                        canvas::Stroke::default().with_color(fg).with_width(1.0),
+                    );
+                }
+            }
         }
 
-        // 2. Draw Terminal Cursor
-        let cursor_point = content.cursor.point;
+        // 2. Draw Terminal Cursor & Cursor Character
         let cursor_pos = Point::new(
             cursor_point.column.0 as f32 * metrics.cell_width,
             cursor_point.line.0 as f32 * metrics.cell_height,
@@ -189,6 +280,27 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
                 Size::new(cursor_width, cursor_height),
                 colors.cursor,
             );
+
+            // Re-render character under focused block cursor using contrasting background color
+            if let Some((content_str, cell_flags)) = cursor_cell_info {
+                let cell_font = resolve_cell_font(font, cell_flags);
+
+                let text = Text {
+                    content: content_str,
+                    position: cursor_pos,
+                    color: colors.background,
+                    size: metrics.font_size.into(),
+                    font: cell_font,
+                    align_x: Horizontal::Left.into(),
+                    align_y: Vertical::Top,
+                    line_height: iced::widget::text::LineHeight::Absolute(
+                        metrics.cell_height.into(),
+                    ),
+                    shaping: iced::widget::text::Shaping::Advanced,
+                    max_width: f32::INFINITY,
+                };
+                frame.fill_text(text);
+            }
         } else {
             let cursor_path = Path::rectangle(cursor_pos, Size::new(cursor_width, cursor_height));
             frame.stroke(
@@ -222,8 +334,8 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
                 font,
                 align_x: Horizontal::Left.into(),
                 align_y: Vertical::Top,
-                line_height: iced::widget::text::LineHeight::Relative(1.0),
-                shaping: iced::widget::text::Shaping::Basic,
+                line_height: iced::widget::text::LineHeight::Absolute(metrics.cell_height.into()),
+                shaping: iced::widget::text::Shaping::Advanced,
                 max_width: f32::INFINITY,
             };
             frame.fill_text(text);
@@ -370,5 +482,75 @@ mod tests {
             ..COLORS.selection
         };
         assert_eq!(selection, Color::from_rgba8(0x26, 0x4f, 0x78, 0.6));
+    }
+
+    #[test]
+    fn compute_cell_colors_handles_dim_inverse_and_selection() {
+        let (fg, bg) = compute_cell_colors(
+            AnsiColor::Named(NamedColor::Foreground),
+            AnsiColor::Named(NamedColor::Background),
+            Flags::empty(),
+            false,
+            COLORS,
+        );
+        assert_eq!(fg, COLORS.foreground);
+        assert_eq!(bg, COLORS.background);
+
+        // Dim scales foreground alpha
+        let (dim_fg, _) = compute_cell_colors(
+            AnsiColor::Named(NamedColor::Foreground),
+            AnsiColor::Named(NamedColor::Background),
+            Flags::DIM,
+            false,
+            COLORS,
+        );
+        assert!((dim_fg.a - COLORS.foreground.a * 0.66).abs() < 0.01);
+
+        // Inverse swaps fg and bg
+        let (inv_fg, inv_bg) = compute_cell_colors(
+            AnsiColor::Named(NamedColor::Foreground),
+            AnsiColor::Named(NamedColor::Background),
+            Flags::INVERSE,
+            false,
+            COLORS,
+        );
+        assert_eq!(inv_fg, COLORS.background);
+        assert_eq!(inv_bg, COLORS.foreground);
+
+        // Selection overrides bg
+        let (_, sel_bg) = compute_cell_colors(
+            AnsiColor::Named(NamedColor::Foreground),
+            AnsiColor::Named(NamedColor::Background),
+            Flags::empty(),
+            true,
+            COLORS,
+        );
+        assert_eq!(
+            sel_bg,
+            Color {
+                a: SELECTION_ALPHA,
+                ..COLORS.selection
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_cell_font_applies_bold_and_italic_attributes() {
+        let base = Font::MONOSPACE;
+        let font_normal = resolve_cell_font(base, Flags::empty());
+        assert_eq!(font_normal.weight, iced::font::Weight::Normal);
+        assert_eq!(font_normal.style, iced::font::Style::Normal);
+
+        let font_bold = resolve_cell_font(base, Flags::BOLD);
+        assert_eq!(font_bold.weight, iced::font::Weight::Bold);
+        assert_eq!(font_bold.style, iced::font::Style::Normal);
+
+        let font_italic = resolve_cell_font(base, Flags::ITALIC);
+        assert_eq!(font_italic.weight, iced::font::Weight::Normal);
+        assert_eq!(font_italic.style, iced::font::Style::Italic);
+
+        let font_bold_italic = resolve_cell_font(base, Flags::BOLD | Flags::ITALIC);
+        assert_eq!(font_bold_italic.weight, iced::font::Weight::Bold);
+        assert_eq!(font_bold_italic.style, iced::font::Style::Italic);
     }
 }
