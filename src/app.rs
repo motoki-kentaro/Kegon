@@ -1,10 +1,11 @@
 //! The iced application: messages, update logic, and the workbench view.
 
 use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, channel};
 
 use iced::advanced::input_method::Event as ImeEvent;
 use iced::futures::SinkExt;
+use iced::futures::StreamExt;
+use iced::futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use iced::keyboard;
 use iced::widget::canvas::Canvas;
 use iced::widget::{
@@ -44,29 +45,31 @@ const SASH_WIDTH: f32 = 4.0;
 const TAB_STRIP_HEIGHT: f32 = 35.0;
 const UI_TEXT_SIZE: f32 = 13.0;
 
-static TERMINAL_EVENT_RX: Mutex<Option<Receiver<TerminalEvent>>> = Mutex::new(None);
+static TERMINAL_EVENT_RX: Mutex<Option<UnboundedReceiver<TerminalEvent>>> = Mutex::new(None);
 
 fn terminal_events_stream() -> impl iced::futures::Stream<Item = Message> {
     iced::stream::channel(
         100,
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-            loop {
-                let event = {
-                    if let Ok(rx_guard) = TERMINAL_EVENT_RX.lock() {
-                        if let Some(rx) = rx_guard.as_ref() {
-                            rx.try_recv().ok()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(evt) = event {
-                    let _ = output.send(Message::TerminalEventReceived(evt)).await;
+            let rx = {
+                if let Ok(mut rx_guard) = TERMINAL_EVENT_RX.lock() {
+                    rx_guard.take()
                 } else {
-                    iced::futures::pending!();
+                    None
+                }
+            };
+
+            let Some(mut rx) = rx else {
+                return;
+            };
+
+            while let Some(evt) = rx.next().await {
+                if output
+                    .send(Message::TerminalEventReceived(evt))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
         },
@@ -192,7 +195,7 @@ impl Kegon {
         let main_h = (initial_window_size.height - TAB_STRIP_HEIGHT).max(10.0);
         let (cols, rows) = terminal_font_config.metrics.grid_size(main_w, main_h);
 
-        let (tx, rx) = channel();
+        let (tx, rx) = unbounded();
         if let Ok(mut rx_guard) = TERMINAL_EVENT_RX.lock() {
             *rx_guard = Some(rx);
         }
