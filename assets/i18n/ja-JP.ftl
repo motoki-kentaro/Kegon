@@ -8,6 +8,7 @@
 activity-explorer = エクスプローラー
 activity-search = 検索
 activity-git = Git
+activity-settings = 設定
 
 ## Side Bar
 
@@ -17,6 +18,11 @@ side-bar-search-title = 検索
 side-bar-search-placeholder = プロジェクト全体の検索はまだ実装されていません。
 side-bar-git-title = ソース管理
 side-bar-git-placeholder = Git 連携はまだ実装されていません。
+side-bar-settings-title = 設定
+side-bar-settings-language-label = 表示言語
+side-bar-settings-language-system = システム設定に従う
+side-bar-settings-cli-override-note = このセッションでは --locale により言語が上書きされています。
+
 
 ## Terminal tab strip
 

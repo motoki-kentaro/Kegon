@@ -97,6 +97,9 @@ pub fn process_key_event_with_resolver(
                 }
             }
             CommandId::TerminalPaste => InputAction::PasteFromClipboard,
+            CommandId::WorkbenchSettingsOpen => {
+                InputAction::WorkbenchShortcut(ActivityItem::Settings)
+            }
             CommandId::DialogConfirm | CommandId::DialogCancel => InputAction::Ignore,
         },
         InputRoute::Terminal => {

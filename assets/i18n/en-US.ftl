@@ -9,6 +9,7 @@
 activity-explorer = File Explorer
 activity-search = Search
 activity-git = Git
+activity-settings = Settings
 
 ## Side Bar
 
@@ -18,6 +19,11 @@ side-bar-search-title = SEARCH
 side-bar-search-placeholder = Project-wide search is not implemented yet.
 side-bar-git-title = SOURCE CONTROL
 side-bar-git-placeholder = Git integration is not implemented yet.
+side-bar-settings-title = SETTINGS
+side-bar-settings-language-label = Application Language
+side-bar-settings-language-system = System default
+side-bar-settings-cli-override-note = Application language is overridden by --locale for this session.
+
 
 ## Terminal tab strip
 

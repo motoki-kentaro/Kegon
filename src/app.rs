@@ -7,7 +7,9 @@ use iced::advanced::input_method::Event as ImeEvent;
 use iced::futures::SinkExt;
 use iced::keyboard;
 use iced::widget::canvas::Canvas;
-use iced::widget::{Space, button, column, container, mouse_area, row, space, svg, text, tooltip};
+use iced::widget::{
+    Space, button, column, container, mouse_area, pick_list, row, space, svg, text, tooltip,
+};
 use iced::{
     Border, Center, Color, Element, Event, Fill, Font, Subscription, Theme, event, font, mouse,
 };
@@ -18,8 +20,11 @@ use crate::dialog::{
     ActionTone, ConfirmationDialog, ConfirmationResult, DialogKind, FocusTarget, FocusedAction,
     render_modal_overlay,
 };
-use crate::i18n::{FluentArgs, Locale, Localizer, MessageKey};
+use crate::i18n::{self, FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{ICON_SIZE, activity_icon};
+use crate::settings::{
+    ApplicationSettings, LocalePreference, resolve_application_locale, save_settings,
+};
 use crate::terminal::{
     DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, InputArbiter, InputRoute, SystemClipboard,
     TerminalEvent, TerminalInputEvent, TerminalKeyEncoder, TerminalProgram, TerminalSession,
@@ -95,10 +100,11 @@ pub enum Message {
     DialogPrimaryClicked,
     DialogSecondaryClicked,
     DialogBackdropClicked,
+    SettingsLocaleChanged(LocalePreference),
 }
 
 pub struct Kegon {
-    /// Fixed for the lifetime of the application; chosen at startup.
+    /// Fixed for the lifetime of the application; chosen at startup or updated on settings change.
     localizer: Localizer,
     workbench: Workbench,
     /// Whether the Side Bar sash is being dragged.
@@ -123,6 +129,10 @@ pub struct Kegon {
     modal: Option<ConfirmationDialog>,
     /// Result of the last closed dialog.
     last_dialog_result: Option<ConfirmationResult>,
+    /// Persisted application settings model.
+    settings: ApplicationSettings,
+    /// Process-level CLI locale override, if given (e.g. `--locale ja-JP`).
+    cli_locale_override: Option<String>,
 }
 
 impl std::fmt::Debug for Kegon {
@@ -132,12 +142,18 @@ impl std::fmt::Debug for Kegon {
             .field("hovered_activity", &self.hovered_activity)
             .field("terminal_focused", &self.terminal_focused)
             .field("modal", &self.modal)
+            .field("settings", &self.settings)
             .finish()
     }
 }
 
 impl Kegon {
-    pub fn new(locale: Locale, smoke_dialog: Option<SmokeConfirmationDialog>) -> Self {
+    pub fn new(
+        locale: Locale,
+        settings: ApplicationSettings,
+        cli_locale_override: Option<String>,
+        smoke_dialog: Option<SmokeConfirmationDialog>,
+    ) -> Self {
         let (tx, rx) = channel();
         if let Ok(mut rx_guard) = TERMINAL_EVENT_RX.lock() {
             *rx_guard = Some(rx);
@@ -166,6 +182,8 @@ impl Kegon {
             keybinding_resolver: KeybindingResolver::default_for_platform(Platform::current()),
             modal: None,
             last_dialog_result: None,
+            settings,
+            cli_locale_override,
         };
 
         if let Some(smoke) = smoke_dialog {
@@ -199,6 +217,16 @@ impl Kegon {
     /// The window title: the product name, which is not translated.
     pub fn title(&self) -> String {
         String::from("Kegon")
+    }
+
+    /// Re-resolves and updates the localizer based on current settings and CLI override.
+    fn apply_locale_preference(&mut self) {
+        let new_locale = resolve_application_locale(
+            self.cli_locale_override.as_deref(),
+            self.settings.locale,
+            i18n::os_preferences(),
+        );
+        self.localizer = Localizer::new(new_locale);
     }
 
     /// Opens a confirmation dialog. Returns true if opened, or false if a modal is already active.
@@ -272,6 +300,17 @@ impl Kegon {
             }
             Message::DialogBackdropClicked => {
                 // Backdrop clicks are intentionally ignored to avoid accidental dismissal.
+            }
+            Message::SettingsLocaleChanged(new_preference) => {
+                if self.cli_locale_override.is_none() {
+                    let mut updated_settings = self.settings.clone();
+                    updated_settings.locale = new_preference;
+                    if let Err(err) = save_settings(&updated_settings, None) {
+                        eprintln!("kegon: failed to save settings: {err}");
+                    }
+                    self.settings = updated_settings;
+                    self.apply_locale_preference();
+                }
             }
         }
     }
@@ -521,53 +560,62 @@ impl Kegon {
     fn activity_bar(&self) -> Element<'_, Message> {
         let active = self.workbench.active_activity();
 
-        let items = ActivityItem::ALL.into_iter().map(|item| {
-            let is_active = item == active;
-            let color = activity_icon_color(is_active, self.hovered_activity == Some(item));
+        let top_items = ActivityItem::TOP_ITEMS
+            .into_iter()
+            .map(|item| self.activity_bar_item(item, active));
 
-            let icon = svg(activity_icon(item))
-                .width(ICON_SIZE)
-                .height(ICON_SIZE)
-                .style(move |_, _| svg::Style { color: Some(color) });
+        let settings_item = self.activity_bar_item(ActivityItem::Settings, active);
 
-            let indicator = container(space())
-                .width(2)
-                .height(ACTIVITY_BAR_WIDTH)
-                .style(move |_| {
-                    container::Style::default().background(if is_active {
-                        palette::ICON_ACTIVE
-                    } else {
-                        Color::TRANSPARENT
-                    })
-                });
+        let content = column![column(top_items), Space::new().height(Fill), settings_item,];
 
-            let entry = button(container(icon).center(Fill))
-                .width(ACTIVITY_BAR_WIDTH - 2.0)
-                .height(ACTIVITY_BAR_WIDTH)
-                .padding(0)
-                .on_press(Message::ActivitySelected(item))
-                .style(|_, _| button::Style::default());
-
-            let entry = mouse_area(row![indicator, entry])
-                .on_enter(Message::ActivityHovered(item))
-                .on_exit(Message::ActivityUnhovered(item));
-
-            let label = self.localizer.text(activity_label(item));
-            tooltip(entry, tooltip_label(label), tooltip::Position::Right).into()
-        });
-
-        container(column(items))
+        container(content)
             .width(ACTIVITY_BAR_WIDTH)
             .height(Fill)
             .style(|_| container::Style::default().background(palette::ACTIVITY_BAR))
             .into()
     }
 
+    fn activity_bar_item(&self, item: ActivityItem, active: ActivityItem) -> Element<'_, Message> {
+        let is_active = item == active;
+        let color = activity_icon_color(is_active, self.hovered_activity == Some(item));
+
+        let icon = svg(activity_icon(item))
+            .width(ICON_SIZE)
+            .height(ICON_SIZE)
+            .style(move |_, _| svg::Style { color: Some(color) });
+
+        let indicator = container(space())
+            .width(2)
+            .height(ACTIVITY_BAR_WIDTH)
+            .style(move |_| {
+                container::Style::default().background(if is_active {
+                    palette::ICON_ACTIVE
+                } else {
+                    Color::TRANSPARENT
+                })
+            });
+
+        let entry = button(container(icon).center(Fill))
+            .width(ACTIVITY_BAR_WIDTH - 2.0)
+            .height(ACTIVITY_BAR_WIDTH)
+            .padding(0)
+            .on_press(Message::ActivitySelected(item))
+            .style(|_, _| button::Style::default());
+
+        let entry = mouse_area(row![indicator, entry])
+            .on_enter(Message::ActivityHovered(item))
+            .on_exit(Message::ActivityUnhovered(item));
+
+        let label = self.localizer.text(activity_label(item));
+        tooltip(entry, tooltip_label(label), tooltip::Position::Right).into()
+    }
+
     fn side_bar(&self) -> Element<'_, Message> {
-        let (title, placeholder) = side_bar_text(self.workbench.active_activity());
+        let active_item = self.workbench.active_activity();
+        let (title_key, placeholder_key) = side_bar_text(active_item);
 
         let header = container(
-            text(self.localizer.text(title))
+            text(self.localizer.text(title_key))
                 .size(11)
                 .font(Font {
                     weight: font::Weight::Bold,
@@ -579,15 +627,66 @@ impl Kegon {
         .padding([0, 20])
         .align_y(Center);
 
-        let content = column![
-            header,
-            container(
-                text(self.localizer.text(placeholder))
-                    .size(UI_TEXT_SIZE)
-                    .color(palette::TEXT_MUTED)
+        let content: Element<'_, Message> = if active_item == ActivityItem::Settings {
+            let label_text = text(
+                self.localizer
+                    .text(MessageKey::SideBarSettingsLanguageLabel),
             )
-            .padding([8, 20]),
-        ];
+            .size(UI_TEXT_SIZE)
+            .color(palette::TEXT);
+
+            let options = vec![
+                LocaleOption {
+                    pref: LocalePreference::System,
+                    label: self
+                        .localizer
+                        .text(MessageKey::SideBarSettingsLanguageSystem),
+                },
+                LocaleOption {
+                    pref: LocalePreference::EnUs,
+                    label: String::from("English (United States)"),
+                },
+                LocaleOption {
+                    pref: LocalePreference::JaJp,
+                    label: String::from("日本語"),
+                },
+            ];
+
+            let selected = options
+                .iter()
+                .find(|opt| opt.pref == self.settings.locale)
+                .cloned();
+
+            let picker = pick_list(options, selected, |opt| {
+                Message::SettingsLocaleChanged(opt.pref)
+            })
+            .width(Fill);
+
+            let mut settings_col = column![label_text, picker].spacing(8);
+
+            if self.cli_locale_override.is_some() {
+                let note = text(
+                    self.localizer
+                        .text(MessageKey::SideBarSettingsCliOverrideNote),
+                )
+                .size(11.0)
+                .color(palette::TEXT_MUTED);
+                settings_col = settings_col.push(note);
+            }
+
+            column![header, container(settings_col).padding([8, 20])].into()
+        } else {
+            column![
+                header,
+                container(
+                    text(self.localizer.text(placeholder_key))
+                        .size(UI_TEXT_SIZE)
+                        .color(palette::TEXT_MUTED)
+                )
+                .padding([8, 20]),
+            ]
+            .into()
+        };
 
         container(content)
             .width(self.workbench.side_bar_width())
@@ -764,6 +863,7 @@ fn activity_label(item: ActivityItem) -> MessageKey {
         ActivityItem::Explorer => MessageKey::ActivityExplorer,
         ActivityItem::Search => MessageKey::ActivitySearch,
         ActivityItem::Git => MessageKey::ActivityGit,
+        ActivityItem::Settings => MessageKey::ActivitySettings,
     }
 }
 
@@ -781,6 +881,10 @@ fn side_bar_text(item: ActivityItem) -> (MessageKey, MessageKey) {
             MessageKey::SideBarGitTitle,
             MessageKey::SideBarGitPlaceholder,
         ),
+        ActivityItem::Settings => (
+            MessageKey::SideBarSettingsTitle,
+            MessageKey::SideBarSettingsTitle,
+        ),
     }
 }
 
@@ -797,6 +901,18 @@ fn tooltip_label<'a>(label: String) -> Element<'a, Message> {
                 })
         })
         .into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocaleOption {
+    pref: LocalePreference,
+    label: String,
+}
+
+impl std::fmt::Display for LocaleOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
 }
 
 #[cfg(test)]
@@ -845,6 +961,10 @@ mod tests {
         );
     }
 
+    fn new_test_app(locale: Locale) -> Kegon {
+        Kegon::new(locale, ApplicationSettings::default(), None, None)
+    }
+
     #[test]
     fn each_activity_has_its_own_messages() {
         let keys: std::collections::HashSet<_> = ActivityItem::ALL
@@ -855,7 +975,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(keys.len(), ActivityItem::ALL.len() * 3);
+        assert_eq!(keys.len(), ActivityItem::ALL.len() * 3 - 1);
     }
 
     #[test]
@@ -868,7 +988,7 @@ mod tests {
 
     #[test]
     fn hover_tracks_the_entry_under_the_pointer() {
-        let mut app = Kegon::new(Locale::EnUs, None);
+        let mut app = new_test_app(Locale::EnUs);
 
         app.update(Message::ActivityHovered(ActivityItem::Search));
         assert_eq!(app.hovered_activity, Some(ActivityItem::Search));
@@ -883,15 +1003,18 @@ mod tests {
 
     #[test]
     fn activity_messages_update_the_workbench() {
-        let mut app = Kegon::new(Locale::EnUs, None);
+        let mut app = new_test_app(Locale::EnUs);
 
         app.update(Message::ActivitySelected(ActivityItem::Git));
         assert_eq!(app.workbench.active_activity(), ActivityItem::Git);
+
+        app.update(Message::ActivitySelected(ActivityItem::Settings));
+        assert_eq!(app.workbench.active_activity(), ActivityItem::Settings);
     }
 
     #[test]
     fn sash_drag_resizes_the_side_bar_only_while_pressed() {
-        let mut app = Kegon::new(Locale::EnUs, None);
+        let mut app = new_test_app(Locale::EnUs);
         let initial = app.workbench.side_bar_width();
 
         app.update(Message::SashDragged(350.0));
@@ -914,7 +1037,7 @@ mod tests {
 
     #[test]
     fn single_active_modal_policy() {
-        let mut app = Kegon::new(Locale::EnUs, None);
+        let mut app = new_test_app(Locale::EnUs);
 
         let d1 = ConfirmationDialog::builder(
             DialogKind::Question,
@@ -946,7 +1069,7 @@ mod tests {
 
     #[test]
     fn modal_focus_restoration() {
-        let mut app = Kegon::new(Locale::EnUs, None);
+        let mut app = new_test_app(Locale::EnUs);
 
         let d = ConfirmationDialog::builder(
             DialogKind::Question,
@@ -966,10 +1089,31 @@ mod tests {
 
     #[test]
     fn smoke_confirmation_dialog_initialization() {
-        let app_q = Kegon::new(Locale::EnUs, Some(SmokeConfirmationDialog::Question));
+        let app_q = Kegon::new(
+            Locale::EnUs,
+            ApplicationSettings::default(),
+            None,
+            Some(SmokeConfirmationDialog::Question),
+        );
         assert!(app_q.is_modal_open());
 
-        let app_w = Kegon::new(Locale::EnUs, Some(SmokeConfirmationDialog::Warning));
+        let app_w = Kegon::new(
+            Locale::EnUs,
+            ApplicationSettings::default(),
+            None,
+            Some(SmokeConfirmationDialog::Warning),
+        );
         assert!(app_w.is_modal_open());
+    }
+
+    #[test]
+    fn runtime_locale_switch_preserves_terminal_session() {
+        let mut app = new_test_app(Locale::EnUs);
+        let initial_text = app.localizer.text(MessageKey::ActivitySettings);
+        assert_eq!(initial_text, "Settings");
+
+        app.update(Message::SettingsLocaleChanged(LocalePreference::JaJp));
+        let updated_text = app.localizer.text(MessageKey::ActivitySettings);
+        assert_eq!(updated_text, "設定");
     }
 }

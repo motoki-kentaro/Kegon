@@ -8,6 +8,7 @@ mod command;
 mod dialog;
 mod i18n;
 mod icons;
+mod settings;
 mod terminal;
 mod workbench;
 
@@ -19,10 +20,28 @@ fn main() -> iced::Result {
         eprintln!("kegon: {warning}");
     }
 
-    let locale = i18n::resolve(options.locale.as_deref(), i18n::os_preferences());
+    let (settings, settings_warning) = settings::load_settings(None);
+    if let Some(warning) = settings_warning {
+        eprintln!("kegon: {warning}");
+    }
+
+    let locale = settings::resolve_application_locale(
+        options.locale.as_deref(),
+        settings.locale,
+        i18n::os_preferences(),
+    );
+
+    let cli_locale_override = options.locale.clone();
 
     iced::application(
-        move || Kegon::new(locale, options.smoke_confirmation_dialog),
+        move || {
+            Kegon::new(
+                locale,
+                settings.clone(),
+                cli_locale_override.clone(),
+                options.smoke_confirmation_dialog,
+            )
+        },
         Kegon::update,
         Kegon::view,
     )

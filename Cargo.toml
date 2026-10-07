@@ -18,6 +18,10 @@ sys-locale = "0.3"
 # Terminal core emulation and system clipboard
 alacritty_terminal = "0.26.0"
 arboard = "3.6.1"
+# Application settings serialization, TOML parsing, and cross-platform config paths
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+dirs = "5.0"
 
 [build-dependencies]
 # Embeds the application icon into the Windows executable (see build.rs).

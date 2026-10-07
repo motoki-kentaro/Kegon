@@ -38,6 +38,12 @@ static GIT: LazyLock<svg::Handle> = LazyLock::new(|| {
     ))
 });
 
+static SETTINGS_GEAR: LazyLock<svg::Handle> = LazyLock::new(|| {
+    svg::Handle::from_memory(include_bytes!(
+        "../assets/icons/codicons/activity-bar/settings-gear.svg"
+    ))
+});
+
 static QUESTION: LazyLock<svg::Handle> = LazyLock::new(|| {
     svg::Handle::from_memory(include_bytes!(
         "../assets/icons/codicons/dialog/question.svg"
@@ -56,6 +62,7 @@ pub fn activity_icon(item: ActivityItem) -> svg::Handle {
         ActivityItem::Explorer => EXPLORER.clone(),
         ActivityItem::Search => SEARCH.clone(),
         ActivityItem::Git => GIT.clone(),
+        ActivityItem::Settings => SETTINGS_GEAR.clone(),
     }
 }
 
