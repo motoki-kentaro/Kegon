@@ -2,8 +2,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+
+use iced::futures::channel::mpsc::UnboundedSender;
 
 use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
@@ -35,7 +36,7 @@ pub enum TerminalEvent {
 
 #[derive(Clone)]
 pub(crate) struct EventProxy {
-    event_tx: Sender<TerminalEvent>,
+    event_tx: UnboundedSender<TerminalEvent>,
     title: Arc<Mutex<String>>,
     state: Arc<Mutex<SessionState>>,
 }
@@ -44,21 +45,21 @@ impl EventListener for EventProxy {
     fn send_event(&self, event: AlacrittyEvent) {
         match event {
             AlacrittyEvent::Wakeup => {
-                let _ = self.event_tx.send(TerminalEvent::Wakeup);
+                let _ = self.event_tx.unbounded_send(TerminalEvent::Wakeup);
             }
             AlacrittyEvent::Title(t) => {
                 if let Ok(mut title_guard) = self.title.lock() {
                     *title_guard = t.clone();
                 }
-                let _ = self.event_tx.send(TerminalEvent::Title(t));
+                let _ = self.event_tx.unbounded_send(TerminalEvent::Title(t));
             }
             AlacrittyEvent::ChildExit(status) => {
                 let code = status.code();
                 if let Ok(mut state_guard) = self.state.lock() {
                     *state_guard = SessionState::Exited(code);
                 }
-                let _ = self.event_tx.send(TerminalEvent::ChildExit(code));
-                let _ = self.event_tx.send(TerminalEvent::Wakeup);
+                let _ = self.event_tx.unbounded_send(TerminalEvent::ChildExit(code));
+                let _ = self.event_tx.unbounded_send(TerminalEvent::Wakeup);
             }
             _ => {}
         }
@@ -100,7 +101,7 @@ impl TerminalSession {
         rows: u16,
         cell_width: u16,
         cell_height: u16,
-        event_tx: Sender<TerminalEvent>,
+        event_tx: UnboundedSender<TerminalEvent>,
     ) -> Result<Self, String> {
         let shell_cfg = ShellConfig::resolve_default();
         let options = Options {
@@ -279,11 +280,12 @@ impl TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::channel;
+    use iced::futures::channel::mpsc::unbounded;
+    use iced::futures::{FutureExt, StreamExt};
 
     #[test]
     fn session_spawns_and_reports_initial_state() {
-        let (tx, _rx) = channel();
+        let (tx, _rx) = unbounded();
         let session = TerminalSession::spawn(80, 24, 10, 20, tx);
         assert!(session.is_ok());
         let session = session.unwrap();
@@ -294,7 +296,7 @@ mod tests {
 
     #[test]
     fn selection_lifecycle_starts_updates_and_clears() {
-        let (tx, _rx) = channel();
+        let (tx, _rx) = unbounded();
         let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
 
         assert!(!session.has_selection());
@@ -304,5 +306,44 @@ mod tests {
 
         session.clear_selection();
         assert!(!session.has_selection());
+    }
+
+    #[test]
+    fn event_proxy_delivers_events_in_exact_order() {
+        let (tx, mut rx) = unbounded();
+        let title = Arc::new(Mutex::new(String::from("Terminal")));
+        let state = Arc::new(Mutex::new(SessionState::Running));
+
+        let proxy = EventProxy {
+            event_tx: tx,
+            title: title.clone(),
+            state: state.clone(),
+        };
+
+        proxy.send_event(AlacrittyEvent::Wakeup);
+        proxy.send_event(AlacrittyEvent::Title("Custom Title".to_string()));
+
+        assert_eq!(
+            rx.next().now_or_never().flatten(),
+            Some(TerminalEvent::Wakeup)
+        );
+        assert_eq!(
+            rx.next().now_or_never().flatten(),
+            Some(TerminalEvent::Title("Custom Title".to_string()))
+        );
+        assert_eq!(*title.lock().unwrap(), "Custom Title");
+        assert_eq!(*state.lock().unwrap(), SessionState::Running);
+    }
+
+    #[test]
+    fn event_channel_drop_safety() {
+        let (tx, mut rx) = unbounded::<TerminalEvent>();
+        drop(tx);
+        assert_eq!(rx.next().now_or_never().flatten(), None);
+
+        let (tx, rx) = unbounded::<TerminalEvent>();
+        drop(rx);
+        let res = tx.unbounded_send(TerminalEvent::Wakeup);
+        assert!(res.is_err());
     }
 }
