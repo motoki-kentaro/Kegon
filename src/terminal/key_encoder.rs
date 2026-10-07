@@ -15,6 +15,10 @@ impl TerminalKeyEncoder {
             return None;
         }
 
+        if is_space_event(event) {
+            return encode_space(event, mode);
+        }
+
         if mode.is_extended() {
             Self::encode_extended(event, mode)
         } else {
@@ -31,6 +35,9 @@ impl TerminalKeyEncoder {
             key::Key::Named(named) => map_named_key_legacy(*named, event.modifiers, app_cursor),
             key::Key::Character(c) => {
                 if event.modifiers.control() && !event.modifiers.shift() && !event.modifiers.alt() {
+                    if c == " " || c == "@" {
+                        return Some(vec![0x00]);
+                    }
                     if let Some(first_char) = c.chars().next() {
                         let ascii = first_char.to_ascii_uppercase();
                         if ascii.is_ascii_uppercase() {
@@ -49,6 +56,9 @@ impl TerminalKeyEncoder {
                     && !event.modifiers.alt()
                 {
                     return Some(txt.as_bytes().to_vec());
+                }
+                if !event.modifiers.control() && !event.modifiers.alt() {
+                    return Some(c.as_bytes().to_vec());
                 }
                 None
             }
@@ -71,6 +81,13 @@ impl TerminalKeyEncoder {
 
         match &event.logical_key {
             key::Key::Named(named) => match named {
+                key::Named::Space => {
+                    if has_modifiers(event.modifiers) || mode.report_all_keys_as_esc {
+                        Some(format!("\x1b[32;{mod_param}{event_suffix}u").into_bytes())
+                    } else {
+                        Some(vec![b' '])
+                    }
+                }
                 key::Named::Enter => {
                     if has_modifiers(event.modifiers) || mode.report_all_keys_as_esc {
                         Some(format!("\x1b[13;{mod_param}{event_suffix}u").into_bytes())
@@ -169,6 +186,45 @@ impl TerminalKeyEncoder {
     }
 }
 
+fn is_space_event(event: &TerminalInputEvent) -> bool {
+    match &event.logical_key {
+        key::Key::Named(key::Named::Space) => true,
+        key::Key::Character(c) => c == " ",
+        _ => event.text.as_deref() == Some(" "),
+    }
+}
+
+fn encode_space(event: &TerminalInputEvent, mode: TerminalKeyboardMode) -> Option<Vec<u8>> {
+    let has_ctrl_or_alt = event.modifiers.control() || event.modifiers.alt();
+    let mod_param = modifier_param(event.modifiers);
+    let event_suffix = event_type_suffix(event.kind, mode.report_event_types);
+
+    if mode.report_all_keys_as_esc {
+        return Some(format!("\x1b[32;{mod_param}{event_suffix}u").into_bytes());
+    }
+
+    if mode.disambiguate_esc_codes && has_ctrl_or_alt {
+        if event.kind == KeyEventKind::Release && !mode.report_event_types {
+            return None;
+        }
+        return Some(format!("\x1b[32;{mod_param}{event_suffix}u").into_bytes());
+    }
+
+    if event.kind == KeyEventKind::Release {
+        return None;
+    }
+
+    if event.modifiers.control() && event.modifiers.alt() {
+        Some(vec![0x1b, 0x00])
+    } else if event.modifiers.control() {
+        Some(vec![0x00])
+    } else if event.modifiers.alt() {
+        Some(vec![0x1b, b' '])
+    } else {
+        Some(vec![b' '])
+    }
+}
+
 fn modifier_param(modifiers: Modifiers) -> u8 {
     let mut param = 1u8;
     if modifiers.shift() {
@@ -224,6 +280,15 @@ fn map_named_key_legacy(
     app_cursor_keys: bool,
 ) -> Option<Vec<u8>> {
     let bytes = match named {
+        key::Named::Space => {
+            if modifiers.control() {
+                vec![0x00]
+            } else if modifiers.alt() {
+                b"\x1b ".to_vec()
+            } else {
+                vec![b' ']
+            }
+        }
         key::Named::Enter => vec![b'\r'],
         key::Named::Backspace => vec![0x7f],
         key::Named::Tab => {
@@ -488,5 +553,273 @@ mod tests {
             TerminalKeyEncoder::encode(&release, mode),
             Some(b"\x1b[13;2:3u".to_vec())
         );
+    }
+
+    #[test]
+    fn space_encoding_legacy_and_modifiers() {
+        let mode = TerminalKeyboardMode::default();
+
+        let space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::NONE,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&space, mode),
+            Some(b" ".to_vec())
+        );
+
+        let shift_space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::SHIFT,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&shift_space, mode),
+            Some(b" ".to_vec())
+        );
+
+        let ctrl_space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::COMMAND,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&ctrl_space, mode),
+            Some(vec![0x00])
+        );
+
+        let alt_space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::ALT,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&alt_space, mode),
+            Some(b"\x1b ".to_vec())
+        );
+    }
+
+    #[test]
+    fn space_encoding_disambiguate_esc_codes() {
+        let mode = TerminalKeyboardMode {
+            disambiguate_esc_codes: true,
+            ..Default::default()
+        };
+
+        let space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::NONE,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&space, mode),
+            Some(b" ".to_vec())
+        );
+
+        let shift_space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::SHIFT,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&shift_space, mode),
+            Some(b" ".to_vec())
+        );
+
+        let ctrl_space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::COMMAND,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&ctrl_space, mode),
+            Some(b"\x1b[32;5u".to_vec())
+        );
+
+        let alt_space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::ALT,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&alt_space, mode),
+            Some(b"\x1b[32;3u".to_vec())
+        );
+
+        let ctrl_shift_space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&ctrl_shift_space, mode),
+            Some(b"\x1b[32;6u".to_vec())
+        );
+
+        let alt_shift_space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::ALT | Modifiers::SHIFT,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&alt_shift_space, mode),
+            Some(b"\x1b[32;4u".to_vec())
+        );
+
+        let ctrl_alt_space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::COMMAND | Modifiers::ALT,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&ctrl_alt_space, mode),
+            Some(b"\x1b[32;7u".to_vec())
+        );
+    }
+
+    #[test]
+    fn space_encoding_report_event_types_and_alternate_keys_only() {
+        let report_types_mode = TerminalKeyboardMode {
+            report_event_types: true,
+            ..Default::default()
+        };
+
+        let press = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::NONE,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&press, report_types_mode),
+            Some(b" ".to_vec())
+        );
+
+        let repeat = TerminalInputEvent::new(
+            key::Key::Named(key::Named::Space),
+            key::Physical::Code(key::Code::Space),
+            Modifiers::NONE,
+            Some(" ".to_string()),
+            KeyEventKind::Repeat,
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&repeat, report_types_mode),
+            Some(b" ".to_vec())
+        );
+
+        let release = TerminalInputEvent::release(
+            key::Key::Named(key::Named::Space),
+            key::Physical::Code(key::Code::Space),
+            Modifiers::NONE,
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&release, report_types_mode),
+            None
+        );
+
+        let alt_keys_mode = TerminalKeyboardMode {
+            report_alternate_keys: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            TerminalKeyEncoder::encode(&press, alt_keys_mode),
+            Some(b" ".to_vec())
+        );
+    }
+
+    #[test]
+    fn space_encoding_report_all_keys() {
+        let mode = TerminalKeyboardMode {
+            report_all_keys_as_esc: true,
+            ..Default::default()
+        };
+
+        let space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::NONE,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&space, mode),
+            Some(b"\x1b[32;1u".to_vec())
+        );
+
+        let shift_space = press_event(
+            key::Key::Named(key::Named::Space),
+            key::Code::Space,
+            Modifiers::SHIFT,
+            Some(" "),
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&shift_space, mode),
+            Some(b"\x1b[32;2u".to_vec())
+        );
+
+        let mode_with_events = TerminalKeyboardMode {
+            report_all_keys_as_esc: true,
+            report_event_types: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            TerminalKeyEncoder::encode(&space, mode_with_events),
+            Some(b"\x1b[32;1:1u".to_vec())
+        );
+
+        let repeat = TerminalInputEvent::new(
+            key::Key::Named(key::Named::Space),
+            key::Physical::Code(key::Code::Space),
+            Modifiers::NONE,
+            Some(" ".to_string()),
+            KeyEventKind::Repeat,
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&repeat, mode_with_events),
+            Some(b"\x1b[32;1:2u".to_vec())
+        );
+
+        let release = TerminalInputEvent::release(
+            key::Key::Named(key::Named::Space),
+            key::Physical::Code(key::Code::Space),
+            Modifiers::NONE,
+        );
+        assert_eq!(
+            TerminalKeyEncoder::encode(&release, mode_with_events),
+            Some(b"\x1b[32;1:3u".to_vec())
+        );
+    }
+
+    #[test]
+    fn printable_symbols_encoding() {
+        let mode = TerminalKeyboardMode::default();
+        let symbols = [
+            "a", "1", "-", "_", "=", "+", "[", "]", "{", "}", ";", ":", "'", "\"", ",", ".", "/",
+            "?", "\\", "|", "`", "~",
+        ];
+        for sym in symbols {
+            let evt = press_event(
+                key::Key::Character(sym.into()),
+                key::Code::KeyA,
+                Modifiers::NONE,
+                Some(sym),
+            );
+            assert_eq!(
+                TerminalKeyEncoder::encode(&evt, mode),
+                Some(sym.as_bytes().to_vec())
+            );
+        }
     }
 }
