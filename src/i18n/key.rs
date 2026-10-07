@@ -32,6 +32,7 @@ message_keys! {
     ActivityExplorer => "activity-explorer",
     ActivitySearch => "activity-search",
     ActivityGit => "activity-git",
+    ActivitySettings => "activity-settings",
 
     SideBarExplorerTitle => "side-bar-explorer-title",
     SideBarExplorerPlaceholder => "side-bar-explorer-placeholder",
@@ -39,6 +40,10 @@ message_keys! {
     SideBarSearchPlaceholder => "side-bar-search-placeholder",
     SideBarGitTitle => "side-bar-git-title",
     SideBarGitPlaceholder => "side-bar-git-placeholder",
+    SideBarSettingsTitle => "side-bar-settings-title",
+    SideBarSettingsLanguageLabel => "side-bar-settings-language-label",
+    SideBarSettingsLanguageSystem => "side-bar-settings-language-system",
+    SideBarSettingsCliOverrideNote => "side-bar-settings-cli-override-note",
 
     TerminalTabDefaultTitle => "terminal-tab-default-title",
     TerminalNewTabTooltip => "terminal-new-tab-tooltip",

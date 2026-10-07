@@ -17,11 +17,16 @@ pub enum ActivityItem {
     Explorer,
     Search,
     Git,
+    Settings,
 }
 
 impl ActivityItem {
-    /// All Activity Bar entries, in display order (top to bottom).
-    pub const ALL: [Self; 3] = [Self::Explorer, Self::Search, Self::Git];
+    /// Top primary Activity Bar entries, in display order.
+    pub const TOP_ITEMS: [Self; 3] = [Self::Explorer, Self::Search, Self::Git];
+
+    /// All Activity Bar entries, including bottom global actions.
+    #[allow(dead_code)]
+    pub const ALL: [Self; 4] = [Self::Explorer, Self::Search, Self::Git, Self::Settings];
 }
 
 /// Identifies a terminal tab independently of its position in the strip.
@@ -129,11 +134,20 @@ mod tests {
     #[test]
     fn activity_items_are_ordered_explorer_search_git() {
         assert_eq!(
-            ActivityItem::ALL,
+            ActivityItem::TOP_ITEMS,
             [
                 ActivityItem::Explorer,
                 ActivityItem::Search,
                 ActivityItem::Git
+            ]
+        );
+        assert_eq!(
+            ActivityItem::ALL,
+            [
+                ActivityItem::Explorer,
+                ActivityItem::Search,
+                ActivityItem::Git,
+                ActivityItem::Settings,
             ]
         );
     }

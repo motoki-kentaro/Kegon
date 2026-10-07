@@ -80,6 +80,10 @@ impl CommandDispatcher {
                     CommandOutcome::Ignored
                 }
             }
+            CommandId::WorkbenchSettingsOpen => {
+                workbench.select_activity(ActivityItem::Settings);
+                CommandOutcome::Executed
+            }
             CommandId::DialogConfirm | CommandId::DialogCancel => CommandOutcome::Ignored,
         }
     }

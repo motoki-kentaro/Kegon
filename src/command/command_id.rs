@@ -24,6 +24,8 @@ pub enum CommandId {
     DialogConfirm,
     /// Cancel or close the active modal dialog.
     DialogCancel,
+    /// Open the Settings surface in the workbench.
+    WorkbenchSettingsOpen,
 }
 
 impl CommandId {
@@ -39,6 +41,7 @@ impl CommandId {
             Self::TerminalPaste => "terminal.paste",
             Self::DialogConfirm => "dialog.confirm",
             Self::DialogCancel => "dialog.cancel",
+            Self::WorkbenchSettingsOpen => "workbench.settings.open",
         }
     }
 }
@@ -74,6 +77,7 @@ impl FromStr for CommandId {
             "terminal.paste" => Ok(Self::TerminalPaste),
             "dialog.confirm" => Ok(Self::DialogConfirm),
             "dialog.cancel" => Ok(Self::DialogCancel),
+            "workbench.settings.open" => Ok(Self::WorkbenchSettingsOpen),
             _ => Err(ParseCommandIdError(s.to_string())),
         }
     }
@@ -95,6 +99,7 @@ mod tests {
             CommandId::TerminalPaste,
             CommandId::DialogConfirm,
             CommandId::DialogCancel,
+            CommandId::WorkbenchSettingsOpen,
         ];
 
         for cmd in commands {
