@@ -64,10 +64,12 @@ On Windows, initial shell discovery prioritizes:
 
 ## Keyboard Input Routing & Escapes
 
-Logical key events are mapped to terminal escape sequences:
-- **Enter**: `\r`
-- **Backspace**: `\x7f`
-- **Tab / Shift+Tab**: `\t` / `\x1b[Z`
+Logical key events are mapped to terminal escape sequences and characters:
+- **Printable Text**: Input text is passed directly to the PTY. Physical key codes are not forced to US layout, preserving non-US (e.g. Japanese JIS) and AltGr layouts.
+- **Space Key**: `Named::Space` and `Character(" ")` encode to `0x20` (Space) in legacy mode, `\x00` for `Ctrl+Space`, `\x1b ` for `Alt+Space`, and `\x1b[32;...u` under Kitty/CSI-u extended mode.
+- **Enter**: `\r` (or `\x1b[13;...u` extended)
+- **Backspace**: `\x7f` (or `\x1b[127;...u` extended)
+- **Tab / Shift+Tab**: `\t` / `\x1b[Z` (or `\x1b[9;...u` extended)
 - **Arrows**: ANSI cursor sequences (`\x1b[A`, `\x1b[B`, etc.) or application cursor mode (`\x1bOA`, etc.)
 - **Home / End / PageUp / PageDown / Delete / Insert**: VT escape sequences (`\x1b[H`, `\x1b[5~`, etc.)
 - **Function Keys**: F1..F12 (`\x1bOP`..`\x1b[24~`)
@@ -75,20 +77,32 @@ Logical key events are mapped to terminal escape sequences:
 - **Alt+Key**: ESC prefix `\x1b<char>`
 - **Workbench Shortcuts**: `Ctrl+Shift+E/F/G` are intercepted and routed to the Workbench Activity Bar, bypassing the terminal PTY.
 
-## Ctrl+C / Ctrl+V Policy
+## Text Selection & Scrollback Mapping
 
-- **Ctrl+C**:
-  - If a text selection exists: Copies the selected text to the OS clipboard (`arboard`) and clears the selection. Does **not** send `\x03` to the child process.
-  - If no selection exists: Sends `\x03` (SIGINT) to the child process via PTY.
-- **Ctrl+V**:
-  - Reads text from the OS system clipboard (`arboard`).
-  - If the child application has enabled bracketed paste mode (`BRACKETED_PASTE`), wraps the text with `\x1b[200~` ... `\x1b[201~`.
-  - Normalizes newlines to `\r` for terminal input.
+- Mouse left-button drag creates and extends local simple text selections.
+- Selection cell coordinates use active `TerminalCellMetrics` (`cell_width`, `cell_height`) and account for `display_offset` in `alacritty_terminal` grid line indexing, supporting scrollback selection.
+- Mouse coordinates outside the terminal viewport bounds are safely clamped to the visible grid boundaries `[0..cols-1, 0..rows-1]`.
+- Selection highlights are rendered using active theme tokens (`colors.selection`) with `SELECTION_ALPHA` opacity.
+
+## Ctrl+C / Ctrl+V & Clipboard Policy
+
+- **Windows / Linux**:
+  - **Ctrl+C**:
+    - If a text selection exists: Copies the selected text to the OS clipboard (`arboard`) and clears the selection. Does **not** send `\x03` to the child process.
+    - If no selection exists: Sends `\x03` (SIGINT) to the child process via PTY.
+  - **Ctrl+V**:
+    - Reads text from the OS system clipboard (`arboard`).
+    - If the child application has enabled bracketed paste mode (`BRACKETED_PASTE`), wraps the text with `\x1b[200~` ... `\x1b[201~`.
+    - Normalizes newlines to `\r` for normal terminal paste.
+- **macOS**:
+  - **Cmd+C**: Copy active selection.
+  - **Cmd+V**: Paste from clipboard.
+  - **Ctrl+C**: Send `\x03` (SIGINT) interrupt signal.
 
 ## Japanese MS-IME Integration
 
 - iced 0.14 native `Event::InputMethod` events are consumed:
-  - `ImeEvent::Preedit(text, _)`: Stores transient `preedit_text` in UI state and renders preedit text inline over the cursor position with underline. Preedit text is **never** sent to the PTY.
+  - `ImeEvent::Preedit(text, _)`: Stores transient `preedit_text` in UI state and renders preedit text inline over the cursor position with underline. Preedit text is **never** sent to the PTY. Space pressed during composition drives conversion candidate selection and is not leaked to the PTY.
   - `ImeEvent::Commit(text)`: Clears preedit state and sends the committed UTF-8 string directly to the PTY.
 - Prevents double-transmission of composition keystrokes.
 
@@ -103,15 +117,16 @@ Logical key events are mapped to terminal escape sequences:
 - Resizing updates `alacritty_terminal` grid dimensions and sends a `Msg::Resize` command to ConPTY.
 - Mouse wheel scrolling shifts the display offset into the scrollback history buffer.
 
+## Non-Goals (Out of Scope for Issue #27)
+
+- Right-click paste and terminal context menus.
+- Double-click word selection and triple-click line selection.
+- Child application mouse event reporting (X10, VT200, SGR mouse capture).
+- Advanced graphics protocols (Sixel, Kitty, iTerm2 inline images).
+
 ## License & Attribution
 
 - Kegon is licensed under the **MIT License**.
 - `alacritty_terminal` is licensed under **Apache-2.0**.
 - `arboard` is dual-licensed under **MIT OR Apache-2.0**.
 - Third-party notices and licenses are documented in `THIRD_PARTY_NOTICES.md`.
-
-## Known Limitations (PoC Scope)
-
-- Multi-tab management and creation UI are out of scope for this PoC (single terminal session only).
-- Advanced graphics protocols (Sixel, Kitty, iTerm2 inline images) are intentionally omitted.
-- Font selection UI and detailed font metric measurements are out of scope.

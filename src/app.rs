@@ -12,8 +12,8 @@ use iced::widget::{
     Space, button, column, container, mouse_area, pick_list, row, space, svg, text, tooltip,
 };
 use iced::{
-    Border, Center, Color, Element, Event, Fill, Font, Size, Subscription, Theme, event, font,
-    mouse,
+    Border, Center, Color, Element, Event, Fill, Font, Point, Size, Subscription, Theme, event,
+    font, mouse,
 };
 
 use crate::cli::{SmokeConfirmationDialog, SmokeFontPicker};
@@ -24,8 +24,8 @@ use crate::dialog::{
     render_modal_overlay,
 };
 use crate::font::{
-    FontCache, SystemFontCatalog, TerminalFontConfig, TerminalFontStatus, UiFontResolution,
-    UiFontStatus, resolve_terminal_font, resolve_ui_font,
+    FontCache, SystemFontCatalog, TerminalCellMetrics, TerminalFontConfig, TerminalFontStatus,
+    UiFontResolution, UiFontStatus, resolve_terminal_font, resolve_ui_font,
 };
 use crate::i18n::{self, FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{ICON_SIZE, activity_icon};
@@ -74,6 +74,31 @@ fn terminal_events_stream() -> impl iced::futures::Stream<Item = Message> {
             }
         },
     )
+}
+
+/// Calculates clamped column and row line indices for a given screen position.
+pub fn calculate_terminal_cell_point(
+    position: Point,
+    window_size: Size,
+    side_bar_width: f32,
+    metrics: &TerminalCellMetrics,
+) -> (usize, usize) {
+    let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + side_bar_width;
+    let term_y = TAB_STRIP_HEIGHT;
+    let term_w = (window_size.width - term_x).max(1.0);
+    let term_h = (window_size.height - term_y).max(1.0);
+
+    let (max_cols, max_rows) = metrics.grid_size(term_w, term_h);
+
+    let local_x = (position.x - term_x).clamp(0.0, (term_w - 0.1).max(0.0));
+    let local_y = (position.y - term_y).clamp(0.0, (term_h - 0.1).max(0.0));
+
+    let col = ((local_x / metrics.cell_width).floor() as usize)
+        .min((max_cols as usize).saturating_sub(1));
+    let line = ((local_y / metrics.cell_height).floor() as usize)
+        .min((max_rows as usize).saturating_sub(1));
+
+    (col, line)
 }
 
 #[derive(Debug, Clone)]
@@ -736,11 +761,12 @@ impl Kegon {
                     if self.cursor_position.x >= term_x && self.cursor_position.y >= term_y {
                         self.terminal_focused = true;
                         if let Some(session) = &self.terminal_session {
-                            let local_x = (self.cursor_position.x - term_x).max(0.0);
-                            let local_y = (self.cursor_position.y - term_y).max(0.0);
-                            let metrics = &self.terminal_font_config.metrics;
-                            let col = (local_x / metrics.cell_width).floor() as usize;
-                            let line = (local_y / metrics.cell_height).floor() as usize;
+                            let (col, line) = calculate_terminal_cell_point(
+                                self.cursor_position,
+                                self.window_size,
+                                self.workbench.side_bar_width(),
+                                &self.terminal_font_config.metrics,
+                            );
                             session.start_selection(col, line);
                             self.mouse_dragging_selection = true;
                         }
@@ -755,13 +781,12 @@ impl Kegon {
                     && self.mouse_dragging_selection
                     && let Some(session) = &self.terminal_session
                 {
-                    let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + self.workbench.side_bar_width();
-                    let term_y = TAB_STRIP_HEIGHT;
-                    let local_x = (position.x - term_x).max(0.0);
-                    let local_y = (position.y - term_y).max(0.0);
-                    let metrics = &self.terminal_font_config.metrics;
-                    let col = (local_x / metrics.cell_width).floor() as usize;
-                    let line = (local_y / metrics.cell_height).floor() as usize;
+                    let (col, line) = calculate_terminal_cell_point(
+                        position,
+                        self.window_size,
+                        self.workbench.side_bar_width(),
+                        &self.terminal_font_config.metrics,
+                    );
                     session.update_selection(col, line);
                 }
             }
@@ -1928,5 +1953,30 @@ mod tests {
         app.update(Message::SettingsResetTerminalFontClicked);
         assert_eq!(app.settings.appearance.terminal_font_family, None);
         assert_eq!(app.terminal_font_config.status, TerminalFontStatus::Default);
+    }
+
+    #[test]
+    fn terminal_cell_point_calculation_and_clamping() {
+        let metrics = TerminalCellMetrics::new(10.0, 20.0, 13.0);
+        let window_size = Size::new(1000.0, 600.0);
+        let side_bar_w = 200.0;
+
+        let pt = Point::new(272.0, 75.0);
+        let (col, line) = calculate_terminal_cell_point(pt, window_size, side_bar_w, &metrics);
+        assert_eq!((col, line), (2, 2));
+
+        let pt_neg = Point::new(-100.0, -50.0);
+        let (col_neg, line_neg) =
+            calculate_terminal_cell_point(pt_neg, window_size, side_bar_w, &metrics);
+        assert_eq!((col_neg, line_neg), (0, 0));
+
+        let pt_far = Point::new(5000.0, 5000.0);
+        let (col_far, line_far) =
+            calculate_terminal_cell_point(pt_far, window_size, side_bar_w, &metrics);
+        let (max_cols, max_rows) = metrics.grid_size(1000.0 - 252.0, 600.0 - 35.0);
+        assert_eq!(
+            (col_far, line_far),
+            ((max_cols - 1) as usize, (max_rows - 1) as usize)
+        );
     }
 }

@@ -227,7 +227,8 @@ impl TerminalSession {
         use alacritty_terminal::index::{Column, Line, Point as TermPoint, Side};
         use alacritty_terminal::selection::{Selection, SelectionType};
         let mut term = self.term.lock();
-        let point = TermPoint::new(Line(line as i32), Column(col));
+        let display_offset = term.grid().display_offset() as i32;
+        let point = TermPoint::new(Line(line as i32 - display_offset), Column(col));
         term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
     }
 
@@ -235,8 +236,9 @@ impl TerminalSession {
     pub fn update_selection(&self, col: usize, line: usize) {
         use alacritty_terminal::index::{Column, Line, Point as TermPoint, Side};
         let mut term = self.term.lock();
+        let display_offset = term.grid().display_offset() as i32;
         if let Some(selection) = term.selection.as_mut() {
-            let point = TermPoint::new(Line(line as i32), Column(col));
+            let point = TermPoint::new(Line(line as i32 - display_offset), Column(col));
             selection.update(point, Side::Right);
         }
     }
@@ -345,5 +347,19 @@ mod tests {
         drop(rx);
         let res = tx.unbounded_send(TerminalEvent::Wakeup);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn selection_lifecycle_with_scrollback() {
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
+
+        session.scroll_display(5);
+        session.start_selection(0, 0);
+        session.update_selection(10, 0);
+        assert!(session.has_selection());
+
+        session.clear_selection();
+        assert!(!session.has_selection());
     }
 }
