@@ -9,7 +9,9 @@ It is designed to serve both UI font selection and Terminal font selection throu
 - `FontPickerMode::Ui`: Lists all reasonable installed font families and renders mixed Latin, numeric, and CJK text.
 - `FontPickerMode::Terminal`: Enables monospaced font filtering by default and renders terminal-oriented preview text (including ASCII, CJK, box-drawing characters, and emojis).
 
-The Font Picker does **not** persist selections to `settings.toml` or apply fonts to active terminal sessions or UI elements directly. It returns a `FontPickerResult` (`Select(FontCandidate)` or `Cancel`) to the caller.
+The Font Picker does **not** persist selections to `settings.toml` directly. It returns a `FontPickerResult` (`Select(FontCandidate)` or `Cancel`) to the caller (`Kegon`), which handles settings persistence and runtime UI font application.
+
+When opened from the Settings Side Bar (`Choose...`), if `ui_font_family` is configured in `ApplicationSettings`, the corresponding family candidate is automatically pre-selected and highlighted in the candidate list. If unset or uninstalled, the first candidate is selected by default.
 
 ---
 

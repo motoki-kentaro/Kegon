@@ -36,6 +36,7 @@ pub fn render_font_picker_overlay<'a, Message>(
     base_view: Element<'a, Message>,
     picker: &'a FontPicker,
     localizer: &'a Localizer,
+    ui_font: Font,
     on_search_changed: impl Fn(String) -> Message + 'a,
     on_monospace_toggled: impl Fn(bool) -> Message + 'a,
     on_candidate_selected: impl Fn(usize) -> Message + 'a + Copy,
@@ -59,6 +60,7 @@ where
 
     let is_search_focused = picker.focus == FontPickerFocus::SearchInput;
     let search_input = text_input(&search_placeholder, &picker.search_query)
+        .font(ui_font)
         .on_input(on_search_changed)
         .padding(8)
         .size(13.0)
@@ -180,58 +182,68 @@ where
 
     let cancel_on_result = on_result.clone();
     let is_cancel_focused = picker.focus == FontPickerFocus::CancelButton;
-    let cancel_btn = button(text(cancel_label).size(13.0).color(palette::TEXT_TITLE))
-        .padding([6, 16])
-        .style(move |_, status| {
-            let bg = match status {
-                button::Status::Hovered | button::Status::Pressed => palette::BUTTON_BG_HOVER,
-                _ => palette::BUTTON_BG,
-            };
-            let border_color = if is_cancel_focused {
-                palette::FOCUS_BORDER
-            } else {
-                palette::BORDER
-            };
-            button::Style {
-                background: Some(bg.into()),
-                text_color: palette::TEXT_TITLE,
-                border: Border {
-                    color: border_color,
-                    width: if is_cancel_focused { 2.0 } else { 1.0 },
-                    radius: 4.0.into(),
-                },
-                ..button::Style::default()
-            }
-        })
-        .on_press(cancel_on_result(FontPickerResult::Cancel));
+    let cancel_btn = button(
+        text(cancel_label)
+            .size(13.0)
+            .font(ui_font)
+            .color(palette::TEXT_TITLE),
+    )
+    .padding([6, 16])
+    .style(move |_, status| {
+        let bg = match status {
+            button::Status::Hovered | button::Status::Pressed => palette::BUTTON_BG_HOVER,
+            _ => palette::BUTTON_BG,
+        };
+        let border_color = if is_cancel_focused {
+            palette::FOCUS_BORDER
+        } else {
+            palette::BORDER
+        };
+        button::Style {
+            background: Some(bg.into()),
+            text_color: palette::TEXT_TITLE,
+            border: Border {
+                color: border_color,
+                width: if is_cancel_focused { 2.0 } else { 1.0 },
+                radius: 4.0.into(),
+            },
+            ..button::Style::default()
+        }
+    })
+    .on_press(cancel_on_result(FontPickerResult::Cancel));
 
     let select_on_result = on_result;
     let is_select_focused = picker.focus == FontPickerFocus::SelectButton;
     let selected_candidate = highlighted.cloned();
 
-    let mut select_btn = button(text(select_label).size(13.0).color(palette::TEXT_TITLE))
-        .padding([6, 16])
-        .style(move |_, status| {
-            let bg = match status {
-                button::Status::Hovered | button::Status::Pressed => palette::PRIMARY_BG_HOVER,
-                _ => palette::PRIMARY_BG,
-            };
-            let border_color = if is_select_focused {
-                palette::FOCUS_BORDER_BRIGHT
-            } else {
-                palette::BORDER
-            };
-            button::Style {
-                background: Some(bg.into()),
-                text_color: palette::TEXT_TITLE,
-                border: Border {
-                    color: border_color,
-                    width: if is_select_focused { 2.0 } else { 1.0 },
-                    radius: 4.0.into(),
-                },
-                ..button::Style::default()
-            }
-        });
+    let mut select_btn = button(
+        text(select_label)
+            .size(13.0)
+            .font(ui_font)
+            .color(palette::TEXT_TITLE),
+    )
+    .padding([6, 16])
+    .style(move |_, status| {
+        let bg = match status {
+            button::Status::Hovered | button::Status::Pressed => palette::PRIMARY_BG_HOVER,
+            _ => palette::PRIMARY_BG,
+        };
+        let border_color = if is_select_focused {
+            palette::FOCUS_BORDER_BRIGHT
+        } else {
+            palette::BORDER
+        };
+        button::Style {
+            background: Some(bg.into()),
+            text_color: palette::TEXT_TITLE,
+            border: Border {
+                color: border_color,
+                width: if is_select_focused { 2.0 } else { 1.0 },
+                radius: 4.0.into(),
+            },
+            ..button::Style::default()
+        }
+    });
 
     if let Some(candidate) = selected_candidate {
         select_btn = select_btn.on_press(select_on_result(FontPickerResult::Select(candidate)));
@@ -240,7 +252,10 @@ where
     let actions = row![cancel_btn, Space::new().width(8.0), select_btn].align_y(Center);
 
     let mut content = column![
-        text(title_text).size(16.0).color(palette::TEXT_TITLE),
+        text(title_text)
+            .size(16.0)
+            .font(ui_font)
+            .color(palette::TEXT_TITLE),
         Space::new().height(12.0),
         search_input,
     ]

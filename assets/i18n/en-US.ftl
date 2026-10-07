@@ -23,6 +23,12 @@ side-bar-settings-title = SETTINGS
 side-bar-settings-language-label = Application Language
 side-bar-settings-language-system = System default
 side-bar-settings-cli-override-note = Application language is overridden by --locale for this session.
+side-bar-settings-appearance-title = APPEARANCE
+side-bar-settings-ui-font-label = UI Font
+side-bar-settings-ui-font-system = System default
+side-bar-settings-ui-font-choose = Choose...
+side-bar-settings-ui-font-reset = Reset
+side-bar-settings-ui-font-not-installed = { $family } (not installed)
 
 
 ## Terminal tab strip

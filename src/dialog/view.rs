@@ -1,7 +1,7 @@
 //! Modal shell and confirmation dialog UI rendering.
 
 use iced::widget::{Space, button, column, container, mouse_area, row, space, svg, text};
-use iced::{Border, Center, Element, Fill, Length};
+use iced::{Border, Center, Element, Fill, Font, Length};
 
 use crate::dialog::confirmation::{
     ActionTone, ConfirmationDialog, ConfirmationResult, FocusedAction,
@@ -33,6 +33,7 @@ pub fn render_modal_overlay<'a, Message>(
     base_view: Element<'a, Message>,
     dialog: &'a ConfirmationDialog,
     localizer: &'a Localizer,
+    ui_font: Font,
     on_action: impl Fn(ConfirmationResult) -> Message + 'a + Clone,
     on_backdrop: Message,
 ) -> Element<'a, Message>
@@ -53,72 +54,88 @@ where
                 color: Some(icon_color),
             }),
         Space::new().width(12.0),
-        text(title_text).size(16.0).color(palette::TEXT_TITLE)
+        text(title_text)
+            .size(16.0)
+            .font(ui_font)
+            .color(palette::TEXT_TITLE)
     ]
     .align_y(Center);
 
-    let body = text(message_text).size(13.0).color(palette::TEXT_BODY);
+    let body = text(message_text)
+        .size(13.0)
+        .font(ui_font)
+        .color(palette::TEXT_BODY);
 
     let is_sec_focused = dialog.focused_action == FocusedAction::Secondary;
     let sec_on_action = on_action.clone();
-    let secondary_btn = button(text(secondary_label).size(13.0).color(palette::TEXT_TITLE))
-        .padding([6, 16])
-        .style(move |_, status| {
-            let bg = match status {
-                button::Status::Hovered | button::Status::Pressed => palette::BUTTON_BG_HOVER,
-                _ => palette::BUTTON_BG,
-            };
-            let border_color = if is_sec_focused {
-                palette::FOCUS_BORDER
-            } else {
-                palette::BORDER
-            };
-            let border_width = if is_sec_focused { 2.0 } else { 1.0 };
-            button::Style {
-                background: Some(bg.into()),
-                text_color: palette::TEXT_TITLE,
-                border: Border {
-                    color: border_color,
-                    width: border_width,
-                    radius: 4.0.into(),
-                },
-                ..button::Style::default()
-            }
-        })
-        .on_press(sec_on_action(ConfirmationResult::Secondary));
+    let secondary_btn = button(
+        text(secondary_label)
+            .size(13.0)
+            .font(ui_font)
+            .color(palette::TEXT_TITLE),
+    )
+    .padding([6, 16])
+    .style(move |_, status| {
+        let bg = match status {
+            button::Status::Hovered | button::Status::Pressed => palette::BUTTON_BG_HOVER,
+            _ => palette::BUTTON_BG,
+        };
+        let border_color = if is_sec_focused {
+            palette::FOCUS_BORDER
+        } else {
+            palette::BORDER
+        };
+        let border_width = if is_sec_focused { 2.0 } else { 1.0 };
+        button::Style {
+            background: Some(bg.into()),
+            text_color: palette::TEXT_TITLE,
+            border: Border {
+                color: border_color,
+                width: border_width,
+                radius: 4.0.into(),
+            },
+            ..button::Style::default()
+        }
+    })
+    .on_press(sec_on_action(ConfirmationResult::Secondary));
 
     let is_pri_focused = dialog.focused_action == FocusedAction::Primary;
     let tone = dialog.primary_action_tone;
     let pri_on_action = on_action;
-    let primary_btn = button(text(primary_label).size(13.0).color(palette::TEXT_TITLE))
-        .padding([6, 16])
-        .style(move |_, status| {
-            let (bg, hover_bg) = match tone {
-                ActionTone::Destructive => (palette::DESTRUCTIVE_BG, palette::DESTRUCTIVE_BG_HOVER),
-                ActionTone::Normal => (palette::PRIMARY_BG, palette::PRIMARY_BG_HOVER),
-            };
-            let background = match status {
-                button::Status::Hovered | button::Status::Pressed => hover_bg,
-                _ => bg,
-            };
-            let border_color = if is_pri_focused {
-                palette::FOCUS_BORDER_BRIGHT
-            } else {
-                palette::BORDER
-            };
-            let border_width = if is_pri_focused { 2.0 } else { 1.0 };
-            button::Style {
-                background: Some(background.into()),
-                text_color: palette::TEXT_TITLE,
-                border: Border {
-                    color: border_color,
-                    width: border_width,
-                    radius: 4.0.into(),
-                },
-                ..button::Style::default()
-            }
-        })
-        .on_press(pri_on_action(ConfirmationResult::Primary));
+    let primary_btn = button(
+        text(primary_label)
+            .size(13.0)
+            .font(ui_font)
+            .color(palette::TEXT_TITLE),
+    )
+    .padding([6, 16])
+    .style(move |_, status| {
+        let (bg, hover_bg) = match tone {
+            ActionTone::Destructive => (palette::DESTRUCTIVE_BG, palette::DESTRUCTIVE_BG_HOVER),
+            ActionTone::Normal => (palette::PRIMARY_BG, palette::PRIMARY_BG_HOVER),
+        };
+        let background = match status {
+            button::Status::Hovered | button::Status::Pressed => hover_bg,
+            _ => bg,
+        };
+        let border_color = if is_pri_focused {
+            palette::FOCUS_BORDER_BRIGHT
+        } else {
+            palette::BORDER
+        };
+        let border_width = if is_pri_focused { 2.0 } else { 1.0 };
+        button::Style {
+            background: Some(background.into()),
+            text_color: palette::TEXT_TITLE,
+            border: Border {
+                color: border_color,
+                width: border_width,
+                radius: 4.0.into(),
+            },
+            ..button::Style::default()
+        }
+    })
+    .on_press(pri_on_action(ConfirmationResult::Primary));
 
     let actions = row![secondary_btn, Space::new().width(8.0), primary_btn].align_y(Center);
 

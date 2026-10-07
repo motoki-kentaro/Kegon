@@ -38,10 +38,22 @@ impl std::fmt::Display for LocalePreference {
     }
 }
 
+/// User preferences for visual appearance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AppearanceSettings {
+    /// Preferred UI font family name (e.g. "Noto Sans JP", "Segoe UI").
+    /// `None` indicates system default font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_font_family: Option<String>,
+}
+
 /// Typed model holding Kegon application-level configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ApplicationSettings {
     /// Preferred UI language.
     #[serde(default)]
     pub locale: LocalePreference,
+    /// Preferred visual appearance.
+    #[serde(default)]
+    pub appearance: AppearanceSettings,
 }

@@ -128,6 +128,20 @@ impl FontPicker {
         }
     }
 
+    /// Select candidate by family name, if present in filtered candidates. Returns true if found.
+    pub fn select_family(&mut self, family_name: &str) -> bool {
+        let filtered = self.filtered_candidates();
+        if let Some(idx) = filtered
+            .iter()
+            .position(|c| c.family_name.eq_ignore_ascii_case(family_name))
+        {
+            self.highlighted_index = idx;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Move candidate highlight up.
     pub fn move_highlight_up(&mut self) {
         if self.highlighted_index > 0 {
@@ -286,6 +300,25 @@ mod tests {
                     bytes: vec![]
                 }
             )))
+        );
+    }
+
+    #[test]
+    fn select_family_preselects_candidate() {
+        let mut picker = FontPicker::new(FontPickerMode::Ui, test_catalog());
+        assert_eq!(picker.highlighted_index, 0);
+
+        assert!(picker.select_family("Segoe UI"));
+        assert_eq!(
+            picker.highlighted_candidate().unwrap().family_name,
+            "Segoe UI"
+        );
+
+        assert!(!picker.select_family("NonExistentFont"));
+        // Unmatched leaves highlighted_index unchanged
+        assert_eq!(
+            picker.highlighted_candidate().unwrap().family_name,
+            "Segoe UI"
         );
     }
 }

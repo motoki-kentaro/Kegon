@@ -44,6 +44,12 @@ message_keys! {
     SideBarSettingsLanguageLabel => "side-bar-settings-language-label",
     SideBarSettingsLanguageSystem => "side-bar-settings-language-system",
     SideBarSettingsCliOverrideNote => "side-bar-settings-cli-override-note",
+    SideBarSettingsAppearanceTitle => "side-bar-settings-appearance-title",
+    SideBarSettingsUiFontLabel => "side-bar-settings-ui-font-label",
+    SideBarSettingsUiFontSystem => "side-bar-settings-ui-font-system",
+    SideBarSettingsUiFontChoose => "side-bar-settings-ui-font-choose",
+    SideBarSettingsUiFontReset => "side-bar-settings-ui-font-reset",
+    SideBarSettingsUiFontNotInstalled => "side-bar-settings-ui-font-not-installed",
 
     TerminalTabDefaultTitle => "terminal-tab-default-title",
     TerminalNewTabTooltip => "terminal-new-tab-tooltip",
