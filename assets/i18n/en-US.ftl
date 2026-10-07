@@ -23,6 +23,7 @@ side-bar-git-placeholder = Git integration is not implemented yet.
 
 terminal-tab-default-title = Terminal
 terminal-new-tab-tooltip = New Terminal (not implemented yet)
+terminal-process-exited = Process exited with code { $code }.
 
 ## Main area
 

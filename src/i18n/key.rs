@@ -41,6 +41,7 @@ message_keys! {
 
     TerminalTabDefaultTitle => "terminal-tab-default-title",
     TerminalNewTabTooltip => "terminal-new-tab-tooltip",
+    TerminalProcessExited => "terminal-process-exited",
 
     MainPlaceholderTitle => "main-placeholder-title",
     MainPlaceholderBody => "main-placeholder-body",

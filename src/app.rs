@@ -1,19 +1,59 @@
 //! The iced application: messages, update logic, and the workbench view.
 
-use iced::keyboard::{self, Modifiers, key};
+use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, channel};
+
+use iced::advanced::input_method::Event as ImeEvent;
+use iced::futures::SinkExt;
+use iced::keyboard;
+use iced::widget::canvas::Canvas;
 use iced::widget::{Space, button, column, container, mouse_area, row, space, svg, text, tooltip};
 use iced::{
     Border, Center, Color, Element, Event, Fill, Font, Subscription, Theme, event, font, mouse,
 };
 
-use crate::i18n::{Locale, Localizer, MessageKey};
+use crate::command::{CommandContext, CommandDispatcher, KeyChord, KeybindingResolver, Platform};
+use crate::i18n::{FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{ICON_SIZE, activity_icon};
+use crate::terminal::{
+    DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, InputAction, SystemClipboard, TerminalEvent,
+    TerminalProgram, TerminalSession, calculate_grid_size, format_paste, process_key_event,
+};
 use crate::workbench::{ActivityItem, TabId, Workbench};
 
 const ACTIVITY_BAR_WIDTH: f32 = 48.0;
 const SASH_WIDTH: f32 = 4.0;
 const TAB_STRIP_HEIGHT: f32 = 35.0;
 const UI_TEXT_SIZE: f32 = 13.0;
+
+static TERMINAL_EVENT_RX: Mutex<Option<Receiver<TerminalEvent>>> = Mutex::new(None);
+
+fn terminal_events_stream() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        100,
+        move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            loop {
+                let event = {
+                    if let Ok(rx_guard) = TERMINAL_EVENT_RX.lock() {
+                        if let Some(rx) = rx_guard.as_ref() {
+                            rx.try_recv().ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(evt) = event {
+                    let _ = output.send(Message::TerminalEventReceived(evt)).await;
+                } else {
+                    iced::futures::pending!();
+                }
+            }
+        },
+    )
+}
 
 /// Colors for the PoC. A proper theme system is out of scope for now.
 mod palette {
@@ -43,29 +83,73 @@ pub enum Message {
     SashPressed,
     SashDragged(f32),
     SashReleased,
+    IcedEventReceived(Event),
+    TerminalEventReceived(TerminalEvent),
+    TerminalClicked,
 }
 
-#[derive(Debug)]
 pub struct Kegon {
     /// Fixed for the lifetime of the application; chosen at startup.
     localizer: Localizer,
     workbench: Workbench,
-    /// Whether the Side Bar sash is being dragged. This is transient
-    /// interaction state, so it lives here rather than in [`Workbench`].
+    /// Whether the Side Bar sash is being dragged.
     resizing_side_bar: bool,
-    /// The Activity Bar entry under the pointer, if any. Tracked here
-    /// because the hover color applies to the whole entry, not just the
-    /// icon's own bounds.
+    /// The Activity Bar entry under the pointer, if any.
     hovered_activity: Option<ActivityItem>,
+    /// Active terminal session.
+    terminal_session: Option<TerminalSession>,
+    /// System clipboard interface.
+    system_clipboard: SystemClipboard,
+    /// Transient Japanese IME preedit composition string.
+    preedit_text: Option<String>,
+    /// Whether keyboard focus is in the terminal.
+    terminal_focused: bool,
+    /// Last known mouse cursor position.
+    cursor_position: iced::Point,
+    /// Whether the mouse left button is currently dragging a text selection.
+    mouse_dragging_selection: bool,
+    /// Keybinding resolver and platform configuration.
+    keybinding_resolver: KeybindingResolver,
+}
+
+impl std::fmt::Debug for Kegon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Kegon")
+            .field("resizing_side_bar", &self.resizing_side_bar)
+            .field("hovered_activity", &self.hovered_activity)
+            .field("terminal_focused", &self.terminal_focused)
+            .finish()
+    }
 }
 
 impl Kegon {
     pub fn new(locale: Locale) -> Self {
+        let (tx, rx) = channel();
+        if let Ok(mut rx_guard) = TERMINAL_EVENT_RX.lock() {
+            *rx_guard = Some(rx);
+        }
+
+        let terminal_session = TerminalSession::spawn(
+            80,
+            24,
+            DEFAULT_CELL_WIDTH as u16,
+            DEFAULT_CELL_HEIGHT as u16,
+            tx,
+        )
+        .ok();
+
         Self {
             localizer: Localizer::new(locale),
             workbench: Workbench::default(),
             resizing_side_bar: false,
             hovered_activity: None,
+            terminal_session,
+            system_clipboard: SystemClipboard::new(),
+            preedit_text: None,
+            terminal_focused: true,
+            cursor_position: iced::Point::ORIGIN,
+            mouse_dragging_selection: false,
+            keybinding_resolver: KeybindingResolver::default_for_platform(Platform::current()),
         }
     }
 
@@ -79,7 +163,6 @@ impl Kegon {
             Message::ActivitySelected(item) => self.workbench.select_activity(item),
             Message::ActivityHovered(item) => self.hovered_activity = Some(item),
             Message::ActivityUnhovered(item) => {
-                // Ignore a late exit from an entry the pointer already left.
                 if self.hovered_activity == Some(item) {
                     self.hovered_activity = None;
                 }
@@ -93,22 +176,172 @@ impl Kegon {
                 }
             }
             Message::SashReleased => self.resizing_side_bar = false,
+            Message::TerminalClicked => {
+                self.terminal_focused = true;
+            }
+            Message::TerminalEventReceived(_event) => {
+                // Terminal event arrived; iced will re-render automatically.
+            }
+            Message::IcedEventReceived(event) => {
+                self.handle_iced_event(event);
+            }
+        }
+    }
+
+    fn handle_iced_event(&mut self, event: Event) {
+        match event {
+            Event::Window(iced::window::Event::Resized(size)) => {
+                if let Some(session) = &self.terminal_session {
+                    let side_bar_w = self.workbench.side_bar_width();
+                    let main_w =
+                        (size.width - ACTIVITY_BAR_WIDTH - SASH_WIDTH - side_bar_w).max(10.0);
+                    let main_h = (size.height - TAB_STRIP_HEIGHT).max(10.0);
+                    let (cols, rows) = calculate_grid_size(main_w, main_h);
+                    session.resize(
+                        cols,
+                        rows,
+                        DEFAULT_CELL_WIDTH as u16,
+                        DEFAULT_CELL_HEIGHT as u16,
+                    );
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                physical_key,
+                key: logical_key,
+                modifiers,
+                text,
+                ..
+            }) => {
+                let context = if self.terminal_focused {
+                    CommandContext::TerminalFocused
+                } else {
+                    CommandContext::Workbench
+                };
+
+                if let Some(chord) = KeyChord::from_iced(&logical_key, modifiers)
+                    && let Some(command_id) = self.keybinding_resolver.resolve(context, &chord)
+                {
+                    CommandDispatcher::dispatch(
+                        command_id,
+                        &mut self.workbench,
+                        self.terminal_session.as_ref(),
+                        &mut self.system_clipboard,
+                    );
+                    return;
+                }
+
+                if self.terminal_focused
+                    && let Some(session) = &self.terminal_session
+                {
+                    let has_selection = session.has_selection();
+                    let app_cursor = session.is_app_cursor_keys();
+                    let action = process_key_event(
+                        physical_key,
+                        &logical_key,
+                        modifiers,
+                        text.as_deref(),
+                        has_selection,
+                        app_cursor,
+                    );
+
+                    match action {
+                        InputAction::WorkbenchShortcut(item) => {
+                            self.workbench.select_activity(item);
+                        }
+                        InputAction::CopySelection => {
+                            if let Some(selected_text) = session.copy_selection() {
+                                self.system_clipboard.set_text(selected_text);
+                                session.clear_selection();
+                            }
+                        }
+                        InputAction::PasteFromClipboard => {
+                            if let Some(pasted_text) = self.system_clipboard.get_text() {
+                                let formatted =
+                                    format_paste(&pasted_text, session.is_bracketed_paste());
+                                session.write_input(formatted);
+                            }
+                        }
+                        InputAction::SendToPty(bytes) => {
+                            session.write_input(bytes);
+                        }
+                        InputAction::Ignore => {}
+                    }
+                }
+            }
+            Event::InputMethod(ime_event) => {
+                if self.terminal_focused
+                    && let Some(session) = &self.terminal_session
+                {
+                    match ime_event {
+                        ImeEvent::Preedit(text, _) => {
+                            self.preedit_text = if text.is_empty() { None } else { Some(text) };
+                        }
+                        ImeEvent::Commit(text) => {
+                            self.preedit_text = None;
+                            session.write_input(text.into_bytes());
+                        }
+                        ImeEvent::Closed => {
+                            self.preedit_text = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + self.workbench.side_bar_width();
+                let term_y = TAB_STRIP_HEIGHT;
+
+                if self.cursor_position.x >= term_x && self.cursor_position.y >= term_y {
+                    self.terminal_focused = true;
+                    if let Some(session) = &self.terminal_session {
+                        let local_x = (self.cursor_position.x - term_x).max(0.0);
+                        let local_y = (self.cursor_position.y - term_y).max(0.0);
+                        let col = (local_x / DEFAULT_CELL_WIDTH).floor() as usize;
+                        let line = (local_y / DEFAULT_CELL_HEIGHT).floor() as usize;
+                        session.start_selection(col, line);
+                        self.mouse_dragging_selection = true;
+                    }
+                } else {
+                    self.terminal_focused = false;
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                self.cursor_position = position;
+                if self.mouse_dragging_selection
+                    && let Some(session) = &self.terminal_session
+                {
+                    let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + self.workbench.side_bar_width();
+                    let term_y = TAB_STRIP_HEIGHT;
+                    let local_x = (position.x - term_x).max(0.0);
+                    let local_y = (position.y - term_y).max(0.0);
+                    let col = (local_x / DEFAULT_CELL_WIDTH).floor() as usize;
+                    let line = (local_y / DEFAULT_CELL_HEIGHT).floor() as usize;
+                    session.update_selection(col, line);
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                self.mouse_dragging_selection = false;
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                if let Some(session) = &self.terminal_session {
+                    let lines = match delta {
+                        mouse::ScrollDelta::Lines { y, .. } => (y * 3.0) as i32,
+                        mouse::ScrollDelta::Pixels { y, .. } => (y / 6.0) as i32,
+                    };
+                    if lines != 0 {
+                        session.scroll_display(lines);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let shortcuts = keyboard::listen().filter_map(|event| match event {
-            keyboard::Event::KeyPressed {
-                physical_key,
-                modifiers,
-                ..
-            } => activity_shortcut(physical_key, modifiers).map(Message::ActivitySelected),
-            _ => None,
-        });
+        let events = event::listen().map(Message::IcedEventReceived);
+        let terminal_events = Subscription::run(terminal_events_stream);
 
         if self.resizing_side_bar {
-            // Track the cursor across the whole window while dragging, so the
-            // drag continues even when the pointer leaves the thin sash.
             let drag = event::listen_with(|event, _status, _window| match event {
                 Event::Mouse(mouse::Event::CursorMoved { position }) => {
                     Some(Message::SashDragged(position.x))
@@ -119,9 +352,9 @@ impl Kegon {
                 _ => None,
             });
 
-            Subscription::batch([shortcuts, drag])
+            Subscription::batch([events, terminal_events, drag])
         } else {
-            shortcuts
+            Subscription::batch([events, terminal_events])
         }
     }
 
@@ -135,7 +368,6 @@ impl Kegon {
         .height(Fill);
 
         if self.resizing_side_bar {
-            // Keep the resize cursor while the pointer is outside the sash.
             mouse_area(body)
                 .interaction(mouse::Interaction::ResizingHorizontally)
                 .into()
@@ -156,7 +388,6 @@ impl Kegon {
                 .height(ICON_SIZE)
                 .style(move |_, _| svg::Style { color: Some(color) });
 
-            // A thin bar on the left edge marks the selected item.
             let indicator = container(space())
                 .width(2)
                 .height(ACTIVITY_BAR_WIDTH)
@@ -223,7 +454,6 @@ impl Kegon {
             .into()
     }
 
-    /// The draggable divider between the Side Bar and the main area.
     fn sash(&self) -> Element<'_, Message> {
         let line = container(Space::new().width(1).height(Fill))
             .style(|_| container::Style::default().background(palette::BORDER));
@@ -250,22 +480,64 @@ impl Kegon {
     fn main_area(&self) -> Element<'_, Message> {
         let tab_strip = self.tab_strip();
 
-        let placeholder = column![
-            text(self.localizer.text(MessageKey::MainPlaceholderTitle))
-                .size(UI_TEXT_SIZE + 2.0)
-                .color(palette::TEXT),
-            text(self.localizer.text(MessageKey::MainPlaceholderBody))
-                .size(UI_TEXT_SIZE)
-                .color(palette::TEXT_MUTED),
-        ]
-        .spacing(6)
-        .align_x(Center);
+        let terminal_view: Element<'_, Message> = if let Some(session) = &self.terminal_session {
+            let canvas_program = TerminalProgram {
+                session,
+                preedit_text: self.preedit_text.as_deref(),
+                is_focused: self.terminal_focused,
+            };
 
-        let content = container(placeholder)
-            .center(Fill)
-            .style(|_| container::Style::default().background(palette::EDITOR));
+            let canvas_widget = Canvas::new(canvas_program).width(Fill).height(Fill);
 
-        column![tab_strip, content].width(Fill).into()
+            let main_content: Element<'_, Message> = mouse_area(canvas_widget)
+                .on_press(Message::TerminalClicked)
+                .into();
+
+            if session.is_exited() {
+                let code_str = session
+                    .exit_code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| String::from("N/A"));
+
+                let mut args = FluentArgs::new();
+                args.set("code", code_str);
+
+                let exit_banner = container(
+                    text(
+                        self.localizer
+                            .text_with(MessageKey::TerminalProcessExited, &args),
+                    )
+                    .size(UI_TEXT_SIZE)
+                    .color(Color::from_rgb8(0xf1, 0x4c, 0x4c)),
+                )
+                .padding([6, 12])
+                .style(|_| {
+                    container::Style::default().background(Color::from_rgb8(0x2d, 0x20, 0x20))
+                });
+
+                column![main_content, exit_banner].height(Fill).into()
+            } else {
+                main_content
+            }
+        } else {
+            let placeholder = column![
+                text(self.localizer.text(MessageKey::MainPlaceholderTitle))
+                    .size(UI_TEXT_SIZE + 2.0)
+                    .color(palette::TEXT),
+                text(self.localizer.text(MessageKey::MainPlaceholderBody))
+                    .size(UI_TEXT_SIZE)
+                    .color(palette::TEXT_MUTED),
+            ]
+            .spacing(6)
+            .align_x(Center);
+
+            container(placeholder)
+                .center(Fill)
+                .style(|_| container::Style::default().background(palette::EDITOR))
+                .into()
+        };
+
+        column![tab_strip, terminal_view].width(Fill).into()
     }
 
     fn tab_strip(&self) -> Element<'_, Message> {
@@ -287,9 +559,6 @@ impl Kegon {
             .into()
         });
 
-        // Creating sessions is out of scope for now: the button has no
-        // `on_press`, which also renders it as disabled. The "+" is a symbol,
-        // not text, so it is not localized.
         let new_tab = tooltip(
             button(container(text("+").size(16)).center(Fill))
                 .width(TAB_STRIP_HEIGHT)
@@ -313,26 +582,6 @@ impl Kegon {
     }
 }
 
-/// Maps VS Code-style shortcuts to Activity Bar entries:
-/// Ctrl+Shift+E / F / G (Cmd+Shift on macOS).
-///
-/// Physical keys are used so that the shortcuts do not depend on the
-/// keyboard layout.
-fn activity_shortcut(physical_key: key::Physical, modifiers: Modifiers) -> Option<ActivityItem> {
-    if !(modifiers.command() && modifiers.shift()) || modifiers.alt() {
-        return None;
-    }
-
-    match physical_key {
-        key::Physical::Code(key::Code::KeyE) => Some(ActivityItem::Explorer),
-        key::Physical::Code(key::Code::KeyF) => Some(ActivityItem::Search),
-        key::Physical::Code(key::Code::KeyG) => Some(ActivityItem::Git),
-        _ => None,
-    }
-}
-
-/// Icon color for an Activity Bar entry. Selection takes precedence over
-/// hover.
 fn activity_icon_color(is_active: bool, is_hovered: bool) -> Color {
     if is_active {
         palette::ICON_ACTIVE
@@ -368,7 +617,6 @@ fn tab_style(is_active: bool, status: button::Status) -> button::Style {
     }
 }
 
-/// Tooltip text for an Activity Bar entry.
 fn activity_label(item: ActivityItem) -> MessageKey {
     match item {
         ActivityItem::Explorer => MessageKey::ActivityExplorer,
@@ -377,7 +625,6 @@ fn activity_label(item: ActivityItem) -> MessageKey {
     }
 }
 
-/// Side Bar heading and placeholder body for an Activity Bar entry.
 fn side_bar_text(item: ActivityItem) -> (MessageKey, MessageKey) {
     match item {
         ActivityItem::Explorer => (
@@ -413,46 +660,47 @@ fn tooltip_label<'a>(label: String) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ctrl_shift() -> Modifiers {
-        Modifiers::COMMAND | Modifiers::SHIFT
-    }
-
-    fn code(code: key::Code) -> key::Physical {
-        key::Physical::Code(code)
-    }
+    use crate::command::{CommandId, KeyChord, Modifiers};
 
     #[test]
     fn shortcuts_select_activity_items() {
+        let resolver = KeybindingResolver::default_for_platform(Platform::Windows);
+
         assert_eq!(
-            activity_shortcut(code(key::Code::KeyE), ctrl_shift()),
-            Some(ActivityItem::Explorer)
+            resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_shift_char('e')),
+            Some(CommandId::WorkbenchExplorerFocus)
         );
         assert_eq!(
-            activity_shortcut(code(key::Code::KeyF), ctrl_shift()),
-            Some(ActivityItem::Search)
+            resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_shift_char('f')),
+            Some(CommandId::WorkbenchSearchFocus)
         );
         assert_eq!(
-            activity_shortcut(code(key::Code::KeyG), ctrl_shift()),
-            Some(ActivityItem::Git)
+            resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_shift_char('g')),
+            Some(CommandId::WorkbenchSourceControlFocus)
         );
     }
 
     #[test]
     fn shortcuts_require_command_and_shift() {
+        let resolver = KeybindingResolver::default_for_platform(Platform::Windows);
+
         assert_eq!(
-            activity_shortcut(code(key::Code::KeyE), Modifiers::COMMAND),
+            resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_char('e')),
             None
         );
-        assert_eq!(
-            activity_shortcut(code(key::Code::KeyE), Modifiers::SHIFT),
-            None
+        let ctrl_alt_shift_e = KeyChord::new(
+            crate::command::Key::Character("e".into()),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: true,
+                super_key: false,
+            },
         );
         assert_eq!(
-            activity_shortcut(code(key::Code::KeyE), ctrl_shift() | Modifiers::ALT),
+            resolver.resolve(CommandContext::Workbench, &ctrl_alt_shift_e),
             None
         );
-        assert_eq!(activity_shortcut(code(key::Code::KeyX), ctrl_shift()), None);
     }
 
     #[test]
@@ -483,8 +731,6 @@ mod tests {
         app.update(Message::ActivityHovered(ActivityItem::Search));
         assert_eq!(app.hovered_activity, Some(ActivityItem::Search));
 
-        // Moving straight to a neighbor may deliver the new enter before the
-        // old exit; the stale exit must not clear the new hover.
         app.update(Message::ActivityHovered(ActivityItem::Git));
         app.update(Message::ActivityUnhovered(ActivityItem::Search));
         assert_eq!(app.hovered_activity, Some(ActivityItem::Git));

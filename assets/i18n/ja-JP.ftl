@@ -22,6 +22,7 @@ side-bar-git-placeholder = Git 連携はまだ実装されていません。
 
 terminal-tab-default-title = ターミナル
 terminal-new-tab-tooltip = 新しいターミナル(未実装)
+terminal-process-exited = プロセスがコード { $code } で終了しました。
 
 ## Main area
 
