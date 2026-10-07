@@ -1,30 +1,36 @@
-# Kegon icon
+# Kegon application icon asset set
 
-| File | Role |
-|---|---|
-| `kegon.svg` | Master artwork. Edit this file. |
-| `kegon-app-icon.svg` | Generated. The artwork on a light rounded plate, as used for the app icon. |
-| `kegon.ico` | Generated. Windows icon: 16, 24, 32, 48, 64, 128, and 256 px. |
+This directory contains the application icon asset set for Kegon across supported desktop platforms.
 
-The master artwork is a near-black silhouette on a transparent background,
-which is almost invisible on dark taskbars and in dark-mode Explorer. The app
-icon therefore puts it on a light rounded plate, cropped close to the artwork.
-Sizes up to 32 px use less padding, so the artwork keeps as many pixels as
-possible.
+## Canonical source / Master artwork
 
-`kegon.ico` is used in two places:
+- `png/icon_1024x1024.png`: Canonical source master asset (1024x1024 transparent PNG).
 
-- `build.rs` embeds it in the Windows executable, for Explorer.
-- `src/app_icon.rs` sets one of its sizes as the window icon, for the title
-  bar, taskbar, and Alt+Tab.
+## Platform assets & Roles
 
-## Regenerating
+| Path | Format / Description | Role / Usage |
+|---|---|---|
+| `kegon.ico` | Windows ICO (16, 24, 32, 48, 64, 128, 256 px) | Formal Windows app icon. Used by `build.rs` (PE binary resource) and `src/app_icon.rs` (runtime window title bar, taskbar, Alt+Tab). |
+| `windows/kegon.ico` | Windows ICO | Windows platform asset directory copy of `kegon.ico`. |
+| `macos/kegon.icns` | macOS ICNS | Apple icon format. Reserved for future macOS application bundling. |
+| `linux_hicolor/` | PNG icon theme directory structure | Freedesktop hicolor icon theme hierarchy (16x16 to 512x512). Reserved for future Linux packaging (.desktop, AppImage, deb, rpm). |
+| `png/` | Transparent PNG variants | Pre-rendered transparent PNG assets in sizes 16x16 through 1024x1024. |
+| `png_solid/` | Solid background PNG variants | Pre-rendered solid square background PNG assets in sizes 16x16 through 1024x1024. |
 
-After changing `kegon.svg`, run this from the repository root:
+## Legacy assets & tools/icon-gen
 
-```sh
-cargo run --manifest-path tools/icon-gen/Cargo.toml
-```
+The previous SVG-based generation workflow (`kegon.svg`, `kegon-app-icon.svg`, and `tools/icon-gen`) is obsolete and removed. Pre-rendered platform assets are now maintained directly in this repository.
 
-Commit the regenerated `kegon-app-icon.svg` and `kegon.ico` together with the
-SVG change.
+## Note on Windows icon cache
+
+Windows Explorer and taskbar may cache executable icons. If the icon does not refresh immediately in Explorer, restarting `explorer.exe` or clearing the Windows shell icon cache may be required.
+
+## Updating the application icon
+
+To update the Kegon application icon in the future:
+
+1. Replace the canonical source asset `png/icon_1024x1024.png`.
+2. Generate/update all derived PNG variants (`png/` and `png_solid/`).
+3. Generate/update platform assets (`kegon.ico` / `windows/kegon.ico`, `macos/kegon.icns`, and `linux_hicolor/`).
+4. Ensure `kegon.ico` contains all required icon sizes (16x16, 24x24, 32x32, 48x48, 64x64, 128x128, 256x256).
+5. Run tests and verify the build (`cargo test`, `cargo build --release`).
