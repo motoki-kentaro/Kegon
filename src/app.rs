@@ -5,13 +5,14 @@ use std::sync::mpsc::{Receiver, channel};
 
 use iced::advanced::input_method::Event as ImeEvent;
 use iced::futures::SinkExt;
-use iced::keyboard::{self, Modifiers, key};
+use iced::keyboard;
 use iced::widget::canvas::Canvas;
 use iced::widget::{Space, button, column, container, mouse_area, row, space, svg, text, tooltip};
 use iced::{
     Border, Center, Color, Element, Event, Fill, Font, Subscription, Theme, event, font, mouse,
 };
 
+use crate::command::{CommandContext, CommandDispatcher, KeyChord, KeybindingResolver, Platform};
 use crate::i18n::{FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{ICON_SIZE, activity_icon};
 use crate::terminal::{
@@ -107,6 +108,8 @@ pub struct Kegon {
     cursor_position: iced::Point,
     /// Whether the mouse left button is currently dragging a text selection.
     mouse_dragging_selection: bool,
+    /// Keybinding resolver and platform configuration.
+    keybinding_resolver: KeybindingResolver,
 }
 
 impl std::fmt::Debug for Kegon {
@@ -146,6 +149,7 @@ impl Kegon {
             terminal_focused: true,
             cursor_position: iced::Point::ORIGIN,
             mouse_dragging_selection: false,
+            keybinding_resolver: KeybindingResolver::default_for_platform(Platform::current()),
         }
     }
 
@@ -208,6 +212,24 @@ impl Kegon {
                 text,
                 ..
             }) => {
+                let context = if self.terminal_focused {
+                    CommandContext::TerminalFocused
+                } else {
+                    CommandContext::Workbench
+                };
+
+                if let Some(chord) = KeyChord::from_iced(&logical_key, modifiers)
+                    && let Some(command_id) = self.keybinding_resolver.resolve(context, &chord)
+                {
+                    CommandDispatcher::dispatch(
+                        command_id,
+                        &mut self.workbench,
+                        self.terminal_session.as_ref(),
+                        &mut self.system_clipboard,
+                    );
+                    return;
+                }
+
                 if self.terminal_focused
                     && let Some(session) = &self.terminal_session
                 {
@@ -560,20 +582,6 @@ impl Kegon {
     }
 }
 
-#[allow(dead_code)]
-fn activity_shortcut(physical_key: key::Physical, modifiers: Modifiers) -> Option<ActivityItem> {
-    if !(modifiers.command() && modifiers.shift()) || modifiers.alt() {
-        return None;
-    }
-
-    match physical_key {
-        key::Physical::Code(key::Code::KeyE) => Some(ActivityItem::Explorer),
-        key::Physical::Code(key::Code::KeyF) => Some(ActivityItem::Search),
-        key::Physical::Code(key::Code::KeyG) => Some(ActivityItem::Git),
-        _ => None,
-    }
-}
-
 fn activity_icon_color(is_active: bool, is_hovered: bool) -> Color {
     if is_active {
         palette::ICON_ACTIVE
@@ -652,46 +660,47 @@ fn tooltip_label<'a>(label: String) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ctrl_shift() -> Modifiers {
-        Modifiers::COMMAND | Modifiers::SHIFT
-    }
-
-    fn code(code: key::Code) -> key::Physical {
-        key::Physical::Code(code)
-    }
+    use crate::command::{CommandId, KeyChord, Modifiers};
 
     #[test]
     fn shortcuts_select_activity_items() {
+        let resolver = KeybindingResolver::default_for_platform(Platform::Windows);
+
         assert_eq!(
-            activity_shortcut(code(key::Code::KeyE), ctrl_shift()),
-            Some(ActivityItem::Explorer)
+            resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_shift_char('e')),
+            Some(CommandId::WorkbenchExplorerFocus)
         );
         assert_eq!(
-            activity_shortcut(code(key::Code::KeyF), ctrl_shift()),
-            Some(ActivityItem::Search)
+            resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_shift_char('f')),
+            Some(CommandId::WorkbenchSearchFocus)
         );
         assert_eq!(
-            activity_shortcut(code(key::Code::KeyG), ctrl_shift()),
-            Some(ActivityItem::Git)
+            resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_shift_char('g')),
+            Some(CommandId::WorkbenchSourceControlFocus)
         );
     }
 
     #[test]
     fn shortcuts_require_command_and_shift() {
+        let resolver = KeybindingResolver::default_for_platform(Platform::Windows);
+
         assert_eq!(
-            activity_shortcut(code(key::Code::KeyE), Modifiers::COMMAND),
+            resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_char('e')),
             None
         );
-        assert_eq!(
-            activity_shortcut(code(key::Code::KeyE), Modifiers::SHIFT),
-            None
+        let ctrl_alt_shift_e = KeyChord::new(
+            crate::command::Key::Character("e".into()),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: true,
+                super_key: false,
+            },
         );
         assert_eq!(
-            activity_shortcut(code(key::Code::KeyE), ctrl_shift() | Modifiers::ALT),
+            resolver.resolve(CommandContext::Workbench, &ctrl_alt_shift_e),
             None
         );
-        assert_eq!(activity_shortcut(code(key::Code::KeyX), ctrl_shift()), None);
     }
 
     #[test]

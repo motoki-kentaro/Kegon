@@ -1,5 +1,6 @@
 //! Translation of iced keyboard events into terminal escape sequences and actions.
 
+use crate::command::{CommandContext, CommandId, KeyChord, KeybindingResolver, Platform};
 use crate::workbench::ActivityItem;
 use iced::keyboard::{Modifiers, key};
 
@@ -41,39 +42,61 @@ pub fn process_key_event(
     has_selection: bool,
     app_cursor_keys: bool,
 ) -> InputAction {
-    // 1. Check Workbench Activity shortcuts (Ctrl+Shift+E / F / G)
-    if modifiers.command()
-        && modifiers.shift()
-        && !modifiers.alt()
-        && let key::Physical::Code(code) = physical_key
-    {
-        match code {
-            key::Code::KeyE => return InputAction::WorkbenchShortcut(ActivityItem::Explorer),
-            key::Code::KeyF => return InputAction::WorkbenchShortcut(ActivityItem::Search),
-            key::Code::KeyG => return InputAction::WorkbenchShortcut(ActivityItem::Git),
-            _ => {}
-        }
-    }
+    process_key_event_with_resolver(
+        &KeybindingResolver::default_for_platform(Platform::current()),
+        physical_key,
+        logical_key,
+        modifiers,
+        text,
+        has_selection,
+        app_cursor_keys,
+    )
+}
 
-    // 2. Check Ctrl+C / Ctrl+V policy
-    if modifiers.command()
-        && !modifiers.shift()
-        && !modifiers.alt()
-        && let key::Key::Character(c) = logical_key
+/// Processes a key press event using a specific [`KeybindingResolver`].
+pub fn process_key_event_with_resolver(
+    resolver: &KeybindingResolver,
+    _physical_key: key::Physical,
+    logical_key: &key::Key,
+    modifiers: Modifiers,
+    text: Option<&str>,
+    has_selection: bool,
+    app_cursor_keys: bool,
+) -> InputAction {
+    // 1. Resolve command via KeybindingResolver
+    if let Some(chord) = KeyChord::from_iced(logical_key, modifiers)
+        && let Some(command) = resolver.resolve(CommandContext::TerminalFocused, &chord)
     {
-        let lower = c.to_lowercase();
-        if lower == "c" {
-            if has_selection {
-                return InputAction::CopySelection;
-            } else {
-                return InputAction::SendToPty(vec![0x03]); // SIGINT / Ctrl+C
+        match command {
+            CommandId::WorkbenchExplorerFocus => {
+                return InputAction::WorkbenchShortcut(ActivityItem::Explorer);
             }
-        } else if lower == "v" {
-            return InputAction::PasteFromClipboard;
+            CommandId::WorkbenchSearchFocus => {
+                return InputAction::WorkbenchShortcut(ActivityItem::Search);
+            }
+            CommandId::WorkbenchSourceControlFocus => {
+                return InputAction::WorkbenchShortcut(ActivityItem::Git);
+            }
+            CommandId::TerminalCopy => {
+                return InputAction::CopySelection;
+            }
+            CommandId::TerminalInterrupt => {
+                return InputAction::SendToPty(vec![0x03]);
+            }
+            CommandId::TerminalCopyOrInterrupt => {
+                if has_selection {
+                    return InputAction::CopySelection;
+                } else {
+                    return InputAction::SendToPty(vec![0x03]);
+                }
+            }
+            CommandId::TerminalPaste => {
+                return InputAction::PasteFromClipboard;
+            }
         }
     }
 
-    // 3. Handle Special Keys and Escape Sequences
+    // 2. Handle Special Keys and Escape Sequences (Raw PTY Input)
     match logical_key {
         key::Key::Named(named) => {
             if let Some(bytes) = map_named_key(*named, modifiers, app_cursor_keys) {
@@ -81,7 +104,7 @@ pub fn process_key_event(
             }
         }
         key::Key::Character(c) => {
-            if modifiers.command() && !modifiers.shift() && !modifiers.alt() {
+            if modifiers.control() && !modifiers.shift() && !modifiers.alt() {
                 // Ctrl + letter (A-Z) => Control codes \x01 - \x1a
                 if let Some(first_char) = c.chars().next() {
                     let ascii = first_char.to_ascii_uppercase();
@@ -90,7 +113,7 @@ pub fn process_key_event(
                         return InputAction::SendToPty(vec![ctrl_byte]);
                     }
                 }
-            } else if modifiers.alt() && !modifiers.command() {
+            } else if modifiers.alt() && !modifiers.control() {
                 // Alt + key => ESC prefix
                 let mut bytes = vec![0x1b];
                 bytes.extend_from_slice(c.as_bytes());
@@ -100,10 +123,10 @@ pub fn process_key_event(
         _ => {}
     }
 
-    // 4. Normal character input (from IME commit or standard typing)
+    // 3. Normal character input (from IME commit or standard typing)
     if let Some(txt) = text
         && !txt.is_empty()
-        && !modifiers.command()
+        && !modifiers.control()
         && !modifiers.alt()
     {
         return InputAction::SendToPty(txt.as_bytes().to_vec());

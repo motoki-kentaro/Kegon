@@ -4,6 +4,7 @@
 mod app;
 mod app_icon;
 mod cli;
+mod command;
 mod i18n;
 mod icons;
 mod terminal;
