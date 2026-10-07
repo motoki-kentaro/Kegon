@@ -8,13 +8,16 @@ repository = "https://github.com/motoki-kentaro/Kegon"
 publish = false
 
 [dependencies]
-iced = { version = "0.14", features = ["svg"] }
+iced = { version = "0.14", features = ["svg", "canvas", "advanced"] }
 # Decodes the embedded application icon for the window.
 ico = "0.4"
 # Localization: Fluent bundles, locale tags, and the OS locale (see docs/architecture/i18n.md).
 fluent-bundle = "0.16"
 unic-langid = "0.9"
 sys-locale = "0.3"
+# Terminal core emulation and system clipboard
+alacritty_terminal = "0.26.0"
+arboard = "3.6.1"
 
 [build-dependencies]
 # Embeds the application icon into the Windows executable (see build.rs).
