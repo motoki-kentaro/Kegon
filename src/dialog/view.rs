@@ -1,31 +1,30 @@
 //! Modal shell and confirmation dialog UI rendering.
 
 use iced::widget::{Space, button, column, container, mouse_area, row, space, svg, text};
-use iced::{Border, Center, Element, Fill, Font, Length};
+use iced::{Center, Color, Element, Fill, Font, Length};
 
 use crate::dialog::confirmation::{
-    ActionTone, ConfirmationDialog, ConfirmationResult, FocusedAction,
+    ActionTone, ConfirmationDialog, ConfirmationResult, DialogKind, FocusedAction,
 };
 use crate::i18n::Localizer;
 use crate::icons::{DIALOG_ICON_SIZE, dialog_icon};
+use crate::theme::{KegonTheme, style};
 
-mod palette {
-    use iced::Color;
+/// The tint of a dialog's header icon.
+pub fn dialog_icon_color(theme: &KegonTheme, kind: DialogKind) -> Color {
+    match kind {
+        DialogKind::Question => theme.icons.active,
+        DialogKind::Warning => theme.semantic.warning,
+    }
+}
 
-    pub const BACKDROP: Color = Color::from_rgba8(0, 0, 0, 0.65);
-    pub const SURFACE_BG: Color = Color::from_rgb8(0x25, 0x25, 0x26);
-    pub const BORDER: Color = Color::from_rgb8(0x45, 0x45, 0x45);
-    pub const TEXT_TITLE: Color = Color::from_rgb8(0xff, 0xff, 0xff);
-    pub const TEXT_BODY: Color = Color::from_rgb8(0xcc, 0xcc, 0xcc);
-
-    pub const BUTTON_BG: Color = Color::from_rgb8(0x33, 0x33, 0x36);
-    pub const BUTTON_BG_HOVER: Color = Color::from_rgb8(0x3c, 0x3c, 0x40);
-    pub const PRIMARY_BG: Color = Color::from_rgb8(0x00, 0x7a, 0xcc);
-    pub const PRIMARY_BG_HOVER: Color = Color::from_rgb8(0x00, 0x62, 0xa3);
-    pub const DESTRUCTIVE_BG: Color = Color::from_rgb8(0xd7, 0x3a, 0x49);
-    pub const DESTRUCTIVE_BG_HOVER: Color = Color::from_rgb8(0xb3, 0x2d, 0x3a);
-    pub const FOCUS_BORDER: Color = Color::from_rgb8(0x00, 0x7a, 0xcc);
-    pub const FOCUS_BORDER_BRIGHT: Color = Color::from_rgb8(0xff, 0xff, 0xff);
+/// The fill of a dialog's primary action. Depends only on the action's tone,
+/// never on the dialog kind.
+pub fn primary_action_fill(theme: &KegonTheme, tone: ActionTone) -> Color {
+    match tone {
+        ActionTone::Normal => theme.interaction.accent,
+        ActionTone::Destructive => theme.semantic.destructive,
+    }
 }
 
 /// Renders a modal confirmation dialog overlay centered over the main UI.
@@ -34,20 +33,21 @@ pub fn render_modal_overlay<'a, Message>(
     dialog: &'a ConfirmationDialog,
     localizer: &'a Localizer,
     ui_font: Font,
+    theme: &'a KegonTheme,
     on_action: impl Fn(ConfirmationResult) -> Message + 'a + Clone,
     on_backdrop: Message,
 ) -> Element<'a, Message>
 where
     Message: 'a + Clone,
 {
-    let (icon_handle, icon_color) = dialog_icon(dialog.kind);
+    let icon_color = dialog_icon_color(theme, dialog.kind);
     let title_text = localizer.text(dialog.title);
     let message_text = localizer.text(dialog.message);
     let primary_label = localizer.text(dialog.primary_action);
     let secondary_label = localizer.text(dialog.secondary_action);
 
     let header = row![
-        svg(icon_handle)
+        svg(dialog_icon(dialog.kind))
             .width(DIALOG_ICON_SIZE)
             .height(DIALOG_ICON_SIZE)
             .style(move |_, _| svg::Style {
@@ -57,85 +57,29 @@ where
         text(title_text)
             .size(16.0)
             .font(ui_font)
-            .color(palette::TEXT_TITLE)
+            .color(theme.text.emphasis)
     ]
     .align_y(Center);
 
     let body = text(message_text)
         .size(13.0)
         .font(ui_font)
-        .color(palette::TEXT_BODY);
+        .color(theme.text.primary);
 
     let is_sec_focused = dialog.focused_action == FocusedAction::Secondary;
     let sec_on_action = on_action.clone();
-    let secondary_btn = button(
-        text(secondary_label)
-            .size(13.0)
-            .font(ui_font)
-            .color(palette::TEXT_TITLE),
-    )
-    .padding([6, 16])
-    .style(move |_, status| {
-        let bg = match status {
-            button::Status::Hovered | button::Status::Pressed => palette::BUTTON_BG_HOVER,
-            _ => palette::BUTTON_BG,
-        };
-        let border_color = if is_sec_focused {
-            palette::FOCUS_BORDER
-        } else {
-            palette::BORDER
-        };
-        let border_width = if is_sec_focused { 2.0 } else { 1.0 };
-        button::Style {
-            background: Some(bg.into()),
-            text_color: palette::TEXT_TITLE,
-            border: Border {
-                color: border_color,
-                width: border_width,
-                radius: 4.0.into(),
-            },
-            ..button::Style::default()
-        }
-    })
-    .on_press(sec_on_action(ConfirmationResult::Secondary));
+    let secondary_btn = button(text(secondary_label).size(13.0).font(ui_font))
+        .padding([6, 16])
+        .style(move |_, status| style::secondary_button(theme, status, is_sec_focused))
+        .on_press(sec_on_action(ConfirmationResult::Secondary));
 
     let is_pri_focused = dialog.focused_action == FocusedAction::Primary;
-    let tone = dialog.primary_action_tone;
+    let primary_fill = primary_action_fill(theme, dialog.primary_action_tone);
     let pri_on_action = on_action;
-    let primary_btn = button(
-        text(primary_label)
-            .size(13.0)
-            .font(ui_font)
-            .color(palette::TEXT_TITLE),
-    )
-    .padding([6, 16])
-    .style(move |_, status| {
-        let (bg, hover_bg) = match tone {
-            ActionTone::Destructive => (palette::DESTRUCTIVE_BG, palette::DESTRUCTIVE_BG_HOVER),
-            ActionTone::Normal => (palette::PRIMARY_BG, palette::PRIMARY_BG_HOVER),
-        };
-        let background = match status {
-            button::Status::Hovered | button::Status::Pressed => hover_bg,
-            _ => bg,
-        };
-        let border_color = if is_pri_focused {
-            palette::FOCUS_BORDER_BRIGHT
-        } else {
-            palette::BORDER
-        };
-        let border_width = if is_pri_focused { 2.0 } else { 1.0 };
-        button::Style {
-            background: Some(background.into()),
-            text_color: palette::TEXT_TITLE,
-            border: Border {
-                color: border_color,
-                width: border_width,
-                radius: 4.0.into(),
-            },
-            ..button::Style::default()
-        }
-    })
-    .on_press(pri_on_action(ConfirmationResult::Primary));
+    let primary_btn = button(text(primary_label).size(13.0).font(ui_font))
+        .padding([6, 16])
+        .style(move |_, status| style::filled_button(theme, primary_fill, status, is_pri_focused))
+        .on_press(pri_on_action(ConfirmationResult::Primary));
 
     let actions = row![secondary_btn, Space::new().width(8.0), primary_btn].align_y(Center);
 
@@ -149,15 +93,9 @@ where
     .padding(20)
     .width(Length::Shrink);
 
-    let dialog_surface = container(content).max_width(480.0).style(|_| {
-        container::Style::default()
-            .background(palette::SURFACE_BG)
-            .border(Border {
-                color: palette::BORDER,
-                width: 1.0,
-                radius: 6.0.into(),
-            })
-    });
+    let dialog_surface = container(content)
+        .max_width(480.0)
+        .style(move |_| style::modal_surface(theme));
 
     let backdrop = mouse_area(
         container(
@@ -169,9 +107,66 @@ where
         )
         .width(Fill)
         .height(Fill)
-        .style(|_| container::Style::default().background(palette::BACKDROP)),
+        .style(move |_| style::modal_backdrop(theme)),
     )
     .on_press(on_backdrop);
 
     iced::widget::stack![base_view, backdrop].into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::NIGHT_DARK;
+
+    #[test]
+    fn icon_color_follows_the_dialog_kind() {
+        assert_eq!(
+            dialog_icon_color(&NIGHT_DARK, DialogKind::Question),
+            NIGHT_DARK.icons.active
+        );
+        assert_eq!(
+            dialog_icon_color(&NIGHT_DARK, DialogKind::Warning),
+            NIGHT_DARK.semantic.warning
+        );
+    }
+
+    #[test]
+    fn primary_fill_follows_the_action_tone() {
+        assert_eq!(
+            primary_action_fill(&NIGHT_DARK, ActionTone::Normal),
+            NIGHT_DARK.interaction.accent
+        );
+        assert_eq!(
+            primary_action_fill(&NIGHT_DARK, ActionTone::Destructive),
+            NIGHT_DARK.semantic.destructive
+        );
+    }
+
+    #[test]
+    fn kind_and_tone_are_independent() {
+        // A Warning with a normal action is not destructive, and a Question
+        // with a destructive action is still a Question.
+        let mut theme = NIGHT_DARK;
+        theme.semantic.warning = Color::from_rgb8(1, 1, 1);
+        theme.semantic.destructive = Color::from_rgb8(2, 2, 2);
+        theme.interaction.accent = Color::from_rgb8(3, 3, 3);
+
+        assert_eq!(
+            dialog_icon_color(&theme, DialogKind::Warning),
+            Color::from_rgb8(1, 1, 1)
+        );
+        assert_eq!(
+            primary_action_fill(&theme, ActionTone::Normal),
+            Color::from_rgb8(3, 3, 3)
+        );
+        assert_eq!(
+            dialog_icon_color(&theme, DialogKind::Question),
+            theme.icons.active
+        );
+        assert_eq!(
+            primary_action_fill(&theme, ActionTone::Destructive),
+            Color::from_rgb8(2, 2, 2)
+        );
+    }
 }

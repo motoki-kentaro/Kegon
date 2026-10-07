@@ -11,6 +11,7 @@ mod i18n;
 mod icons;
 mod settings;
 mod terminal;
+mod theme;
 mod workbench;
 
 use app::Kegon;
@@ -23,6 +24,9 @@ fn main() -> iced::Result {
 
     let (settings, settings_warning) = settings::load_settings(None);
     if let Some(warning) = settings_warning {
+        eprintln!("kegon: {warning}");
+    }
+    if let Some(warning) = settings.appearance.theme.diagnostic() {
         eprintln!("kegon: {warning}");
     }
 
@@ -49,7 +53,7 @@ fn main() -> iced::Result {
     )
     .title(Kegon::title)
     .subscription(Kegon::subscription)
-    .theme(|_: &Kegon| iced::Theme::Dark)
+    .theme(Kegon::iced_theme)
     .window(iced::window::Settings {
         size: iced::Size::new(1200.0, 760.0),
         min_size: Some(iced::Size::new(640.0, 400.0)),

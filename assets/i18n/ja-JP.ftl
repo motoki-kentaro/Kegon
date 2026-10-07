@@ -23,6 +23,7 @@ side-bar-settings-language-label = 表示言語
 side-bar-settings-language-system = システム設定に従う
 side-bar-settings-cli-override-note = このセッションでは --locale により言語が上書きされています。
 side-bar-settings-appearance-title = 外観
+side-bar-settings-theme-label = テーマ
 side-bar-settings-ui-font-label = UI フォント
 side-bar-settings-ui-font-system = システム標準
 side-bar-settings-ui-font-choose = 選択...

@@ -8,15 +8,14 @@ use iced::widget::canvas::{self, Frame, Geometry, Path, Program, Text};
 use iced::{Color, Font, Point, Rectangle, Size, Theme};
 
 use crate::terminal::session::TerminalSession;
+use crate::theme::TerminalColors;
 
 pub const DEFAULT_CELL_WIDTH: f32 = 8.5;
 pub const DEFAULT_CELL_HEIGHT: f32 = 18.0;
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
 
-pub const PALETTE_BG: Color = Color::from_rgb8(0x1e, 0x1e, 0x1e);
-pub const PALETTE_FG: Color = Color::from_rgb8(0xcc, 0xcc, 0xcc);
-pub const PALETTE_SELECTION: Color = Color::from_rgba8(0x26, 0x4f, 0x78, 0.6);
-pub const PALETTE_CURSOR: Color = Color::from_rgb8(0xae, 0xaf, 0xad);
+/// Opacity of the selection highlight, drawn over the terminal background.
+const SELECTION_ALPHA: f32 = 0.6;
 
 /// Calculates grid columns and rows for a given terminal view size.
 pub fn calculate_grid_size(width: f32, height: f32) -> (u16, u16) {
@@ -26,61 +25,48 @@ pub fn calculate_grid_size(width: f32, height: f32) -> (u16, u16) {
 }
 
 /// Converts an ANSI terminal color into an iced [`Color`].
-pub fn convert_color(color: AnsiColor, is_fg: bool) -> Color {
+///
+/// Named and indexed 0–15 colors come from the theme. Explicit RGB colors
+/// sent by the application, and the generated 256-color cube and grayscale
+/// ramp, are used as-is.
+pub fn convert_color(color: AnsiColor, is_fg: bool, colors: &TerminalColors) -> Color {
+    let ansi = &colors.ansi;
     match color {
         AnsiColor::Named(named) => match named {
-            NamedColor::Black => Color::from_rgb8(0x1e, 0x1e, 0x1e),
-            NamedColor::Red => Color::from_rgb8(0xcd, 0x31, 0x31),
-            NamedColor::Green => Color::from_rgb8(0x0d, 0xbc, 0x79),
-            NamedColor::Yellow => Color::from_rgb8(0xe5, 0xe5, 0x10),
-            NamedColor::Blue => Color::from_rgb8(0x24, 0x72, 0xc8),
-            NamedColor::Magenta => Color::from_rgb8(0xbc, 0x3f, 0xbc),
-            NamedColor::Cyan => Color::from_rgb8(0x11, 0xa8, 0xcd),
-            NamedColor::White => Color::from_rgb8(0xe5, 0xe5, 0xe5),
-            NamedColor::BrightBlack => Color::from_rgb8(0x66, 0x66, 0x66),
-            NamedColor::BrightRed => Color::from_rgb8(0xf1, 0x4c, 0x4c),
-            NamedColor::BrightGreen => Color::from_rgb8(0x23, 0xd1, 0x8b),
-            NamedColor::BrightYellow => Color::from_rgb8(0xf5, 0xf5, 0x43),
-            NamedColor::BrightBlue => Color::from_rgb8(0x3b, 0x8e, 0xe8),
-            NamedColor::BrightMagenta => Color::from_rgb8(0xd6, 0x70, 0xd6),
-            NamedColor::BrightCyan => Color::from_rgb8(0x29, 0xb8, 0xdb),
-            NamedColor::BrightWhite => Color::from_rgb8(0xff, 0xff, 0xff),
-            NamedColor::Foreground => PALETTE_FG,
-            NamedColor::Background => PALETTE_BG,
+            NamedColor::Black => ansi.black,
+            NamedColor::Red => ansi.red,
+            NamedColor::Green => ansi.green,
+            NamedColor::Yellow => ansi.yellow,
+            NamedColor::Blue => ansi.blue,
+            NamedColor::Magenta => ansi.magenta,
+            NamedColor::Cyan => ansi.cyan,
+            NamedColor::White => ansi.white,
+            NamedColor::BrightBlack => ansi.bright_black,
+            NamedColor::BrightRed => ansi.bright_red,
+            NamedColor::BrightGreen => ansi.bright_green,
+            NamedColor::BrightYellow => ansi.bright_yellow,
+            NamedColor::BrightBlue => ansi.bright_blue,
+            NamedColor::BrightMagenta => ansi.bright_magenta,
+            NamedColor::BrightCyan => ansi.bright_cyan,
+            NamedColor::BrightWhite => ansi.bright_white,
+            NamedColor::Foreground => colors.foreground,
+            NamedColor::Background => colors.background,
             _ => {
                 if is_fg {
-                    PALETTE_FG
+                    colors.foreground
                 } else {
-                    PALETTE_BG
+                    colors.background
                 }
             }
         },
         AnsiColor::Spec(Rgb { r, g, b }) => Color::from_rgb8(r, g, b),
-        AnsiColor::Indexed(idx) => convert_indexed_color(idx),
+        AnsiColor::Indexed(idx) => convert_indexed_color(idx, colors),
     }
 }
 
-fn convert_indexed_color(idx: u8) -> Color {
-    if idx < 16 {
-        let named = match idx {
-            0 => NamedColor::Black,
-            1 => NamedColor::Red,
-            2 => NamedColor::Green,
-            3 => NamedColor::Yellow,
-            4 => NamedColor::Blue,
-            5 => NamedColor::Magenta,
-            6 => NamedColor::Cyan,
-            7 => NamedColor::White,
-            8 => NamedColor::BrightBlack,
-            9 => NamedColor::BrightRed,
-            10 => NamedColor::BrightGreen,
-            11 => NamedColor::BrightYellow,
-            12 => NamedColor::BrightBlue,
-            13 => NamedColor::BrightMagenta,
-            14 => NamedColor::BrightCyan,
-            _ => NamedColor::BrightWhite,
-        };
-        convert_color(AnsiColor::Named(named), true)
+fn convert_indexed_color(idx: u8, colors: &TerminalColors) -> Color {
+    if let Some(color) = colors.ansi.indexed(idx) {
+        color
     } else if idx < 232 {
         let i = idx - 16;
         let r = (i / 36) % 6;
@@ -99,6 +85,8 @@ pub struct TerminalProgram<'a> {
     pub session: &'a TerminalSession,
     pub preedit_text: Option<&'a str>,
     pub is_focused: bool,
+    /// The active theme's terminal colors.
+    pub colors: &'a TerminalColors,
 }
 
 impl<'a, Message> Program<Message> for TerminalProgram<'a> {
@@ -112,10 +100,16 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
+        let colors = self.colors;
+        let selection = Color {
+            a: SELECTION_ALPHA,
+            ..colors.selection
+        };
+
         let mut frame = Frame::new(renderer, bounds.size());
 
         // Fill background
-        frame.fill_rectangle(Point::ORIGIN, bounds.size(), PALETTE_BG);
+        frame.fill_rectangle(Point::ORIGIN, bounds.size(), colors.background);
 
         let term = self.session.term().lock();
         let content = term.renderable_content();
@@ -127,8 +121,8 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
             let cell_pos = Point::new(col * DEFAULT_CELL_WIDTH, line * DEFAULT_CELL_HEIGHT);
 
-            let mut fg = convert_color(cell.fg, true);
-            let mut bg = convert_color(cell.bg, false);
+            let mut fg = convert_color(cell.fg, true, colors);
+            let mut bg = convert_color(cell.bg, false, colors);
 
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
@@ -136,11 +130,11 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
             let is_selected = content.selection.is_some_and(|r| r.contains(cell.point));
             if is_selected {
-                bg = PALETTE_SELECTION;
+                bg = selection;
             }
 
             // Draw custom background if non-default
-            if bg != PALETTE_BG {
+            if bg != colors.background {
                 let cell_width = if cell.flags.contains(Flags::WIDE_CHAR) {
                     DEFAULT_CELL_WIDTH * 2.0
                 } else {
@@ -185,14 +179,14 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
             frame.fill_rectangle(
                 cursor_pos,
                 Size::new(cursor_width, cursor_height),
-                PALETTE_CURSOR,
+                colors.cursor,
             );
         } else {
             let cursor_path = Path::rectangle(cursor_pos, Size::new(cursor_width, cursor_height));
             frame.stroke(
                 &cursor_path,
                 canvas::Stroke::default()
-                    .with_color(PALETTE_CURSOR)
+                    .with_color(colors.cursor)
                     .with_width(1.0),
             );
         }
@@ -208,14 +202,14 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
             frame.fill_rectangle(
                 preedit_pos,
                 Size::new(preedit_width.max(DEFAULT_CELL_WIDTH), DEFAULT_CELL_HEIGHT),
-                Color::from_rgb8(0x3a, 0x3d, 0x41),
+                colors.preedit_background,
             );
 
             // Preedit text
             let text = Text {
                 content: preedit.to_string(),
                 position: preedit_pos,
-                color: Color::WHITE,
+                color: colors.preedit_foreground,
                 size: DEFAULT_FONT_SIZE.into(),
                 font: Font::MONOSPACE,
                 align_x: Horizontal::Left.into(),
@@ -237,7 +231,7 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
             frame.stroke(
                 &line_path,
                 canvas::Stroke::default()
-                    .with_color(Color::WHITE)
+                    .with_color(colors.preedit_foreground)
                     .with_width(1.5),
             );
         }
@@ -249,6 +243,17 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::NIGHT_DARK;
+
+    const COLORS: &TerminalColors = &NIGHT_DARK.terminal;
+
+    fn named(color: NamedColor, is_fg: bool) -> Color {
+        convert_color(AnsiColor::Named(color), is_fg, COLORS)
+    }
+
+    fn indexed(idx: u8) -> Color {
+        convert_color(AnsiColor::Indexed(idx), true, COLORS)
+    }
 
     #[test]
     fn calculate_grid_size_computes_correct_rows_and_cols() {
@@ -258,18 +263,98 @@ mod tests {
     }
 
     #[test]
-    fn convert_color_handles_ansi_and_rgb() {
-        let fg = convert_color(AnsiColor::Named(NamedColor::Red), true);
-        assert_eq!(fg, Color::from_rgb8(0xcd, 0x31, 0x31));
-
-        let spec = convert_color(
-            AnsiColor::Spec(Rgb {
-                r: 10,
-                g: 20,
-                b: 30,
-            }),
-            false,
+    fn named_colors_come_from_the_theme_palette() {
+        assert_eq!(named(NamedColor::Black, true), COLORS.ansi.black);
+        assert_eq!(named(NamedColor::Red, true), COLORS.ansi.red);
+        assert_eq!(
+            named(NamedColor::Red, true),
+            Color::from_rgb8(0xcd, 0x31, 0x31)
         );
-        assert_eq!(spec, Color::from_rgb8(10, 20, 30));
+        assert_eq!(
+            named(NamedColor::BrightWhite, false),
+            COLORS.ansi.bright_white
+        );
+    }
+
+    #[test]
+    fn default_foreground_and_background_come_from_the_theme() {
+        assert_eq!(named(NamedColor::Foreground, true), COLORS.foreground);
+        assert_eq!(named(NamedColor::Background, false), COLORS.background);
+        // Other named colors (cursor, dim variants) keep falling back by role.
+        assert_eq!(named(NamedColor::Cursor, true), COLORS.foreground);
+        assert_eq!(named(NamedColor::Cursor, false), COLORS.background);
+    }
+
+    #[test]
+    fn explicit_rgb_is_never_themed() {
+        let spec = AnsiColor::Spec(Rgb {
+            r: 10,
+            g: 20,
+            b: 30,
+        });
+        assert_eq!(
+            convert_color(spec, false, COLORS),
+            Color::from_rgb8(10, 20, 30)
+        );
+
+        let mut other = *COLORS;
+        other.foreground = Color::WHITE;
+        other.background = Color::BLACK;
+        assert_eq!(
+            convert_color(spec, false, &other),
+            Color::from_rgb8(10, 20, 30)
+        );
+    }
+
+    #[test]
+    fn indexed_0_to_15_use_the_theme_palette() {
+        assert_eq!(indexed(0), COLORS.ansi.black);
+        assert_eq!(indexed(1), COLORS.ansi.red);
+        assert_eq!(indexed(8), COLORS.ansi.bright_black);
+        assert_eq!(indexed(15), COLORS.ansi.bright_white);
+    }
+
+    #[test]
+    fn indexed_color_cube_is_unchanged() {
+        assert_eq!(indexed(16), Color::from_rgb8(0, 0, 0));
+        assert_eq!(indexed(17), Color::from_rgb8(0, 0, 95));
+        assert_eq!(indexed(196), Color::from_rgb8(255, 0, 0));
+        assert_eq!(indexed(231), Color::from_rgb8(255, 255, 255));
+    }
+
+    #[test]
+    fn indexed_grayscale_is_unchanged() {
+        assert_eq!(indexed(232), Color::from_rgb8(8, 8, 8));
+        assert_eq!(indexed(244), Color::from_rgb8(128, 128, 128));
+        assert_eq!(indexed(255), Color::from_rgb8(238, 238, 238));
+    }
+
+    #[test]
+    fn conversion_follows_the_supplied_palette() {
+        let mut other = *COLORS;
+        other.ansi.red = Color::from_rgb8(1, 2, 3);
+        other.foreground = Color::from_rgb8(4, 5, 6);
+
+        assert_eq!(
+            convert_color(AnsiColor::Named(NamedColor::Red), true, &other),
+            Color::from_rgb8(1, 2, 3)
+        );
+        assert_eq!(
+            convert_color(AnsiColor::Indexed(1), true, &other),
+            Color::from_rgb8(1, 2, 3)
+        );
+        assert_eq!(
+            convert_color(AnsiColor::Named(NamedColor::Foreground), true, &other),
+            Color::from_rgb8(4, 5, 6)
+        );
+    }
+
+    #[test]
+    fn selection_keeps_the_previous_translucent_color() {
+        let selection = Color {
+            a: SELECTION_ALPHA,
+            ..COLORS.selection
+        };
+        assert_eq!(selection, Color::from_rgba8(0x26, 0x4f, 0x78, 0.6));
     }
 }

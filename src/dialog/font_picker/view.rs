@@ -7,28 +7,7 @@ use iced::{Border, Center, Color, Element, Fill, Font, Length};
 
 use crate::dialog::font_picker::{FontPicker, FontPickerFocus, FontPickerMode, FontPickerResult};
 use crate::i18n::{Localizer, MessageKey};
-
-mod palette {
-    use iced::Color;
-
-    pub const BACKDROP: Color = Color::from_rgba8(0, 0, 0, 0.65);
-    pub const SURFACE_BG: Color = Color::from_rgb8(0x25, 0x25, 0x26);
-    pub const CANDIDATE_BG: Color = Color::from_rgb8(0x1e, 0x1e, 0x1e);
-    pub const SELECTED_BG: Color = Color::from_rgb8(0x37, 0x37, 0x3d);
-    pub const PREVIEW_BG: Color = Color::from_rgb8(0x1e, 0x1e, 0x1e);
-
-    pub const BORDER: Color = Color::from_rgb8(0x45, 0x45, 0x45);
-    pub const TEXT_TITLE: Color = Color::from_rgb8(0xff, 0xff, 0xff);
-    pub const TEXT_BODY: Color = Color::from_rgb8(0xcc, 0xcc, 0xcc);
-    pub const TEXT_MUTED: Color = Color::from_rgb8(0x85, 0x85, 0x85);
-
-    pub const BUTTON_BG: Color = Color::from_rgb8(0x33, 0x33, 0x36);
-    pub const BUTTON_BG_HOVER: Color = Color::from_rgb8(0x3c, 0x3c, 0x40);
-    pub const PRIMARY_BG: Color = Color::from_rgb8(0x00, 0x7a, 0xcc);
-    pub const PRIMARY_BG_HOVER: Color = Color::from_rgb8(0x00, 0x62, 0xa3);
-    pub const FOCUS_BORDER: Color = Color::from_rgb8(0x00, 0x7a, 0xcc);
-    pub const FOCUS_BORDER_BRIGHT: Color = Color::from_rgb8(0xff, 0xff, 0xff);
-}
+use crate::theme::{KegonTheme, style};
 
 /// Renders the Font Picker modal dialog centered over the base application view.
 #[allow(clippy::too_many_arguments)]
@@ -37,6 +16,7 @@ pub fn render_font_picker_overlay<'a, Message>(
     picker: &'a FontPicker,
     localizer: &'a Localizer,
     ui_font: Font,
+    theme: &'a KegonTheme,
     on_search_changed: impl Fn(String) -> Message + 'a,
     on_monospace_toggled: impl Fn(bool) -> Message + 'a,
     on_candidate_selected: impl Fn(usize) -> Message + 'a + Copy,
@@ -46,6 +26,10 @@ pub fn render_font_picker_overlay<'a, Message>(
 where
     Message: 'a + Clone,
 {
+    // Inset areas (search field, candidate list, preview) sit on the
+    // workbench base color, below the dialog surface.
+    let inset_background = theme.workbench.background;
+
     let title_key = match picker.mode {
         FontPickerMode::Ui => MessageKey::FontPickerTitleUi,
         FontPickerMode::Terminal => MessageKey::FontPickerTitleTerminal,
@@ -64,25 +48,13 @@ where
         .on_input(on_search_changed)
         .padding(8)
         .size(13.0)
-        .style(move |_, _status| {
-            let border_color = if is_search_focused {
-                palette::FOCUS_BORDER
-            } else {
-                palette::BORDER
-            };
-            let border_width = if is_search_focused { 2.0 } else { 1.0 };
-            text_input::Style {
-                background: palette::CANDIDATE_BG.into(),
-                border: Border {
-                    color: border_color,
-                    width: border_width,
-                    radius: 4.0.into(),
-                },
-                icon: palette::TEXT_MUTED,
-                placeholder: palette::TEXT_MUTED,
-                value: palette::TEXT_TITLE,
-                selection: palette::PRIMARY_BG,
-            }
+        .style(move |_, _status| text_input::Style {
+            background: inset_background.into(),
+            border: focus_border(theme, is_search_focused, 4.0),
+            icon: theme.text.muted,
+            placeholder: theme.text.muted,
+            value: theme.text.emphasis,
+            selection: theme.interaction.selection,
         });
 
     let filtered = picker.filtered_candidates();
@@ -90,7 +62,7 @@ where
     let mut list_column = column![].spacing(2);
     if filtered.is_empty() {
         list_column = list_column.push(
-            container(text(no_matching).size(13.0).color(palette::TEXT_MUTED))
+            container(text(no_matching).size(13.0).color(theme.text.muted))
                 .padding(12)
                 .width(Fill)
                 .align_x(Center),
@@ -103,16 +75,16 @@ where
             let font_name = candidate.family_name.clone();
             let label = text(font_name.clone())
                 .size(13.0)
-                .color(palette::TEXT_TITLE);
+                .color(theme.text.emphasis);
 
             let bg = if is_highlighted {
-                palette::SELECTED_BG
+                theme.interaction.hover
             } else {
-                palette::CANDIDATE_BG
+                inset_background
             };
 
             let border_color = if is_highlighted && is_list_focused {
-                palette::FOCUS_BORDER
+                theme.interaction.accent
             } else {
                 Color::TRANSPARENT
             };
@@ -126,7 +98,7 @@ where
                             width: 1.0,
                             radius: 3.0.into(),
                         })
-                        .color(palette::TEXT_TITLE)
+                        .color(theme.text.emphasis)
                 },
             ))
             .on_press(on_candidate_selected(idx));
@@ -137,15 +109,8 @@ where
 
     let list_scrollable = scrollable(list_column).height(160.0);
 
-    let list_container = container(list_scrollable).style(|_| {
-        container::Style::default()
-            .background(palette::CANDIDATE_BG)
-            .border(Border {
-                color: palette::BORDER,
-                width: 1.0,
-                radius: 4.0.into(),
-            })
-    });
+    let list_container =
+        container(list_scrollable).style(move |_| inset_style(theme, inset_background));
 
     let highlighted = picker.highlighted_candidate();
     let preview_font_family = highlighted
@@ -165,85 +130,29 @@ where
         text(picker.preview_text())
             .size(14.0)
             .font(font_arg)
-            .color(palette::TEXT_TITLE),
+            .color(theme.text.emphasis),
     )
     .padding(12)
     .width(Fill)
     .height(100.0)
-    .style(|_| {
-        container::Style::default()
-            .background(palette::PREVIEW_BG)
-            .border(Border {
-                color: palette::BORDER,
-                width: 1.0,
-                radius: 4.0.into(),
-            })
-    });
+    .style(move |_| inset_style(theme, inset_background));
 
     let cancel_on_result = on_result.clone();
     let is_cancel_focused = picker.focus == FontPickerFocus::CancelButton;
-    let cancel_btn = button(
-        text(cancel_label)
-            .size(13.0)
-            .font(ui_font)
-            .color(palette::TEXT_TITLE),
-    )
-    .padding([6, 16])
-    .style(move |_, status| {
-        let bg = match status {
-            button::Status::Hovered | button::Status::Pressed => palette::BUTTON_BG_HOVER,
-            _ => palette::BUTTON_BG,
-        };
-        let border_color = if is_cancel_focused {
-            palette::FOCUS_BORDER
-        } else {
-            palette::BORDER
-        };
-        button::Style {
-            background: Some(bg.into()),
-            text_color: palette::TEXT_TITLE,
-            border: Border {
-                color: border_color,
-                width: if is_cancel_focused { 2.0 } else { 1.0 },
-                radius: 4.0.into(),
-            },
-            ..button::Style::default()
-        }
-    })
-    .on_press(cancel_on_result(FontPickerResult::Cancel));
+    let cancel_btn = button(text(cancel_label).size(13.0).font(ui_font))
+        .padding([6, 16])
+        .style(move |_, status| style::secondary_button(theme, status, is_cancel_focused))
+        .on_press(cancel_on_result(FontPickerResult::Cancel));
 
     let select_on_result = on_result;
     let is_select_focused = picker.focus == FontPickerFocus::SelectButton;
     let selected_candidate = highlighted.cloned();
 
-    let mut select_btn = button(
-        text(select_label)
-            .size(13.0)
-            .font(ui_font)
-            .color(palette::TEXT_TITLE),
-    )
-    .padding([6, 16])
-    .style(move |_, status| {
-        let bg = match status {
-            button::Status::Hovered | button::Status::Pressed => palette::PRIMARY_BG_HOVER,
-            _ => palette::PRIMARY_BG,
-        };
-        let border_color = if is_select_focused {
-            palette::FOCUS_BORDER_BRIGHT
-        } else {
-            palette::BORDER
-        };
-        button::Style {
-            background: Some(bg.into()),
-            text_color: palette::TEXT_TITLE,
-            border: Border {
-                color: border_color,
-                width: if is_select_focused { 2.0 } else { 1.0 },
-                radius: 4.0.into(),
-            },
-            ..button::Style::default()
-        }
-    });
+    let mut select_btn = button(text(select_label).size(13.0).font(ui_font))
+        .padding([6, 16])
+        .style(move |_, status| {
+            style::filled_button(theme, theme.interaction.accent, status, is_select_focused)
+        });
 
     if let Some(candidate) = selected_candidate {
         select_btn = select_btn.on_press(select_on_result(FontPickerResult::Select(candidate)));
@@ -255,7 +164,7 @@ where
         text(title_text)
             .size(16.0)
             .font(ui_font)
-            .color(palette::TEXT_TITLE),
+            .color(theme.text.emphasis),
         Space::new().height(12.0),
         search_input,
     ]
@@ -269,18 +178,10 @@ where
             .size(16)
             .text_size(13.0)
             .style(move |_, _| checkbox::Style {
-                background: palette::CANDIDATE_BG.into(),
-                icon_color: palette::TEXT_TITLE,
-                border: Border {
-                    color: if is_mono_focused {
-                        palette::FOCUS_BORDER
-                    } else {
-                        palette::BORDER
-                    },
-                    width: if is_mono_focused { 2.0 } else { 1.0 },
-                    radius: 3.0.into(),
-                },
-                text_color: Some(palette::TEXT_BODY),
+                background: inset_background.into(),
+                icon_color: theme.text.emphasis,
+                border: focus_border(theme, is_mono_focused, 3.0),
+                text_color: Some(theme.text.primary),
             });
 
         content = content.push(Space::new().height(8.0)).push(mono_checkbox);
@@ -293,22 +194,16 @@ where
         .push(
             text(preview_sub_header)
                 .size(13.0)
-                .color(palette::TEXT_BODY),
+                .color(theme.text.primary),
         )
         .push(Space::new().height(4.0))
         .push(preview_box)
         .push(Space::new().height(16.0))
         .push(row![Space::new().width(Length::Fill), actions]);
 
-    let dialog_surface = container(content.padding(20)).max_width(540.0).style(|_| {
-        container::Style::default()
-            .background(palette::SURFACE_BG)
-            .border(Border {
-                color: palette::BORDER,
-                width: 1.0,
-                radius: 6.0.into(),
-            })
-    });
+    let dialog_surface = container(content.padding(20))
+        .max_width(540.0)
+        .style(move |_| style::modal_surface(theme));
 
     let backdrop = mouse_area(
         container(
@@ -320,9 +215,31 @@ where
         )
         .width(Fill)
         .height(Fill)
-        .style(|_| container::Style::default().background(palette::BACKDROP)),
+        .style(move |_| style::modal_backdrop(theme)),
     )
     .on_press(on_backdrop);
 
     iced::widget::stack![base_view, backdrop].into()
+}
+
+fn inset_style(theme: &KegonTheme, background: Color) -> container::Style {
+    container::Style::default()
+        .background(background)
+        .border(Border {
+            color: theme.workbench.border,
+            width: 1.0,
+            radius: 4.0.into(),
+        })
+}
+
+fn focus_border(theme: &KegonTheme, focused: bool, radius: f32) -> Border {
+    Border {
+        color: if focused {
+            theme.interaction.accent
+        } else {
+            theme.workbench.border
+        },
+        width: if focused { 2.0 } else { 1.0 },
+        radius: radius.into(),
+    }
 }
