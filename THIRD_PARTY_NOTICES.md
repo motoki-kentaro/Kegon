@@ -32,3 +32,22 @@ limitations under the License.
 - **Version**: 3.6.1
 - **License**: MIT License OR Apache License, Version 2.0
 - **Source**: https://github.com/1Password/arboard
+
+---
+
+## fontdb
+
+- **Version**: 0.23.0
+- **License**: MIT License
+- **Copyright**: Copyright (c) 2020 Yevhenii Reizner
+- **Source**: https://github.com/RazrFalcon/fontdb
+
+---
+
+## ttf-parser
+
+- **Version**: 0.25.1
+- **License**: MIT License OR Apache License, Version 2.0
+- **Copyright**: Copyright (c) 2018 Yevhenii Reizner
+- **Source**: https://github.com/RazrFalcon/ttf-parser
+

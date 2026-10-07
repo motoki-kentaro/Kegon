@@ -63,6 +63,15 @@ message_keys! {
     DialogActionClose => "dialog-action-close",
     DialogActionDelete => "dialog-action-delete",
     DialogActionExit => "dialog-action-exit",
+
+    FontPickerTitleUi => "font-picker-title-ui",
+    FontPickerTitleTerminal => "font-picker-title-terminal",
+    FontPickerSearchPlaceholder => "font-picker-search-placeholder",
+    FontPickerMonospaceOnly => "font-picker-monospace-only",
+    FontPickerPreviewHeader => "font-picker-preview-header",
+    FontPickerNoMatchingFonts => "font-picker-no-matching-fonts",
+    FontPickerCancel => "font-picker-cancel",
+    FontPickerSelect => "font-picker-select",
 }
 
 #[cfg(test)]
