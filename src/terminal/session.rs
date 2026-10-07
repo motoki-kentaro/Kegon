@@ -247,9 +247,25 @@ impl TerminalSession {
     }
 
     /// Whether application cursor keys mode (`DECCKM`) is active.
+    #[allow(dead_code)]
     pub fn is_app_cursor_keys(&self) -> bool {
         let term = self.term.lock();
         term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// Terminal keyboard mode flags derived from alacritty_terminal state.
+    pub fn keyboard_mode(&self) -> crate::terminal::mode::TerminalKeyboardMode {
+        let term = self.term.lock();
+        let mode = term.mode();
+        crate::terminal::mode::TerminalKeyboardMode {
+            app_cursor: mode.contains(TermMode::APP_CURSOR),
+            bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
+            disambiguate_esc_codes: mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
+            report_event_types: mode.contains(TermMode::REPORT_EVENT_TYPES),
+            report_alternate_keys: mode.contains(TermMode::REPORT_ALTERNATE_KEYS),
+            report_all_keys_as_esc: mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC),
+            report_associated_text: mode.contains(TermMode::REPORT_ASSOCIATED_TEXT),
+        }
     }
 
     /// Scroll display offset up or down by `delta` lines.
