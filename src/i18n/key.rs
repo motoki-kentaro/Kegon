@@ -45,6 +45,7 @@ message_keys! {
     SideBarSettingsLanguageSystem => "side-bar-settings-language-system",
     SideBarSettingsCliOverrideNote => "side-bar-settings-cli-override-note",
     SideBarSettingsAppearanceTitle => "side-bar-settings-appearance-title",
+    SideBarSettingsThemeLabel => "side-bar-settings-theme-label",
     SideBarSettingsUiFontLabel => "side-bar-settings-ui-font-label",
     SideBarSettingsUiFontSystem => "side-bar-settings-ui-font-system",
     SideBarSettingsUiFontChoose => "side-bar-settings-ui-font-choose",

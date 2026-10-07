@@ -6,7 +6,7 @@ mod precedence;
 mod store;
 
 #[allow(unused_imports)]
-pub use model::{AppearanceSettings, ApplicationSettings, LocalePreference};
+pub use model::{AppearanceSettings, ApplicationSettings, LocalePreference, ThemePreference};
 #[allow(unused_imports)]
 pub use path::{default_settings_dir, default_settings_file_path};
 pub use precedence::resolve_application_locale;
@@ -16,6 +16,7 @@ pub use store::{load_settings, save_settings};
 mod tests {
     use super::*;
     use crate::i18n::Locale;
+    use crate::theme::ThemeId;
     use std::fs;
 
     #[test]
@@ -55,6 +56,7 @@ mod tests {
             locale: LocalePreference::JaJp,
             appearance: AppearanceSettings {
                 ui_font_family: Some("Noto Sans JP".into()),
+                ..AppearanceSettings::default()
             },
         };
 
@@ -138,6 +140,142 @@ mod tests {
         let (loaded, warning) = load_settings(Some(&path));
         assert_eq!(loaded.locale, LocalePreference::EnUs);
         assert!(warning.is_none());
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    fn load_str(prefix: &str, content: &str) -> (ApplicationSettings, Option<String>) {
+        let temp_dir = tempfile_dir(prefix);
+        let path = temp_dir.join("settings.toml");
+        fs::write(&path, content).unwrap();
+        let result = load_settings(Some(&path));
+        let _ = fs::remove_dir_all(temp_dir);
+        result
+    }
+
+    #[test]
+    fn default_theme_is_night_dark() {
+        let settings = ApplicationSettings::default();
+        assert_eq!(
+            settings.appearance.theme,
+            ThemePreference::Builtin(ThemeId::NightDark)
+        );
+    }
+
+    #[test]
+    fn locale_only_settings_default_to_night_dark() {
+        let (settings, warning) = load_str("theme_locale_only", "locale = \"ja-JP\"\n");
+        assert!(warning.is_none());
+        assert_eq!(settings.locale, LocalePreference::JaJp);
+        assert_eq!(settings.appearance.theme, ThemePreference::default());
+    }
+
+    #[test]
+    fn locale_and_ui_font_settings_default_to_night_dark_and_keep_the_font() {
+        let content = "locale = \"ja-JP\"\n\n[appearance]\nui_font_family = \"Yu Gothic UI\"\n";
+        let (settings, warning) = load_str("theme_locale_font", content);
+        assert!(warning.is_none());
+        assert_eq!(settings.locale, LocalePreference::JaJp);
+        assert_eq!(settings.appearance.theme.effective_id(), ThemeId::NightDark);
+        assert_eq!(
+            settings.appearance.ui_font_family.as_deref(),
+            Some("Yu Gothic UI")
+        );
+    }
+
+    #[test]
+    fn explicit_night_dark_round_trips() {
+        let content = "locale = \"en-US\"\n\n[appearance]\ntheme = \"night-dark\"\n";
+        let (settings, warning) = load_str("theme_explicit", content);
+        assert!(warning.is_none());
+        assert_eq!(
+            settings.appearance.theme,
+            ThemePreference::Builtin(ThemeId::NightDark)
+        );
+
+        let serialized = toml::to_string_pretty(&settings).unwrap();
+        assert!(
+            serialized.contains("theme = \"night-dark\""),
+            "{serialized}"
+        );
+        let reparsed: ApplicationSettings = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed, settings);
+    }
+
+    #[test]
+    fn theme_ui_font_and_locale_are_independent() {
+        let content = "locale = \"ja-JP\"\n\n[appearance]\ntheme = \"night-dark\"\nui_font_family = \"Yu Gothic UI\"\n";
+        let (mut settings, _) = load_str("theme_independent", content);
+
+        settings.appearance.ui_font_family = None;
+        assert_eq!(settings.appearance.theme.effective_id(), ThemeId::NightDark);
+        assert_eq!(settings.locale, LocalePreference::JaJp);
+
+        settings.locale = LocalePreference::EnUs;
+        assert_eq!(settings.appearance.theme.effective_id(), ThemeId::NightDark);
+
+        settings.appearance.theme = ThemePreference::Builtin(ThemeId::NightDark);
+        settings.appearance.ui_font_family = Some("Segoe UI".into());
+        assert_eq!(settings.locale, LocalePreference::EnUs);
+
+        let serialized = toml::to_string_pretty(&settings).unwrap();
+        assert!(serialized.contains("theme = \"night-dark\""));
+        assert!(serialized.contains("ui_font_family = \"Segoe UI\""));
+        assert!(serialized.contains("locale = \"en-US\""));
+    }
+
+    #[test]
+    fn unknown_theme_falls_back_without_losing_other_settings() {
+        let content = "locale = \"ja-JP\"\n\n[appearance]\ntheme = \"future-theme\"\nui_font_family = \"Yu Gothic UI\"\n";
+        let (settings, warning) = load_str("theme_unknown", content);
+
+        // Not a parse error: the rest of the file still applies.
+        assert!(warning.is_none());
+        assert_eq!(settings.locale, LocalePreference::JaJp);
+        assert_eq!(
+            settings.appearance.ui_font_family.as_deref(),
+            Some("Yu Gothic UI")
+        );
+        assert_eq!(
+            settings.appearance.theme,
+            ThemePreference::Unknown("future-theme".into())
+        );
+        assert_eq!(settings.appearance.theme.effective_id(), ThemeId::NightDark);
+        assert!(settings.appearance.theme.diagnostic().is_some());
+        assert!(ThemePreference::default().diagnostic().is_none());
+    }
+
+    #[test]
+    fn unknown_theme_is_preserved_on_disk() {
+        let temp_dir = tempfile_dir("theme_unknown_preserved");
+        let path = temp_dir.join("settings.toml");
+        let content = "locale = \"ja-JP\"\n\n[appearance]\ntheme = \"future-theme\"\n";
+        fs::write(&path, content).unwrap();
+
+        // Loading never rewrites the file.
+        let (mut settings, _) = load_settings(Some(&path));
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+
+        // Saving an unrelated change keeps the unknown theme ID verbatim.
+        settings.appearance.ui_font_family = Some("Segoe UI".into());
+        save_settings(&settings, Some(&path)).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("theme = \"future-theme\""), "{saved}");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn non_string_theme_follows_the_malformed_file_policy() {
+        let temp_dir = tempfile_dir("theme_malformed");
+        let path = temp_dir.join("settings.toml");
+        let content = "[appearance]\ntheme = 5\n";
+        fs::write(&path, content).unwrap();
+
+        let (settings, warning) = load_settings(Some(&path));
+        assert_eq!(settings, ApplicationSettings::default());
+        assert!(warning.is_some());
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+
         let _ = fs::remove_dir_all(temp_dir);
     }
 

@@ -9,12 +9,12 @@ Kegon provides a typed, persistent application settings foundation with runtime 
 
 The scope of `ApplicationSettings` covers:
 - **Application Language** (`locale`)
-- **Appearance Settings** (`appearance.ui_font_family`)
+- **Appearance Settings** (`appearance.theme`, `appearance.ui_font_family`)
 
-Future settings (Themes, Terminal Fonts, Keybindings) will extend this architecture without breaking changes or migration friction.
+Future settings (more themes, Terminal Fonts, Keybindings) will extend this architecture without breaking changes or migration friction.
 
 Non-goals for current version:
-- Theme settings and Theme pickers (light/dark/system)
+- Themes other than Night Dark (Light, System, user-authored themes); see [themes.md](themes.md)
 - Terminal Font setting and cell geometry dynamic resizing
 - Keybinding editor or overrides
 - Project-level settings
@@ -31,7 +31,13 @@ pub enum LocalePreference {
     JaJp,   // "ja-JP"
 }
 
+pub enum ThemePreference {
+    Builtin(ThemeId),  // e.g. "night-dark" (default)
+    Unknown(String),   // an ID this build does not know, kept verbatim
+}
+
 pub struct AppearanceSettings {
+    pub theme: ThemePreference,
     pub ui_font_family: Option<String>,
 }
 
@@ -41,16 +47,19 @@ pub struct ApplicationSettings {
 }
 ```
 
-- **Default Preference**: `locale: LocalePreference::System`, `ui_font_family: None` (System default font).
+- **Default Preference**: `locale: LocalePreference::System`, `theme: night-dark`, `ui_font_family: None` (System default font).
 - **TOML Identifiers**: Saved in TOML using stable lower/kebab-case strings and structured sections:
   ```toml
   locale = "system"
 
   [appearance]
+  theme = "night-dark"
   ui_font_family = "Segoe UI"
   ```
+- **Theme ID**: `appearance.theme` stores the theme's stable ID (`night-dark`), never its display name or a localized string.
+- **Unknown Theme Policy**: An unrecognized theme ID (from a newer version or a hand edit) does not make the file invalid. Kegon uses Night Dark, prints a diagnostic to `stderr`, keeps the rest of the file, and preserves the unknown ID verbatim, including when other settings are saved later. Only an explicit theme choice in Settings replaces it. A non-string `theme` value is a malformed file and follows the malformed-file policy below.
 - **Font Family Saving Policy**: Only the clean family name string is saved (e.g. `"Segoe UI"`). Raw font file paths, `.ttf`/`.ttc` paths, and TTC indices are never written to `settings.toml`.
-- **Backward Compatibility**: Omitted `[appearance]` section or missing `ui_font_family` key defaults gracefully to `None` without modifying existing `settings.toml` files.
+- **Backward Compatibility**: An omitted `[appearance]` section, a missing `theme` key (Night Dark), or a missing `ui_font_family` key (`None`) defaults gracefully without modifying existing `settings.toml` files.
 - **Uninstalled Font Policy**: If a saved family string is missing on the host OS, `settings.toml` is **never** rewritten or deleted. The Settings UI indicates `{family} (not installed)` while preserving the configuration.
 
 ## Configuration Path Policy
@@ -145,10 +154,18 @@ Activity Bar
 - **Minimum Window Layout**: At the minimum logical client size of 640x400, top activity icons and bottom gear remain separated by flexible space without overlap.
 - **Settings Surface**: Clicking Settings displays the Settings panel in the Side Bar area while preserving the main Terminal view. Clicking primary activities (Explorer, Search, Source Control) returns to standard Side Bar views.
 
+## Runtime Theme Switching
+
+The Settings > Appearance section shows a Theme drop-down. Selecting a theme:
+1. saves `appearance.theme` through `save_settings`,
+2. re-resolves the active theme (`resolve_theme`), and
+3. re-renders the workbench, dialogs, and terminal with it.
+
+Locale, UI font, and the terminal session are untouched. With Night Dark as the only built-in theme, the drop-down has one entry; see [themes.md](themes.md).
+
 ## Future Extensions
 
 The `ApplicationSettings` structure and UI surface are designed to accommodate future configuration domains:
-- **Theme Settings**: `theme` field (`System`, `Dark`, `Light`, custom themes).
-- **UI Font & Terminal Font Settings**: Font family, font size, line height, and font weight configuration.
-- **Font Picker**: Installed font enumeration, preview, and selection UI.
+- **More Themes**: Light and other built-in themes, added through the theme registry.
+- **UI Font Size & Terminal Font Settings**: Font size, line height, and font weight configuration.
 - **Keybinding Overrides**: User-customizable keybinding shortcuts in `settings.toml`.

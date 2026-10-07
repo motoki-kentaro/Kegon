@@ -25,13 +25,15 @@ use crate::font::{FontCache, SystemFontCatalog, UiFontResolution, UiFontStatus, 
 use crate::i18n::{self, FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{ICON_SIZE, activity_icon};
 use crate::settings::{
-    ApplicationSettings, LocalePreference, resolve_application_locale, save_settings,
+    ApplicationSettings, LocalePreference, ThemePreference, resolve_application_locale,
+    save_settings,
 };
 use crate::terminal::{
     DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, InputArbiter, InputRoute, SystemClipboard,
     TerminalEvent, TerminalInputEvent, TerminalKeyEncoder, TerminalProgram, TerminalSession,
     calculate_grid_size,
 };
+use crate::theme::{KegonTheme, ThemeId, resolve_theme, style};
 use crate::workbench::{ActivityItem, TabId, Workbench};
 
 const ACTIVITY_BAR_WIDTH: f32 = 48.0;
@@ -68,25 +70,6 @@ fn terminal_events_stream() -> impl iced::futures::Stream<Item = Message> {
     )
 }
 
-/// Colors for the PoC. A proper theme system is out of scope for now.
-mod palette {
-    use iced::Color;
-
-    pub const ACTIVITY_BAR: Color = Color::from_rgb8(0x2c, 0x2c, 0x2c);
-    pub const SIDE_BAR: Color = Color::from_rgb8(0x25, 0x25, 0x26);
-    pub const TAB_STRIP: Color = Color::from_rgb8(0x25, 0x25, 0x26);
-    pub const TAB_ACTIVE: Color = Color::from_rgb8(0x1e, 0x1e, 0x1e);
-    pub const EDITOR: Color = Color::from_rgb8(0x1e, 0x1e, 0x1e);
-    pub const BORDER: Color = Color::from_rgb8(0x3c, 0x3c, 0x3c);
-    pub const HOVER: Color = Color::from_rgb8(0x37, 0x37, 0x3d);
-    pub const ACCENT: Color = Color::from_rgb8(0x00, 0x7a, 0xcc);
-    pub const TEXT: Color = Color::from_rgb8(0xcc, 0xcc, 0xcc);
-    pub const TEXT_MUTED: Color = Color::from_rgb8(0x85, 0x85, 0x85);
-    pub const ICON_ACTIVE: Color = Color::from_rgb8(0xff, 0xff, 0xff);
-    pub const ICON_HOVERED: Color = Color::from_rgb8(0xcc, 0xcc, 0xcc);
-    pub const ICON_INACTIVE: Color = Color::from_rgb8(0x85, 0x85, 0x85);
-}
-
 #[derive(Debug, Clone)]
 pub enum Message {
     ActivitySelected(ActivityItem),
@@ -103,6 +86,7 @@ pub enum Message {
     DialogSecondaryClicked,
     DialogBackdropClicked,
     SettingsLocaleChanged(LocalePreference),
+    SettingsThemeChanged(ThemeId),
     SettingsChooseUiFontClicked,
     SettingsResetUiFontClicked,
     FontPickerSearchChanged(String),
@@ -154,6 +138,11 @@ pub struct Kegon {
     active_ui_font: Font,
     /// UI font resolution status.
     ui_font_status: UiFontStatus,
+    /// The theme every view draws with, resolved from
+    /// `settings.appearance.theme`. Views never read the setting directly.
+    active_theme: &'static KegonTheme,
+    /// Where settings are saved. `None` means the OS configuration directory.
+    settings_path: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for Kegon {
@@ -165,6 +154,7 @@ impl std::fmt::Debug for Kegon {
             .field("modal", &self.modal)
             .field("settings", &self.settings)
             .field("ui_font_status", &self.ui_font_status)
+            .field("active_theme", &self.active_theme.id)
             .finish()
     }
 }
@@ -191,6 +181,8 @@ impl Kegon {
         )
         .ok();
 
+        let active_theme = resolve_theme(settings.appearance.theme.effective_id());
+
         let mut app = Self {
             localizer: Localizer::new(locale),
             workbench: Workbench::default(),
@@ -213,6 +205,8 @@ impl Kegon {
             cli_locale_override,
             active_ui_font: Font::DEFAULT,
             ui_font_status: UiFontStatus::SystemDefault,
+            active_theme,
+            settings_path: None,
         };
 
         app.apply_ui_font_preference();
@@ -256,6 +250,24 @@ impl Kegon {
     /// The window title: the product name, which is not translated.
     pub fn title(&self) -> String {
         String::from("Kegon")
+    }
+
+    /// The iced theme for widgets Kegon does not style itself.
+    pub fn iced_theme(&self) -> Theme {
+        self.active_theme.iced_theme()
+    }
+
+    /// Resolves the configured theme into the active theme.
+    fn apply_theme_preference(&mut self) {
+        self.active_theme = resolve_theme(self.settings.appearance.theme.effective_id());
+    }
+
+    /// Saves `updated` through the settings store and makes it current.
+    fn commit_settings(&mut self, updated: ApplicationSettings) {
+        if let Err(err) = save_settings(&updated, self.settings_path.as_deref()) {
+            eprintln!("kegon: failed to save settings: {err}");
+        }
+        self.settings = updated;
     }
 
     /// Re-resolves and updates the localizer based on current settings and CLI override.
@@ -404,12 +416,15 @@ impl Kegon {
                 if self.cli_locale_override.is_none() {
                     let mut updated_settings = self.settings.clone();
                     updated_settings.locale = new_preference;
-                    if let Err(err) = save_settings(&updated_settings, None) {
-                        eprintln!("kegon: failed to save settings: {err}");
-                    }
-                    self.settings = updated_settings;
+                    self.commit_settings(updated_settings);
                     self.apply_locale_preference();
                 }
+            }
+            Message::SettingsThemeChanged(theme_id) => {
+                let mut updated_settings = self.settings.clone();
+                updated_settings.appearance.theme = ThemePreference::Builtin(theme_id);
+                self.commit_settings(updated_settings);
+                self.apply_theme_preference();
             }
             Message::SettingsChooseUiFontClicked => {
                 self.open_font_picker(FontPickerMode::Ui);
@@ -417,10 +432,7 @@ impl Kegon {
             Message::SettingsResetUiFontClicked => {
                 let mut updated_settings = self.settings.clone();
                 updated_settings.appearance.ui_font_family = None;
-                if let Err(err) = save_settings(&updated_settings, None) {
-                    eprintln!("kegon: failed to save settings: {err}");
-                }
-                self.settings = updated_settings;
+                self.commit_settings(updated_settings);
                 self.apply_ui_font_preference();
             }
             Message::FontPickerSearchChanged(query) => {
@@ -455,10 +467,7 @@ impl Kegon {
                     let mut updated_settings = self.settings.clone();
                     updated_settings.appearance.ui_font_family =
                         Some(candidate.family_name.clone());
-                    if let Err(err) = save_settings(&updated_settings, None) {
-                        eprintln!("kegon: failed to save settings: {err}");
-                    }
-                    self.settings = updated_settings;
+                    self.commit_settings(updated_settings);
                     self.apply_ui_font_preference();
                 }
                 self.close_font_picker(result);
@@ -746,6 +755,7 @@ impl Kegon {
                 font_picker,
                 &self.localizer,
                 self.active_ui_font,
+                self.active_theme,
                 Message::FontPickerSearchChanged,
                 Message::FontPickerMonospaceToggled,
                 Message::FontPickerCandidateSelected,
@@ -758,6 +768,7 @@ impl Kegon {
                 dialog,
                 &self.localizer,
                 self.active_ui_font,
+                self.active_theme,
                 |result| match result {
                     ConfirmationResult::Primary => Message::DialogPrimaryClicked,
                     ConfirmationResult::Secondary => Message::DialogSecondaryClicked,
@@ -780,16 +791,18 @@ impl Kegon {
 
         let content = column![column(top_items), Space::new().height(Fill), settings_item,];
 
+        let theme = self.active_theme;
         container(content)
             .width(ACTIVITY_BAR_WIDTH)
             .height(Fill)
-            .style(|_| container::Style::default().background(palette::ACTIVITY_BAR))
+            .style(move |_| activity_bar_style(theme))
             .into()
     }
 
     fn activity_bar_item(&self, item: ActivityItem, active: ActivityItem) -> Element<'_, Message> {
+        let theme = self.active_theme;
         let is_active = item == active;
-        let color = activity_icon_color(is_active, self.hovered_activity == Some(item));
+        let color = activity_icon_color(theme, is_active, self.hovered_activity == Some(item));
 
         let icon = svg(activity_icon(item))
             .width(ICON_SIZE)
@@ -801,7 +814,7 @@ impl Kegon {
             .height(ACTIVITY_BAR_WIDTH)
             .style(move |_| {
                 container::Style::default().background(if is_active {
-                    palette::ICON_ACTIVE
+                    theme.icons.active
                 } else {
                     Color::TRANSPARENT
                 })
@@ -821,13 +834,14 @@ impl Kegon {
         let label = self.localizer.text(activity_label(item));
         tooltip(
             entry,
-            tooltip_label(label, self.active_ui_font),
+            tooltip_label(label, self.active_ui_font, theme),
             tooltip::Position::Right,
         )
         .into()
     }
 
     fn side_bar(&self) -> Element<'_, Message> {
+        let theme = self.active_theme;
         let active_item = self.workbench.active_activity();
         let (title_key, placeholder_key) = side_bar_text(active_item);
 
@@ -838,20 +852,14 @@ impl Kegon {
                     weight: font::Weight::Bold,
                     ..self.active_ui_font
                 })
-                .color(palette::TEXT),
+                .color(theme.text.primary),
         )
         .height(TAB_STRIP_HEIGHT)
         .padding([0, 20])
         .align_y(Center);
 
         let content: Element<'_, Message> = if active_item == ActivityItem::Settings {
-            let label_text = text(
-                self.localizer
-                    .text(MessageKey::SideBarSettingsLanguageLabel),
-            )
-            .size(UI_TEXT_SIZE)
-            .font(self.active_ui_font)
-            .color(palette::TEXT);
+            let label_text = self.settings_label(MessageKey::SideBarSettingsLanguageLabel);
 
             let options = vec![
                 LocaleOption {
@@ -875,13 +883,9 @@ impl Kegon {
                 .find(|opt| opt.pref == self.settings.locale)
                 .cloned();
 
-            let picker = pick_list(options, selected, |opt| {
+            let picker = self.settings_pick_list(options, selected, |opt| {
                 Message::SettingsLocaleChanged(opt.pref)
-            })
-            .font(self.active_ui_font)
-            .text_size(UI_TEXT_SIZE)
-            .text_shaping(iced::widget::text::Shaping::Auto)
-            .width(Fill);
+            });
 
             let mut language_col = column![label_text, picker].spacing(8);
 
@@ -892,7 +896,7 @@ impl Kegon {
                 )
                 .size(11.0)
                 .font(self.active_ui_font)
-                .color(palette::TEXT_MUTED);
+                .color(theme.text.muted);
                 language_col = language_col.push(note);
             }
 
@@ -905,12 +909,17 @@ impl Kegon {
                 weight: font::Weight::Bold,
                 ..self.active_ui_font
             })
-            .color(palette::TEXT);
+            .color(theme.text.primary);
 
-            let ui_font_label = text(self.localizer.text(MessageKey::SideBarSettingsUiFontLabel))
-                .size(UI_TEXT_SIZE)
-                .font(self.active_ui_font)
-                .color(palette::TEXT);
+            let theme_label = self.settings_label(MessageKey::SideBarSettingsThemeLabel);
+            let theme_options: Vec<ThemeOption> =
+                ThemeId::ALL.into_iter().map(ThemeOption).collect();
+            let theme_picker =
+                self.settings_pick_list(theme_options, Some(ThemeOption(theme.id)), |opt| {
+                    Message::SettingsThemeChanged(opt.0)
+                });
+
+            let ui_font_label = self.settings_label(MessageKey::SideBarSettingsUiFontLabel);
 
             let font_status_text = match &self.ui_font_status {
                 UiFontStatus::SystemDefault => {
@@ -928,28 +937,31 @@ impl Kegon {
             let font_status_val = text(font_status_text)
                 .size(UI_TEXT_SIZE)
                 .font(self.active_ui_font)
-                .color(palette::TEXT_MUTED);
+                .color(theme.text.muted);
 
             let choose_btn = button(
                 text(self.localizer.text(MessageKey::SideBarSettingsUiFontChoose))
                     .size(UI_TEXT_SIZE)
                     .font(self.active_ui_font),
             )
+            .style(move |_, status| style::secondary_button(theme, status, false))
             .on_press(Message::SettingsChooseUiFontClicked);
 
             let mut reset_btn = button(
                 text(self.localizer.text(MessageKey::SideBarSettingsUiFontReset))
                     .size(UI_TEXT_SIZE)
                     .font(self.active_ui_font),
-            );
+            )
+            .style(move |_, status| style::secondary_button(theme, status, false));
             if self.settings.appearance.ui_font_family.is_some() {
                 reset_btn = reset_btn.on_press(Message::SettingsResetUiFontClicked);
             }
 
             let btn_row = row![choose_btn, reset_btn].spacing(8);
 
-            let appearance_col =
-                column![appearance_header, ui_font_label, font_status_val, btn_row,].spacing(8);
+            let theme_col = column![theme_label, theme_picker].spacing(8);
+            let ui_font_col = column![ui_font_label, font_status_val, btn_row].spacing(8);
+            let appearance_col = column![appearance_header, theme_col, ui_font_col].spacing(12);
 
             let settings_col = column![language_col, Space::new().height(16), appearance_col];
 
@@ -961,7 +973,7 @@ impl Kegon {
                     text(self.localizer.text(placeholder_key))
                         .size(UI_TEXT_SIZE)
                         .font(self.active_ui_font)
-                        .color(palette::TEXT_MUTED)
+                        .color(theme.text.muted)
                 )
                 .padding([8, 20]),
             ]
@@ -971,13 +983,47 @@ impl Kegon {
         container(content)
             .width(self.workbench.side_bar_width())
             .height(Fill)
-            .style(|_| container::Style::default().background(palette::SIDE_BAR))
+            .style(move |_| side_bar_style(theme))
+            .into()
+    }
+
+    /// A label above a settings control.
+    fn settings_label(&self, key: MessageKey) -> Element<'_, Message> {
+        text(self.localizer.text(key))
+            .size(UI_TEXT_SIZE)
+            .font(self.active_ui_font)
+            .color(self.active_theme.text.primary)
+            .into()
+    }
+
+    /// A themed settings drop-down.
+    ///
+    /// iced 0.14 renders pick list text with basic shaping by default, which
+    /// ignores a named system UI font; `Shaping::Auto` makes the UI font apply.
+    fn settings_pick_list<T>(
+        &self,
+        options: Vec<T>,
+        selected: Option<T>,
+        on_select: impl Fn(T) -> Message + 'static,
+    ) -> Element<'_, Message>
+    where
+        T: ToString + PartialEq + Clone + 'static,
+    {
+        let theme = self.active_theme;
+        pick_list(options, selected, on_select)
+            .font(self.active_ui_font)
+            .text_size(UI_TEXT_SIZE)
+            .text_shaping(iced::widget::text::Shaping::Auto)
+            .width(Fill)
+            .style(move |_, status| pick_list_style(theme, status))
+            .menu_style(move |_| pick_list_menu_style(theme))
             .into()
     }
 
     fn sash(&self) -> Element<'_, Message> {
+        let theme = self.active_theme;
         let line = container(Space::new().width(1).height(Fill))
-            .style(|_| container::Style::default().background(palette::BORDER));
+            .style(move |_| container::Style::default().background(theme.workbench.border));
 
         let highlight = self.resizing_side_bar;
         let handle = container(line)
@@ -986,9 +1032,9 @@ impl Kegon {
             .align_x(Center)
             .style(move |_| {
                 container::Style::default().background(if highlight {
-                    palette::ACCENT
+                    theme.interaction.accent
                 } else {
-                    palette::SIDE_BAR
+                    theme.workbench.side_bar_background
                 })
             });
 
@@ -999,6 +1045,7 @@ impl Kegon {
     }
 
     fn main_area(&self) -> Element<'_, Message> {
+        let theme = self.active_theme;
         let tab_strip = self.tab_strip();
 
         let terminal_view: Element<'_, Message> = if let Some(session) = &self.terminal_session {
@@ -1006,6 +1053,7 @@ impl Kegon {
                 session,
                 preedit_text: self.preedit_text.as_deref(),
                 is_focused: self.terminal_focused,
+                colors: &theme.terminal,
             };
 
             let canvas_widget = Canvas::new(canvas_program).width(Fill).height(Fill);
@@ -1030,12 +1078,10 @@ impl Kegon {
                     )
                     .size(UI_TEXT_SIZE)
                     .font(self.active_ui_font)
-                    .color(Color::from_rgb8(0xf1, 0x4c, 0x4c)),
+                    .color(theme.semantic.destructive),
                 )
                 .padding([6, 12])
-                .style(|_| {
-                    container::Style::default().background(Color::from_rgb8(0x2d, 0x20, 0x20))
-                });
+                .style(move |_| exit_banner_style(theme));
 
                 column![main_content, exit_banner].height(Fill).into()
             } else {
@@ -1046,18 +1092,18 @@ impl Kegon {
                 text(self.localizer.text(MessageKey::MainPlaceholderTitle))
                     .size(UI_TEXT_SIZE + 2.0)
                     .font(self.active_ui_font)
-                    .color(palette::TEXT),
+                    .color(theme.text.primary),
                 text(self.localizer.text(MessageKey::MainPlaceholderBody))
                     .size(UI_TEXT_SIZE)
                     .font(self.active_ui_font)
-                    .color(palette::TEXT_MUTED),
+                    .color(theme.text.muted),
             ]
             .spacing(6)
             .align_x(Center);
 
             container(placeholder)
                 .center(Fill)
-                .style(|_| container::Style::default().background(palette::EDITOR))
+                .style(move |_| workbench_content_style(theme))
                 .into()
         };
 
@@ -1065,6 +1111,7 @@ impl Kegon {
     }
 
     fn tab_strip(&self) -> Element<'_, Message> {
+        let theme = self.active_theme;
         let tabs = self.workbench.terminal_tabs();
 
         let tab_buttons = tabs.iter().map(|tab| {
@@ -1079,7 +1126,7 @@ impl Kegon {
             .height(TAB_STRIP_HEIGHT)
             .padding([0, 16])
             .on_press(Message::TerminalTabSelected(tab.id))
-            .style(move |_, status| tab_style(is_active, status))
+            .style(move |_, status| tab_style(theme, is_active, status))
             .into()
         });
 
@@ -1088,13 +1135,14 @@ impl Kegon {
                 .width(TAB_STRIP_HEIGHT)
                 .height(TAB_STRIP_HEIGHT)
                 .padding(0)
-                .style(|_, _| button::Style {
-                    text_color: palette::TEXT_MUTED,
+                .style(move |_, _| button::Style {
+                    text_color: theme.text.muted,
                     ..button::Style::default()
                 }),
             tooltip_label(
                 self.localizer.text(MessageKey::TerminalNewTabTooltip),
                 self.active_ui_font,
+                theme,
             ),
             tooltip::Position::Bottom,
         );
@@ -1104,43 +1152,105 @@ impl Kegon {
         container(strip)
             .width(Fill)
             .height(TAB_STRIP_HEIGHT)
-            .style(|_| container::Style::default().background(palette::TAB_STRIP))
+            .style(move |_| tab_bar_style(theme))
             .into()
     }
 }
 
-fn activity_icon_color(is_active: bool, is_hovered: bool) -> Color {
+fn activity_bar_style(theme: &KegonTheme) -> container::Style {
+    container::Style::default().background(theme.workbench.activity_bar_background)
+}
+
+fn side_bar_style(theme: &KegonTheme) -> container::Style {
+    container::Style::default().background(theme.workbench.side_bar_background)
+}
+
+fn tab_bar_style(theme: &KegonTheme) -> container::Style {
+    container::Style::default().background(theme.workbench.tab_bar_background)
+}
+
+fn workbench_content_style(theme: &KegonTheme) -> container::Style {
+    container::Style::default().background(theme.workbench.background)
+}
+
+/// The banner shown under a terminal whose process has exited: a faint
+/// destructive tint over the workbench background.
+fn exit_banner_style(theme: &KegonTheme) -> container::Style {
+    const TINT: f32 = 0.1;
+    container::Style::default().background(style::blend(
+        theme.workbench.background,
+        theme.semantic.destructive,
+        TINT,
+    ))
+}
+
+fn activity_icon_color(theme: &KegonTheme, is_active: bool, is_hovered: bool) -> Color {
     if is_active {
-        palette::ICON_ACTIVE
+        theme.icons.active
     } else if is_hovered {
-        palette::ICON_HOVERED
+        theme.icons.hovered
     } else {
-        palette::ICON_INACTIVE
+        theme.icons.inactive
     }
 }
 
-fn tab_style(is_active: bool, status: button::Status) -> button::Style {
+fn tab_style(theme: &KegonTheme, is_active: bool, status: button::Status) -> button::Style {
+    // The active tab merges into the workbench content below it.
     let background = if is_active {
-        palette::TAB_ACTIVE
+        theme.workbench.background
     } else if matches!(status, button::Status::Hovered) {
-        palette::HOVER
+        theme.interaction.hover
     } else {
-        palette::TAB_STRIP
+        theme.workbench.tab_bar_background
     };
 
     button::Style {
         background: Some(background.into()),
         text_color: if is_active {
-            palette::ICON_ACTIVE
+            theme.text.emphasis
         } else {
-            palette::TEXT_MUTED
+            theme.text.muted
         },
         border: Border {
-            color: palette::BORDER,
+            color: theme.workbench.border,
             width: 0.0,
             radius: 0.0.into(),
         },
         ..button::Style::default()
+    }
+}
+
+fn pick_list_style(theme: &KegonTheme, status: pick_list::Status) -> pick_list::Style {
+    let border_color = match status {
+        pick_list::Status::Active => theme.workbench.border,
+        pick_list::Status::Hovered | pick_list::Status::Opened { .. } => theme.interaction.accent,
+    };
+
+    pick_list::Style {
+        text_color: theme.text.primary,
+        placeholder_color: theme.text.muted,
+        handle_color: theme.text.muted,
+        background: theme.workbench.background.into(),
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+    }
+}
+
+fn pick_list_menu_style(theme: &KegonTheme) -> iced::overlay::menu::Style {
+    iced::overlay::menu::Style {
+        background: theme.workbench.surface_elevated.into(),
+        border: Border {
+            color: theme.workbench.border,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        text_color: theme.text.primary,
+        selected_text_color: theme.text.emphasis,
+        selected_background: theme.interaction.selection.into(),
+        shadow: iced::Shadow::default(),
     }
 }
 
@@ -1174,24 +1284,34 @@ fn side_bar_text(item: ActivityItem) -> (MessageKey, MessageKey) {
     }
 }
 
-fn tooltip_label<'a>(label: String, ui_font: Font) -> Element<'a, Message> {
+fn tooltip_label<'a>(label: String, ui_font: Font, theme: &'a KegonTheme) -> Element<'a, Message> {
     container(
         text(label)
             .size(UI_TEXT_SIZE)
             .font(ui_font)
-            .color(palette::TEXT),
+            .color(theme.text.primary),
     )
     .padding([4, 8])
-    .style(|_: &Theme| {
+    .style(move |_: &Theme| {
         container::Style::default()
-            .background(palette::ACTIVITY_BAR)
+            .background(theme.workbench.surface_elevated)
             .border(Border {
-                color: palette::BORDER,
+                color: theme.workbench.border,
                 width: 1.0,
                 radius: 3.0.into(),
             })
     })
     .into()
+}
+
+/// A theme in the Settings drop-down, shown by its product name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThemeOption(ThemeId);
+
+impl std::fmt::Display for ThemeOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.display_name())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1253,7 +1373,53 @@ mod tests {
     }
 
     fn new_test_app(locale: Locale) -> Kegon {
-        Kegon::new(locale, ApplicationSettings::default(), None, None, None)
+        with_test_settings_path(Kegon::new(
+            locale,
+            ApplicationSettings::default(),
+            None,
+            None,
+            None,
+        ))
+    }
+
+    /// Points saves at a per-test temporary file, so tests never touch the
+    /// user's real settings.
+    fn with_test_settings_path(mut app: Kegon) -> Kegon {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "kegon_app_test_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        app.settings_path = Some(dir.join("settings.toml"));
+        app
+    }
+
+    fn background(style: &container::Style) -> Option<Color> {
+        match style.background {
+            Some(iced::Background::Color(color)) => Some(color),
+            _ => None,
+        }
+    }
+
+    /// A theme whose every token differs from Night Dark, to prove that
+    /// styles read the theme they are given rather than fixed colors.
+    fn synthetic_theme() -> &'static KegonTheme {
+        let mut theme = *resolve_theme(ThemeId::NightDark);
+        theme.workbench.background = Color::from_rgb8(1, 0, 0);
+        theme.workbench.activity_bar_background = Color::from_rgb8(2, 0, 0);
+        theme.workbench.side_bar_background = Color::from_rgb8(3, 0, 0);
+        theme.workbench.tab_bar_background = Color::from_rgb8(4, 0, 0);
+        theme.interaction.hover = Color::from_rgb8(5, 0, 0);
+        theme.interaction.accent = Color::from_rgb8(6, 0, 0);
+        theme.text.muted = Color::from_rgb8(7, 0, 0);
+        theme.text.emphasis = Color::from_rgb8(8, 0, 0);
+        theme.icons.active = Color::from_rgb8(9, 0, 0);
+        theme.icons.hovered = Color::from_rgb8(10, 0, 0);
+        theme.icons.inactive = Color::from_rgb8(11, 0, 0);
+        Box::leak(Box::new(theme))
     }
 
     #[test]
@@ -1271,10 +1437,126 @@ mod tests {
 
     #[test]
     fn activity_icon_color_reflects_state() {
-        assert_eq!(activity_icon_color(false, false), palette::ICON_INACTIVE);
-        assert_eq!(activity_icon_color(false, true), palette::ICON_HOVERED);
-        assert_eq!(activity_icon_color(true, false), palette::ICON_ACTIVE);
-        assert_eq!(activity_icon_color(true, true), palette::ICON_ACTIVE);
+        let theme = synthetic_theme();
+        assert_eq!(
+            activity_icon_color(theme, false, false),
+            theme.icons.inactive
+        );
+        assert_eq!(activity_icon_color(theme, false, true), theme.icons.hovered);
+        assert_eq!(activity_icon_color(theme, true, false), theme.icons.active);
+        assert_eq!(activity_icon_color(theme, true, true), theme.icons.active);
+    }
+
+    #[test]
+    fn workbench_areas_take_their_backgrounds_from_the_theme() {
+        let theme = synthetic_theme();
+        assert_eq!(
+            background(&activity_bar_style(theme)),
+            Some(theme.workbench.activity_bar_background)
+        );
+        assert_eq!(
+            background(&side_bar_style(theme)),
+            Some(theme.workbench.side_bar_background)
+        );
+        assert_eq!(
+            background(&tab_bar_style(theme)),
+            Some(theme.workbench.tab_bar_background)
+        );
+        assert_eq!(
+            background(&workbench_content_style(theme)),
+            Some(theme.workbench.background)
+        );
+    }
+
+    #[test]
+    fn tabs_use_theme_tokens() {
+        let theme = synthetic_theme();
+        let tab_background = |style: &button::Style| match style.background {
+            Some(iced::Background::Color(color)) => color,
+            _ => panic!("expected a solid background"),
+        };
+
+        let active = tab_style(theme, true, button::Status::Active);
+        assert_eq!(tab_background(&active), theme.workbench.background);
+        assert_eq!(active.text_color, theme.text.emphasis);
+
+        let inactive = tab_style(theme, false, button::Status::Active);
+        assert_eq!(
+            tab_background(&inactive),
+            theme.workbench.tab_bar_background
+        );
+        assert_eq!(inactive.text_color, theme.text.muted);
+
+        let hovered = tab_style(theme, false, button::Status::Hovered);
+        assert_eq!(tab_background(&hovered), theme.interaction.hover);
+    }
+
+    #[test]
+    fn settings_pick_lists_use_theme_tokens() {
+        let theme = synthetic_theme();
+        let idle = pick_list_style(theme, pick_list::Status::Active);
+        assert_eq!(idle.text_color, theme.text.primary);
+        assert_eq!(idle.handle_color, theme.text.muted);
+        let hovered = pick_list_style(theme, pick_list::Status::Hovered);
+        assert_eq!(hovered.border.color, theme.interaction.accent);
+    }
+
+    #[test]
+    fn default_settings_activate_night_dark() {
+        let app = new_test_app(Locale::EnUs);
+        assert_eq!(app.active_theme.id, ThemeId::NightDark);
+        assert_eq!(app.iced_theme(), Theme::Dark);
+    }
+
+    #[test]
+    fn unknown_theme_setting_activates_night_dark_and_is_kept() {
+        let mut settings = ApplicationSettings::default();
+        settings.appearance.theme = ThemePreference::Unknown("future-theme".into());
+
+        let app = Kegon::new(Locale::EnUs, settings, None, None, None);
+        assert_eq!(app.active_theme.id, ThemeId::NightDark);
+        assert_eq!(
+            app.settings.appearance.theme,
+            ThemePreference::Unknown("future-theme".into())
+        );
+    }
+
+    #[test]
+    fn theme_change_updates_the_active_theme_and_keeps_other_settings() {
+        let settings = ApplicationSettings {
+            locale: LocalePreference::JaJp,
+            appearance: crate::settings::AppearanceSettings {
+                theme: ThemePreference::Unknown("future-theme".into()),
+                ui_font_family: None,
+            },
+        };
+        let mut app = with_test_settings_path(Kegon::new(Locale::JaJp, settings, None, None, None));
+        let font_before = app.active_ui_font;
+        let font_status_before = app.ui_font_status.clone();
+
+        app.update(Message::SettingsThemeChanged(ThemeId::NightDark));
+
+        assert_eq!(
+            app.settings.appearance.theme,
+            ThemePreference::Builtin(ThemeId::NightDark)
+        );
+        assert_eq!(app.active_theme.id, ThemeId::NightDark);
+        assert_eq!(app.settings.locale, LocalePreference::JaJp);
+        assert_eq!(app.settings.appearance.ui_font_family, None);
+        assert_eq!(app.active_ui_font, font_before);
+        assert_eq!(app.ui_font_status, font_status_before);
+
+        let saved = std::fs::read_to_string(app.settings_path.as_ref().unwrap()).unwrap();
+        assert!(saved.contains("theme = \"night-dark\""), "{saved}");
+        assert!(saved.contains("locale = \"ja-JP\""), "{saved}");
+    }
+
+    #[test]
+    fn locale_change_does_not_touch_the_theme() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.update(Message::SettingsLocaleChanged(LocalePreference::JaJp));
+        assert_eq!(app.settings.appearance.theme, ThemePreference::default());
+        assert_eq!(app.active_theme.id, ThemeId::NightDark);
     }
 
     #[test]
@@ -1456,7 +1738,7 @@ mod tests {
         let mut settings = ApplicationSettings::default();
         settings.appearance.ui_font_family = Some(String::from("Arial"));
 
-        let mut app = Kegon::new(Locale::EnUs, settings, None, None, None);
+        let mut app = with_test_settings_path(Kegon::new(Locale::EnUs, settings, None, None, None));
         assert_eq!(app.settings.appearance.ui_font_family, Some("Arial".into()));
 
         // Choose clicked opens font picker
