@@ -14,6 +14,7 @@ pub mod mode;
 pub mod renderer;
 pub mod session;
 pub mod shell;
+pub mod surface;
 
 pub use arbitration::{InputArbiter, InputRoute};
 pub use clipboard::SystemClipboard;
@@ -24,3 +25,4 @@ pub use mode::TerminalKeyboardMode;
 pub use renderer::{DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, TerminalProgram, calculate_grid_size};
 pub use session::{TerminalEvent, TerminalSession};
 pub use shell::ShellConfig;
+pub use surface::{TerminalSurface, calculate_cursor_rectangle};
