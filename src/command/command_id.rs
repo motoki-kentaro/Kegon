@@ -20,6 +20,10 @@ pub enum CommandId {
     TerminalInterrupt,
     /// Paste clipboard content into terminal.
     TerminalPaste,
+    /// Confirm the active modal dialog primary action.
+    DialogConfirm,
+    /// Cancel or close the active modal dialog.
+    DialogCancel,
 }
 
 impl CommandId {
@@ -33,6 +37,8 @@ impl CommandId {
             Self::TerminalCopyOrInterrupt => "terminal.copyOrInterrupt",
             Self::TerminalInterrupt => "terminal.interrupt",
             Self::TerminalPaste => "terminal.paste",
+            Self::DialogConfirm => "dialog.confirm",
+            Self::DialogCancel => "dialog.cancel",
         }
     }
 }
@@ -66,6 +72,8 @@ impl FromStr for CommandId {
             "terminal.copyOrInterrupt" => Ok(Self::TerminalCopyOrInterrupt),
             "terminal.interrupt" => Ok(Self::TerminalInterrupt),
             "terminal.paste" => Ok(Self::TerminalPaste),
+            "dialog.confirm" => Ok(Self::DialogConfirm),
+            "dialog.cancel" => Ok(Self::DialogCancel),
             _ => Err(ParseCommandIdError(s.to_string())),
         }
     }
@@ -85,6 +93,8 @@ mod tests {
             CommandId::TerminalCopyOrInterrupt,
             CommandId::TerminalInterrupt,
             CommandId::TerminalPaste,
+            CommandId::DialogConfirm,
+            CommandId::DialogCancel,
         ];
 
         for cmd in commands {

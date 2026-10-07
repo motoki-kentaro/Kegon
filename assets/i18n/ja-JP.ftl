@@ -28,3 +28,18 @@ terminal-process-exited = プロセスがコード { $code } で終了しまし�
 
 main-placeholder-title = ターミナル(プレースホルダー)
 main-placeholder-body = ターミナルセッションはまだ実装されていません。
+
+## Confirmation Dialog
+
+dialog-smoke-question-title = スモークテスト質問
+dialog-smoke-question-message = このテスト操作を実行しますか？
+dialog-smoke-warning-title = スモークテスト警告
+dialog-smoke-warning-message = 警告: このテスト操作は模擬的な破壊的アクションを実行します。
+
+dialog-action-cancel = キャンセル
+dialog-action-continue = 続行
+dialog-action-ok = OK
+dialog-action-close = 閉じる
+dialog-action-delete = 削除
+dialog-action-exit = 終了
+

@@ -3,18 +3,29 @@
 //! Kegon has very few options, so they are parsed by hand. Problems are
 //! reported as warnings and never stop the application from starting.
 
+/// Smoke test dialog kind requested on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmokeConfirmationDialog {
+    Question,
+    Warning,
+}
+
 /// Options given on the command line.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Options {
     /// The raw value of `--locale`, if given. An empty string means the
     /// option was given without a value.
     pub locale: Option<String>,
+    /// Smoke test confirmation dialog option, if requested.
+    pub smoke_confirmation_dialog: Option<SmokeConfirmationDialog>,
 }
 
 /// Parses arguments, excluding the program name.
 ///
-/// Accepts `--locale <tag>` and `--locale=<tag>`. If the option is repeated,
-/// the last one wins. Unknown arguments are ignored. Returns the options and
+/// Accepts `--locale <tag>` and `--locale=<tag>`, as well as
+/// `--smoke-confirmation-dialog <question|warning>` and
+/// `--smoke-confirmation-dialog=<question|warning>`. If an option is repeated,
+/// the last valid one wins. Unknown arguments are ignored. Returns the options and
 /// any warnings to show.
 pub fn parse<I>(args: I) -> (Options, Vec<String>)
 where
@@ -35,6 +46,43 @@ where
                 ));
             }
             options.locale = Some(value.unwrap_or_default());
+        } else if let Some(value) = arg.strip_prefix("--smoke-confirmation-dialog=") {
+            match value {
+                "question" => {
+                    options.smoke_confirmation_dialog = Some(SmokeConfirmationDialog::Question)
+                }
+                "warning" => {
+                    options.smoke_confirmation_dialog = Some(SmokeConfirmationDialog::Warning)
+                }
+                other => {
+                    warnings.push(format!(
+                        "--smoke-confirmation-dialog expected 'question' or 'warning', got {other:?}"
+                    ));
+                    options.smoke_confirmation_dialog = None;
+                }
+            }
+        } else if arg == "--smoke-confirmation-dialog" {
+            let value = args.next_if(|next| !next.starts_with('-'));
+            match value.as_deref() {
+                Some("question") => {
+                    options.smoke_confirmation_dialog = Some(SmokeConfirmationDialog::Question)
+                }
+                Some("warning") => {
+                    options.smoke_confirmation_dialog = Some(SmokeConfirmationDialog::Warning)
+                }
+                Some(other) => {
+                    warnings.push(format!(
+                        "--smoke-confirmation-dialog expected 'question' or 'warning', got {other:?}"
+                    ));
+                    options.smoke_confirmation_dialog = None;
+                }
+                None => {
+                    warnings.push(String::from(
+                        "--smoke-confirmation-dialog requires a value ('question' or 'warning')",
+                    ));
+                    options.smoke_confirmation_dialog = None;
+                }
+            }
         } else {
             warnings.push(format!("ignoring unknown argument {arg:?}"));
         }
@@ -95,5 +143,29 @@ mod tests {
         let (options, warnings) = parse_strs(&["--verbose", "--locale", "ja-JP", "file.txt"]);
         assert_eq!(options.locale.as_deref(), Some("ja-JP"));
         assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn smoke_confirmation_dialog_parsing() {
+        assert_eq!(
+            parse_strs(&["--smoke-confirmation-dialog", "question"])
+                .0
+                .smoke_confirmation_dialog,
+            Some(SmokeConfirmationDialog::Question)
+        );
+        assert_eq!(
+            parse_strs(&["--smoke-confirmation-dialog=warning"])
+                .0
+                .smoke_confirmation_dialog,
+            Some(SmokeConfirmationDialog::Warning)
+        );
+
+        let (opts, warns) = parse_strs(&["--smoke-confirmation-dialog", "invalid"]);
+        assert_eq!(opts.smoke_confirmation_dialog, None);
+        assert_eq!(warns.len(), 1);
+
+        let (opts2, warns2) = parse_strs(&["--smoke-confirmation-dialog"]);
+        assert_eq!(opts2.smoke_confirmation_dialog, None);
+        assert_eq!(warns2.len(), 1);
     }
 }

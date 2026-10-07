@@ -7,4 +7,6 @@ pub enum CommandContext {
     Workbench,
     /// Terminal input focused context.
     TerminalFocused,
+    /// Native modal dialog context.
+    Modal,
 }

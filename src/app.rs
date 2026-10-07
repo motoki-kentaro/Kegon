@@ -12,7 +12,12 @@ use iced::{
     Border, Center, Color, Element, Event, Fill, Font, Subscription, Theme, event, font, mouse,
 };
 
+use crate::cli::SmokeConfirmationDialog;
 use crate::command::{CommandContext, CommandDispatcher, KeybindingResolver, Platform};
+use crate::dialog::{
+    ActionTone, ConfirmationDialog, ConfirmationResult, DialogKind, FocusTarget, FocusedAction,
+    render_modal_overlay,
+};
 use crate::i18n::{FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{ICON_SIZE, activity_icon};
 use crate::terminal::{
@@ -87,6 +92,9 @@ pub enum Message {
     IcedEventReceived(Event),
     TerminalEventReceived(TerminalEvent),
     TerminalClicked,
+    DialogPrimaryClicked,
+    DialogSecondaryClicked,
+    DialogBackdropClicked,
 }
 
 pub struct Kegon {
@@ -111,6 +119,10 @@ pub struct Kegon {
     mouse_dragging_selection: bool,
     /// Keybinding resolver and platform configuration.
     keybinding_resolver: KeybindingResolver,
+    /// Active modal confirmation dialog, if any. Zero-or-one active modal policy.
+    modal: Option<ConfirmationDialog>,
+    /// Result of the last closed dialog.
+    last_dialog_result: Option<ConfirmationResult>,
 }
 
 impl std::fmt::Debug for Kegon {
@@ -119,12 +131,13 @@ impl std::fmt::Debug for Kegon {
             .field("resizing_side_bar", &self.resizing_side_bar)
             .field("hovered_activity", &self.hovered_activity)
             .field("terminal_focused", &self.terminal_focused)
+            .field("modal", &self.modal)
             .finish()
     }
 }
 
 impl Kegon {
-    pub fn new(locale: Locale) -> Self {
+    pub fn new(locale: Locale, smoke_dialog: Option<SmokeConfirmationDialog>) -> Self {
         let (tx, rx) = channel();
         if let Ok(mut rx_guard) = TERMINAL_EVENT_RX.lock() {
             *rx_guard = Some(rx);
@@ -139,7 +152,7 @@ impl Kegon {
         )
         .ok();
 
-        Self {
+        let mut app = Self {
             localizer: Localizer::new(locale),
             workbench: Workbench::default(),
             resizing_side_bar: false,
@@ -151,12 +164,75 @@ impl Kegon {
             cursor_position: iced::Point::ORIGIN,
             mouse_dragging_selection: false,
             keybinding_resolver: KeybindingResolver::default_for_platform(Platform::current()),
+            modal: None,
+            last_dialog_result: None,
+        };
+
+        if let Some(smoke) = smoke_dialog {
+            let (kind, title, message, tone) = match smoke {
+                SmokeConfirmationDialog::Question => (
+                    DialogKind::Question,
+                    MessageKey::DialogSmokeQuestionTitle,
+                    MessageKey::DialogSmokeQuestionMessage,
+                    ActionTone::Normal,
+                ),
+                SmokeConfirmationDialog::Warning => (
+                    DialogKind::Warning,
+                    MessageKey::DialogSmokeWarningTitle,
+                    MessageKey::DialogSmokeWarningMessage,
+                    ActionTone::Destructive,
+                ),
+            };
+
+            let dialog = ConfirmationDialog::builder(kind, title, message)
+                .primary_action(MessageKey::DialogActionContinue, tone)
+                .secondary_action(MessageKey::DialogActionCancel)
+                .restore_focus(FocusTarget::Terminal)
+                .build();
+
+            app.open_confirmation_dialog(dialog);
         }
+
+        app
     }
 
     /// The window title: the product name, which is not translated.
     pub fn title(&self) -> String {
         String::from("Kegon")
+    }
+
+    /// Opens a confirmation dialog. Returns true if opened, or false if a modal is already active.
+    pub fn open_confirmation_dialog(&mut self, dialog: ConfirmationDialog) -> bool {
+        if self.modal.is_some() {
+            eprintln!("kegon: cannot open modal dialog; a modal is already active");
+            false
+        } else {
+            self.modal = Some(dialog);
+            true
+        }
+    }
+
+    /// Closes the active modal dialog and restores focus according to dialog settings.
+    pub fn close_modal(&mut self, result: ConfirmationResult) {
+        if let Some(dialog) = self.modal.take() {
+            self.last_dialog_result = Some(result);
+            match dialog.restore_focus {
+                FocusTarget::Terminal => self.terminal_focused = true,
+                FocusTarget::Workbench => self.terminal_focused = false,
+            }
+        }
+    }
+
+    /// Returns the result of the last closed modal dialog, if any.
+    #[allow(dead_code)]
+    pub fn last_dialog_result(&self) -> Option<ConfirmationResult> {
+        self.last_dialog_result
+    }
+
+    /// Returns whether a modal dialog is currently active.
+    #[allow(dead_code)]
+    pub fn is_modal_open(&self) -> bool {
+        self.modal.is_some()
     }
 
     pub fn update(&mut self, message: Message) {
@@ -178,13 +254,24 @@ impl Kegon {
             }
             Message::SashReleased => self.resizing_side_bar = false,
             Message::TerminalClicked => {
-                self.terminal_focused = true;
+                if self.modal.is_none() {
+                    self.terminal_focused = true;
+                }
             }
             Message::TerminalEventReceived(_event) => {
                 // Terminal event arrived; iced will re-render automatically.
             }
             Message::IcedEventReceived(event) => {
                 self.handle_iced_event(event);
+            }
+            Message::DialogPrimaryClicked => {
+                self.close_modal(ConfirmationResult::Primary);
+            }
+            Message::DialogSecondaryClicked => {
+                self.close_modal(ConfirmationResult::Secondary);
+            }
+            Message::DialogBackdropClicked => {
+                // Backdrop clicks are intentionally ignored to avoid accidental dismissal.
             }
         }
     }
@@ -213,22 +300,46 @@ impl Kegon {
                 text,
                 ..
             }) => {
-                let context = if self.terminal_focused {
+                let context = if self.modal.is_some() {
+                    CommandContext::Modal
+                } else if self.terminal_focused {
                     CommandContext::TerminalFocused
                 } else {
                     CommandContext::Workbench
                 };
 
                 let is_ime_composing = self.preedit_text.is_some();
+                let is_modal_open = self.modal.is_some();
                 let route = InputArbiter::arbitrate_key_event(
                     &self.keybinding_resolver,
                     context,
                     &logical_key,
                     modifiers,
                     is_ime_composing,
+                    is_modal_open,
                 );
 
                 match route {
+                    InputRoute::Modal => {
+                        if let Some(dialog) = self.modal.as_mut() {
+                            match logical_key {
+                                keyboard::key::Key::Named(keyboard::key::Named::Enter) => {
+                                    let result = match dialog.focused_action {
+                                        FocusedAction::Primary => ConfirmationResult::Primary,
+                                        FocusedAction::Secondary => ConfirmationResult::Secondary,
+                                    };
+                                    self.close_modal(result);
+                                }
+                                keyboard::key::Key::Named(keyboard::key::Named::Escape) => {
+                                    self.close_modal(ConfirmationResult::Secondary);
+                                }
+                                keyboard::key::Key::Named(keyboard::key::Named::Tab) => {
+                                    dialog.toggle_focus();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     InputRoute::Ime => {}
                     InputRoute::Command(command_id) => {
                         CommandDispatcher::dispatch(
@@ -262,7 +373,8 @@ impl Kegon {
                 modifiers,
                 ..
             }) => {
-                if self.terminal_focused
+                if self.modal.is_none()
+                    && self.terminal_focused
                     && let Some(session) = &self.terminal_session
                 {
                     let mode = session.keyboard_mode();
@@ -276,7 +388,8 @@ impl Kegon {
                 }
             }
             Event::InputMethod(ime_event) => {
-                if self.terminal_focused
+                if self.modal.is_none()
+                    && self.terminal_focused
                     && let Some(session) = &self.terminal_session
                 {
                     match ime_event {
@@ -295,26 +408,29 @@ impl Kegon {
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + self.workbench.side_bar_width();
-                let term_y = TAB_STRIP_HEIGHT;
+                if self.modal.is_none() {
+                    let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + self.workbench.side_bar_width();
+                    let term_y = TAB_STRIP_HEIGHT;
 
-                if self.cursor_position.x >= term_x && self.cursor_position.y >= term_y {
-                    self.terminal_focused = true;
-                    if let Some(session) = &self.terminal_session {
-                        let local_x = (self.cursor_position.x - term_x).max(0.0);
-                        let local_y = (self.cursor_position.y - term_y).max(0.0);
-                        let col = (local_x / DEFAULT_CELL_WIDTH).floor() as usize;
-                        let line = (local_y / DEFAULT_CELL_HEIGHT).floor() as usize;
-                        session.start_selection(col, line);
-                        self.mouse_dragging_selection = true;
+                    if self.cursor_position.x >= term_x && self.cursor_position.y >= term_y {
+                        self.terminal_focused = true;
+                        if let Some(session) = &self.terminal_session {
+                            let local_x = (self.cursor_position.x - term_x).max(0.0);
+                            let local_y = (self.cursor_position.y - term_y).max(0.0);
+                            let col = (local_x / DEFAULT_CELL_WIDTH).floor() as usize;
+                            let line = (local_y / DEFAULT_CELL_HEIGHT).floor() as usize;
+                            session.start_selection(col, line);
+                            self.mouse_dragging_selection = true;
+                        }
+                    } else {
+                        self.terminal_focused = false;
                     }
-                } else {
-                    self.terminal_focused = false;
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 self.cursor_position = position;
-                if self.mouse_dragging_selection
+                if self.modal.is_none()
+                    && self.mouse_dragging_selection
                     && let Some(session) = &self.terminal_session
                 {
                     let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + self.workbench.side_bar_width();
@@ -327,10 +443,14 @@ impl Kegon {
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                self.mouse_dragging_selection = false;
+                if self.modal.is_none() {
+                    self.mouse_dragging_selection = false;
+                }
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                if let Some(session) = &self.terminal_session {
+                if self.modal.is_none()
+                    && let Some(session) = &self.terminal_session
+                {
                     let lines = match delta {
                         mouse::ScrollDelta::Lines { y, .. } => (y * 3.0) as i32,
                         mouse::ScrollDelta::Pixels { y, .. } => (y / 6.0) as i32,
@@ -374,12 +494,27 @@ impl Kegon {
         ]
         .height(Fill);
 
-        if self.resizing_side_bar {
+        let content: Element<'_, Message> = if self.resizing_side_bar {
             mouse_area(body)
                 .interaction(mouse::Interaction::ResizingHorizontally)
                 .into()
         } else {
             body.into()
+        };
+
+        if let Some(dialog) = &self.modal {
+            render_modal_overlay(
+                content,
+                dialog,
+                &self.localizer,
+                |result| match result {
+                    ConfirmationResult::Primary => Message::DialogPrimaryClicked,
+                    ConfirmationResult::Secondary => Message::DialogSecondaryClicked,
+                },
+                Message::DialogBackdropClicked,
+            )
+        } else {
+            content
         }
     }
 
@@ -733,7 +868,7 @@ mod tests {
 
     #[test]
     fn hover_tracks_the_entry_under_the_pointer() {
-        let mut app = Kegon::new(Locale::EnUs);
+        let mut app = Kegon::new(Locale::EnUs, None);
 
         app.update(Message::ActivityHovered(ActivityItem::Search));
         assert_eq!(app.hovered_activity, Some(ActivityItem::Search));
@@ -748,7 +883,7 @@ mod tests {
 
     #[test]
     fn activity_messages_update_the_workbench() {
-        let mut app = Kegon::new(Locale::EnUs);
+        let mut app = Kegon::new(Locale::EnUs, None);
 
         app.update(Message::ActivitySelected(ActivityItem::Git));
         assert_eq!(app.workbench.active_activity(), ActivityItem::Git);
@@ -756,7 +891,7 @@ mod tests {
 
     #[test]
     fn sash_drag_resizes_the_side_bar_only_while_pressed() {
-        let mut app = Kegon::new(Locale::EnUs);
+        let mut app = Kegon::new(Locale::EnUs, None);
         let initial = app.workbench.side_bar_width();
 
         app.update(Message::SashDragged(350.0));
@@ -775,5 +910,66 @@ mod tests {
             app.workbench.side_bar_width(),
             350.0 - ACTIVITY_BAR_WIDTH - SASH_WIDTH / 2.0
         );
+    }
+
+    #[test]
+    fn single_active_modal_policy() {
+        let mut app = Kegon::new(Locale::EnUs, None);
+
+        let d1 = ConfirmationDialog::builder(
+            DialogKind::Question,
+            MessageKey::DialogSmokeQuestionTitle,
+            MessageKey::DialogSmokeQuestionMessage,
+        )
+        .build();
+
+        let d2 = ConfirmationDialog::builder(
+            DialogKind::Warning,
+            MessageKey::DialogSmokeWarningTitle,
+            MessageKey::DialogSmokeWarningMessage,
+        )
+        .build();
+
+        assert!(app.open_confirmation_dialog(d1));
+        assert!(app.is_modal_open());
+
+        // Second modal is deterministically rejected
+        assert!(!app.open_confirmation_dialog(d2));
+
+        app.close_modal(ConfirmationResult::Secondary);
+        assert!(!app.is_modal_open());
+        assert_eq!(
+            app.last_dialog_result(),
+            Some(ConfirmationResult::Secondary)
+        );
+    }
+
+    #[test]
+    fn modal_focus_restoration() {
+        let mut app = Kegon::new(Locale::EnUs, None);
+
+        let d = ConfirmationDialog::builder(
+            DialogKind::Question,
+            MessageKey::DialogSmokeQuestionTitle,
+            MessageKey::DialogSmokeQuestionMessage,
+        )
+        .restore_focus(FocusTarget::Workbench)
+        .build();
+
+        app.terminal_focused = true;
+        app.open_confirmation_dialog(d);
+
+        app.close_modal(ConfirmationResult::Primary);
+        assert!(!app.terminal_focused);
+        assert_eq!(app.last_dialog_result(), Some(ConfirmationResult::Primary));
+    }
+
+    #[test]
+    fn smoke_confirmation_dialog_initialization() {
+        let app_q = Kegon::new(Locale::EnUs, Some(SmokeConfirmationDialog::Question));
+        assert!(app_q.is_modal_open());
+
+        let app_w = Kegon::new(Locale::EnUs, Some(SmokeConfirmationDialog::Warning));
+        assert!(app_w.is_modal_open());
     }
 }
