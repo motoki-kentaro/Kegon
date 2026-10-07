@@ -204,6 +204,15 @@ impl TerminalSession {
         self.title.lock().unwrap().clone()
     }
 
+    /// Returns the active terminal cursor column and row in display grid coordinates.
+    pub fn cursor_position(&self) -> (usize, usize) {
+        let term = self.term.lock();
+        let content = term.renderable_content();
+        let col = content.cursor.point.column.0;
+        let line = content.cursor.point.line.0.max(0) as usize;
+        (col, line)
+    }
+
     /// Whether there is an active text selection in the terminal.
     pub fn has_selection(&self) -> bool {
         let term = self.term.lock();
@@ -361,5 +370,13 @@ mod tests {
 
         session.clear_selection();
         assert!(!session.has_selection());
+    }
+
+    #[test]
+    fn cursor_position_returns_initial_coordinates() {
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
+        let (col, line) = session.cursor_position();
+        assert_eq!((col, line), (0, 0));
     }
 }

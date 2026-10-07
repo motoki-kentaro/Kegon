@@ -101,9 +101,16 @@ Logical key events are mapped to terminal escape sequences and characters:
 
 ## Japanese MS-IME Integration
 
-- iced 0.14 native `Event::InputMethod` events are consumed:
-  - `ImeEvent::Preedit(text, _)`: Stores transient `preedit_text` in UI state and renders preedit text inline over the cursor position with underline. Preedit text is **never** sent to the PTY. Space pressed during composition drives conversion candidate selection and is not leaked to the PTY.
-  - `ImeEvent::Commit(text)`: Clears preedit state and sends the committed UTF-8 string directly to the PTY.
+- **Input Method Activation & Candidate Positioning**:
+  - Managed by custom widget `TerminalSurface` (`src/terminal/surface.rs`) wrapping the terminal canvas.
+  - Calls iced 0.14 `shell.request_input_method(&InputMethod::Enabled { cursor, purpose: Purpose::Normal, preedit: None })` when the terminal has keyboard focus (`terminal_focused == true` and no modal is active).
+  - Calculates `cursor` rectangle from active grid cursor position `(cursor_col, cursor_line)` and dynamic `TerminalCellMetrics` (`cell_width`, `cell_height`) mapped to absolute window coordinates: `Rectangle { x: bounds.x + col * cell_width, y: bounds.y + line * cell_height, width: cell_width, height: cell_height }`.
+  - When focus leaves the terminal (e.g. modal confirmation or font picker opens), calls `shell.request_input_method(&InputMethod::Disabled)` to disable native IME ownership.
+- **IME Event Handling**:
+  - iced 0.14 native `Event::InputMethod` events are consumed:
+    - `ImeEvent::Preedit(text, _)`: Stores transient `preedit_text` in UI state and renders preedit text inline over the cursor position with underline. Preedit text is **never** sent to the PTY. Space pressed during composition drives conversion candidate selection and is not leaked to the PTY.
+    - `ImeEvent::Commit(text)`: Clears preedit state and sends the committed UTF-8 string directly to the PTY.
+    - `ImeEvent::Closed`: Clears preedit state.
 - Prevents double-transmission of composition keystrokes.
 
 ## Clipboard Operations

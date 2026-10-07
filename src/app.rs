@@ -35,7 +35,8 @@ use crate::settings::{
 };
 use crate::terminal::{
     InputArbiter, InputRoute, SystemClipboard, TerminalEvent, TerminalInputEvent,
-    TerminalKeyEncoder, TerminalProgram, TerminalSession,
+    TerminalKeyEncoder, TerminalProgram, TerminalSession, TerminalSurface,
+    calculate_cursor_rectangle,
 };
 use crate::theme::{KegonTheme, ThemeId, resolve_theme, style};
 use crate::workbench::{ActivityItem, SIDE_BAR_DEFAULT_WIDTH, TabId, Workbench};
@@ -1219,9 +1220,21 @@ impl Kegon {
 
             let canvas_widget = Canvas::new(canvas_program).width(Fill).height(Fill);
 
-            let main_content: Element<'_, Message> = mouse_area(canvas_widget)
-                .on_press(Message::TerminalClicked)
-                .into();
+            let (cursor_col, cursor_line) = session.cursor_position();
+            let cursor_rect = calculate_cursor_rectangle(
+                cursor_col,
+                cursor_line,
+                &self.terminal_font_config.metrics,
+            );
+
+            let is_focused = self.terminal_focused && !self.is_modal_open();
+
+            let main_content: Element<'_, Message> = TerminalSurface::new(
+                mouse_area(canvas_widget).on_press(Message::TerminalClicked),
+                is_focused,
+                Some(cursor_rect),
+            )
+            .into();
 
             if session.is_exited() {
                 let code_str = session
@@ -1978,5 +1991,65 @@ mod tests {
             (col_far, line_far),
             ((max_cols - 1) as usize, (max_rows - 1) as usize)
         );
+    }
+
+    #[test]
+    fn ime_preedit_and_commit_flow() {
+        use iced::advanced::input_method::Event as ImeEvent;
+
+        let mut app = new_test_app(Locale::EnUs);
+        app.terminal_focused = true;
+
+        assert_eq!(app.preedit_text, None);
+
+        // Preedit event updates preedit_text
+        app.update(Message::IcedEventReceived(Event::InputMethod(
+            ImeEvent::Preedit(String::from("にほんご"), None),
+        )));
+        assert_eq!(app.preedit_text.as_deref(), Some("にほんご"));
+
+        // Commit event clears preedit_text
+        app.update(Message::IcedEventReceived(Event::InputMethod(
+            ImeEvent::Commit(String::from("日本語")),
+        )));
+        assert_eq!(app.preedit_text, None);
+
+        // Closed event clears preedit_text
+        app.update(Message::IcedEventReceived(Event::InputMethod(
+            ImeEvent::Preedit(String::from("かな"), None),
+        )));
+        assert_eq!(app.preedit_text.as_deref(), Some("かな"));
+
+        app.update(Message::IcedEventReceived(Event::InputMethod(
+            ImeEvent::Closed,
+        )));
+        assert_eq!(app.preedit_text, None);
+    }
+
+    #[test]
+    fn terminal_focus_toggles_with_modal_and_clicks() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.terminal_focused = true;
+
+        // Terminal click keeps focus when no modal
+        app.update(Message::TerminalClicked);
+        assert!(app.terminal_focused);
+
+        // Open modal
+        let dialog = ConfirmationDialog::builder(
+            DialogKind::Question,
+            MessageKey::DialogSmokeQuestionTitle,
+            MessageKey::DialogSmokeQuestionMessage,
+        )
+        .restore_focus(FocusTarget::Terminal)
+        .build();
+
+        app.open_confirmation_dialog(dialog);
+        assert!(app.is_modal_open());
+
+        // Close modal restores terminal focus
+        app.close_modal(ConfirmationResult::Primary);
+        assert!(!app.is_modal_open());
+        assert!(app.terminal_focused);
     }
 }
