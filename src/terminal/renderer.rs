@@ -7,21 +7,24 @@ use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Program, Text};
 use iced::{Color, Font, Point, Rectangle, Size, Theme};
 
+use crate::font::{TerminalCellMetrics, TerminalFontConfig};
 use crate::terminal::session::TerminalSession;
 use crate::theme::TerminalColors;
 
+#[allow(dead_code)]
 pub const DEFAULT_CELL_WIDTH: f32 = 8.5;
+#[allow(dead_code)]
 pub const DEFAULT_CELL_HEIGHT: f32 = 18.0;
+#[allow(dead_code)]
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
 
 /// Opacity of the selection highlight, drawn over the terminal background.
 const SELECTION_ALPHA: f32 = 0.6;
 
-/// Calculates grid columns and rows for a given terminal view size.
-pub fn calculate_grid_size(width: f32, height: f32) -> (u16, u16) {
-    let cols = (width / DEFAULT_CELL_WIDTH).floor().max(1.0) as u16;
-    let rows = (height / DEFAULT_CELL_HEIGHT).floor().max(1.0) as u16;
-    (cols, rows)
+/// Calculates grid columns and rows for a given terminal view size using active cell metrics.
+#[allow(dead_code)]
+pub fn calculate_grid_size(width: f32, height: f32, metrics: &TerminalCellMetrics) -> (u16, u16) {
+    metrics.grid_size(width, height)
 }
 
 /// Converts an ANSI terminal color into an iced [`Color`].
@@ -87,6 +90,8 @@ pub struct TerminalProgram<'a> {
     pub is_focused: bool,
     /// The active theme's terminal colors.
     pub colors: &'a TerminalColors,
+    /// Active terminal font and cell metrics.
+    pub font_config: &'a TerminalFontConfig,
 }
 
 impl<'a, Message> Program<Message> for TerminalProgram<'a> {
@@ -101,6 +106,9 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let colors = self.colors;
+        let metrics = &self.font_config.metrics;
+        let font = self.font_config.font;
+
         let selection = Color {
             a: SELECTION_ALPHA,
             ..colors.selection
@@ -119,7 +127,7 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
             let col = cell.point.column.0 as f32;
             let line = cell.point.line.0 as f32;
 
-            let cell_pos = Point::new(col * DEFAULT_CELL_WIDTH, line * DEFAULT_CELL_HEIGHT);
+            let cell_pos = Point::new(col * metrics.cell_width, line * metrics.cell_height);
 
             let mut fg = convert_color(cell.fg, true, colors);
             let mut bg = convert_color(cell.bg, false, colors);
@@ -136,11 +144,11 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
             // Draw custom background if non-default
             if bg != colors.background {
                 let cell_width = if cell.flags.contains(Flags::WIDE_CHAR) {
-                    DEFAULT_CELL_WIDTH * 2.0
+                    metrics.cell_width * 2.0
                 } else {
-                    DEFAULT_CELL_WIDTH
+                    metrics.cell_width
                 };
-                frame.fill_rectangle(cell_pos, Size::new(cell_width, DEFAULT_CELL_HEIGHT), bg);
+                frame.fill_rectangle(cell_pos, Size::new(cell_width, metrics.cell_height), bg);
             }
 
             // Draw character text unless wide char spacer or hidden
@@ -153,8 +161,8 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
                     content: cell.c.to_string(),
                     position: cell_pos,
                     color: fg,
-                    size: DEFAULT_FONT_SIZE.into(),
-                    font: Font::MONOSPACE,
+                    size: metrics.font_size.into(),
+                    font,
                     align_x: Horizontal::Left.into(),
                     align_y: Vertical::Top,
                     line_height: iced::widget::text::LineHeight::Relative(1.0),
@@ -168,12 +176,12 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         // 2. Draw Terminal Cursor
         let cursor_point = content.cursor.point;
         let cursor_pos = Point::new(
-            cursor_point.column.0 as f32 * DEFAULT_CELL_WIDTH,
-            cursor_point.line.0 as f32 * DEFAULT_CELL_HEIGHT,
+            cursor_point.column.0 as f32 * metrics.cell_width,
+            cursor_point.line.0 as f32 * metrics.cell_height,
         );
 
-        let cursor_width = DEFAULT_CELL_WIDTH;
-        let cursor_height = DEFAULT_CELL_HEIGHT;
+        let cursor_width = metrics.cell_width;
+        let cursor_height = metrics.cell_height;
 
         if self.is_focused {
             frame.fill_rectangle(
@@ -196,12 +204,12 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
             && !preedit.is_empty()
         {
             let preedit_pos = cursor_pos;
-            let preedit_width = (preedit.chars().count() as f32) * DEFAULT_CELL_WIDTH * 1.5;
+            let preedit_width = (preedit.chars().count() as f32) * metrics.cell_width * 1.5;
 
             // Preedit background highlight
             frame.fill_rectangle(
                 preedit_pos,
-                Size::new(preedit_width.max(DEFAULT_CELL_WIDTH), DEFAULT_CELL_HEIGHT),
+                Size::new(preedit_width.max(metrics.cell_width), metrics.cell_height),
                 colors.preedit_background,
             );
 
@@ -210,8 +218,8 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
                 content: preedit.to_string(),
                 position: preedit_pos,
                 color: colors.preedit_foreground,
-                size: DEFAULT_FONT_SIZE.into(),
-                font: Font::MONOSPACE,
+                size: metrics.font_size.into(),
+                font,
                 align_x: Horizontal::Left.into(),
                 align_y: Vertical::Top,
                 line_height: iced::widget::text::LineHeight::Relative(1.0),
@@ -222,10 +230,10 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
             // Preedit underline
             let line_path = Path::line(
-                Point::new(preedit_pos.x, preedit_pos.y + DEFAULT_CELL_HEIGHT - 1.0),
+                Point::new(preedit_pos.x, preedit_pos.y + metrics.cell_height - 1.0),
                 Point::new(
                     preedit_pos.x + preedit_width,
-                    preedit_pos.y + DEFAULT_CELL_HEIGHT - 1.0,
+                    preedit_pos.y + metrics.cell_height - 1.0,
                 ),
             );
             frame.stroke(
@@ -257,9 +265,15 @@ mod tests {
 
     #[test]
     fn calculate_grid_size_computes_correct_rows_and_cols() {
-        let (cols, rows) = calculate_grid_size(850.0, 360.0);
+        let default_metrics = TerminalCellMetrics::default();
+        let (cols, rows) = calculate_grid_size(850.0, 360.0, &default_metrics);
         assert_eq!(cols, 100); // 850 / 8.5 = 100
         assert_eq!(rows, 20); // 360 / 18 = 20
+
+        let custom_metrics = TerminalCellMetrics::new(10.0, 20.0, 13.0);
+        let (cols, rows) = calculate_grid_size(1000.0, 400.0, &custom_metrics);
+        assert_eq!(cols, 100);
+        assert_eq!(rows, 20);
     }
 
     #[test]

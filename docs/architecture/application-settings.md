@@ -9,13 +9,13 @@ Kegon provides a typed, persistent application settings foundation with runtime 
 
 The scope of `ApplicationSettings` covers:
 - **Application Language** (`locale`)
-- **Appearance Settings** (`appearance.theme`, `appearance.ui_font_family`)
+- **Appearance Settings** (`appearance.theme`, `appearance.ui_font_family`, `appearance.terminal_font_family`)
 
-Future settings (more themes, Terminal Fonts, Keybindings) will extend this architecture without breaking changes or migration friction.
+Future settings (more themes, Terminal font size / line height, Keybindings) will extend this architecture without breaking changes or migration friction.
 
 Non-goals for current version:
 - Themes other than Night Dark (Light, System, user-authored themes); see [themes.md](themes.md)
-- Terminal Font setting and cell geometry dynamic resizing
+- Terminal Font size UI or custom line height configuration
 - Keybinding editor or overrides
 - Project-level settings
 - Settings search or category tree
@@ -39,6 +39,7 @@ pub enum ThemePreference {
 pub struct AppearanceSettings {
     pub theme: ThemePreference,
     pub ui_font_family: Option<String>,
+    pub terminal_font_family: Option<String>,
 }
 
 pub struct ApplicationSettings {
@@ -47,7 +48,7 @@ pub struct ApplicationSettings {
 }
 ```
 
-- **Default Preference**: `locale: LocalePreference::System`, `theme: night-dark`, `ui_font_family: None` (System default font).
+- **Default Preference**: `locale: LocalePreference::System`, `theme: night-dark`, `ui_font_family: None` (System default font), `terminal_font_family: None` (System default monospaced font).
 - **TOML Identifiers**: Saved in TOML using stable lower/kebab-case strings and structured sections:
   ```toml
   locale = "system"
@@ -55,6 +56,7 @@ pub struct ApplicationSettings {
   [appearance]
   theme = "night-dark"
   ui_font_family = "Segoe UI"
+  terminal_font_family = "Cascadia Mono"
   ```
 - **Theme ID**: `appearance.theme` stores the theme's stable ID (`night-dark`), never its display name or a localized string.
 - **Unknown Theme Policy**: An unrecognized theme ID (from a newer version or a hand edit) does not make the file invalid. Kegon uses Night Dark, prints a diagnostic to `stderr`, keeps the rest of the file, and preserves the unknown ID verbatim, including when other settings are saved later. Only an explicit theme choice in Settings replaces it. A non-string `theme` value is a malformed file and follows the malformed-file policy below.
@@ -163,9 +165,19 @@ The Settings > Appearance section shows a Theme drop-down. Selecting a theme:
 
 Locale, UI font, and the terminal session are untouched. With Night Dark as the only built-in theme, the drop-down has one entry; see [themes.md](themes.md).
 
+## Runtime Terminal Font Switching & Dynamic Resizing
+
+Selecting a Terminal font in Settings > Appearance (or clicking Reset):
+1. Saves `appearance.terminal_font_family` through `save_settings`.
+2. Resolves `TerminalFontConfig` against system font catalog and byte cache.
+3. Derives OpenType `units_per_em`, ascender, descender, line gap, and monospace glyph advance width to calculate exact `TerminalCellMetrics` (`cell_width`, `cell_height`).
+4. Re-calculates terminal grid columns and rows for the active window viewport.
+5. Resizes the active `TerminalSession` (preserves PTY child process, shell state, scrollback, and TUI state).
+6. Re-renders the terminal grid, cursor, selection highlight, and IME preedit using active cell metrics.
+
 ## Future Extensions
 
 The `ApplicationSettings` structure and UI surface are designed to accommodate future configuration domains:
 - **More Themes**: Light and other built-in themes, added through the theme registry.
-- **UI Font Size & Terminal Font Settings**: Font size, line height, and font weight configuration.
+- **UI Font Size & Terminal Font Size**: User-facing font size and line height controls.
 - **Keybinding Overrides**: User-customizable keybinding shortcuts in `settings.toml`.

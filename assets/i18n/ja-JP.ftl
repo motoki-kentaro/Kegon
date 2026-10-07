@@ -29,6 +29,11 @@ side-bar-settings-ui-font-system = システム標準
 side-bar-settings-ui-font-choose = 選択...
 side-bar-settings-ui-font-reset = リセット
 side-bar-settings-ui-font-not-installed = { $family } (未インストール)
+side-bar-settings-terminal-font-label = ターミナル フォント
+side-bar-settings-terminal-font-default = 標準
+side-bar-settings-terminal-font-choose = 選択...
+side-bar-settings-terminal-font-reset = リセット
+side-bar-settings-terminal-font-not-installed = { $family } (未インストール)
 
 
 ## Terminal tab strip

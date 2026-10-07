@@ -51,6 +51,11 @@ message_keys! {
     SideBarSettingsUiFontChoose => "side-bar-settings-ui-font-choose",
     SideBarSettingsUiFontReset => "side-bar-settings-ui-font-reset",
     SideBarSettingsUiFontNotInstalled => "side-bar-settings-ui-font-not-installed",
+    SideBarSettingsTerminalFontLabel => "side-bar-settings-terminal-font-label",
+    SideBarSettingsTerminalFontDefault => "side-bar-settings-terminal-font-default",
+    SideBarSettingsTerminalFontChoose => "side-bar-settings-terminal-font-choose",
+    SideBarSettingsTerminalFontReset => "side-bar-settings-terminal-font-reset",
+    SideBarSettingsTerminalFontNotInstalled => "side-bar-settings-terminal-font-not-installed",
 
     TerminalTabDefaultTitle => "terminal-tab-default-title",
     TerminalNewTabTooltip => "terminal-new-tab-tooltip",

@@ -112,6 +112,10 @@ pub struct AppearanceSettings {
     /// `None` indicates system default font.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_font_family: Option<String>,
+    /// Preferred Terminal font family name (e.g. "Cascadia Mono", "Consolas").
+    /// `None` indicates system default monospaced font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_font_family: Option<String>,
 }
 
 /// Typed model holding Kegon application-level configuration.
