@@ -54,13 +54,18 @@ On Windows, initial shell discovery prioritizes:
 
 - Rendered via iced's `Canvas` widget (`TerminalProgram` implementing `canvas::Program`).
 - Grid cells are measured with dynamic `TerminalCellMetrics` derived from active font OpenType metrics (`units_per_em`, `ascender`, `descender`, `line_gap`, and monospace advance width). Default fallback metrics are `cell_width = 8.5px`, `cell_height = 18.0px`.
-- Supports:
-  - ASCII and Unicode characters
-  - Japanese CJK wide characters (`WIDE_CHAR` occupying 2 column widths)
-  - 16 ANSI colors, 256 indexed colors, and TrueColor RGB
-  - Cursor styles (block cursor when focused, hollow outline when unfocused)
-  - Selection highlights
-  - Preedit inline composition rendering for Japanese MS-IME
+- **Text Alignment & Shaping**:
+  - `LineHeight::Absolute(metrics.cell_height)` matches cell height to preserve vertical baseline placement across fonts.
+  - `Shaping::Advanced` enables `cosmic-text` system font fallback for missing glyphs (Braille `U+2800..U+28FF`, Box Drawing `U+2500..U+257F`, Block Elements `U+2580..U+259F`, symbols `⚠`, `✓`, `✗`, `•`, `→`, `←`, and CJK).
+  - Individual per-cell text rendering preserves logical grid isolation and prevents multi-cell ligature merges.
+- **Attributes & Features**:
+  - ASCII, Unicode, combining zero-width characters (`zerowidth()`), and Japanese CJK wide characters (`WIDE_CHAR`).
+  - Terminal cell attributes: `BOLD` (weight mapping), `ITALIC` (style mapping), `DIM` (foreground alpha scaling), `INVERSE` (fg/bg swap), `HIDDEN` (background preserved, text hidden).
+  - Metric-driven text line attributes: `UNDERLINE`, `DOUBLE_UNDERLINE`, and `STRIKEOUT`.
+  - 16 ANSI colors, 256 indexed colors, and TrueColor RGB.
+  - Cursor styles: block cursor when focused with contrasting character text rendered over solid block, hollow outline when unfocused.
+  - Translucent text selection highlights (`SELECTION_ALPHA = 0.6`).
+  - Preedit inline composition rendering for Japanese MS-IME.
 
 ## Keyboard Input Routing & Escapes
 
