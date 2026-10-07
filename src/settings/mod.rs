@@ -257,9 +257,45 @@ mod tests {
 
         // Saving an unrelated change keeps the unknown theme ID verbatim.
         settings.appearance.ui_font_family = Some("Segoe UI".into());
+        settings.appearance.terminal_font_family = Some("Cascadia Mono".into());
         save_settings(&settings, Some(&path)).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("theme = \"future-theme\""), "{saved}");
+        assert!(
+            saved.contains("terminal_font_family = \"Cascadia Mono\""),
+            "{saved}"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn missing_terminal_font_family_is_preserved_when_saving_other_settings() {
+        let temp_dir = tempfile_dir("missing_terminal_font");
+        let path = temp_dir.join("settings.toml");
+        let content = "locale = \"ja-JP\"\n\n[appearance]\nterminal_font_family = \"Kegon Definitely Missing Font\"\n";
+        fs::write(&path, content).unwrap();
+
+        let (mut settings, warning) = load_settings(Some(&path));
+        assert!(warning.is_none());
+        assert_eq!(
+            settings.appearance.terminal_font_family.as_deref(),
+            Some("Kegon Definitely Missing Font")
+        );
+
+        settings.appearance.ui_font_family = Some("Segoe UI".into());
+        save_settings(&settings, Some(&path)).unwrap();
+
+        let (reloaded, warning) = load_settings(Some(&path));
+        assert!(warning.is_none());
+        assert_eq!(
+            reloaded.appearance.terminal_font_family.as_deref(),
+            Some("Kegon Definitely Missing Font")
+        );
+        assert_eq!(
+            reloaded.appearance.ui_font_family.as_deref(),
+            Some("Segoe UI")
+        );
 
         let _ = fs::remove_dir_all(temp_dir);
     }

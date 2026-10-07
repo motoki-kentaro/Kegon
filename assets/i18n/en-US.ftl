@@ -30,6 +30,11 @@ side-bar-settings-ui-font-system = System default
 side-bar-settings-ui-font-choose = Choose...
 side-bar-settings-ui-font-reset = Reset
 side-bar-settings-ui-font-not-installed = { $family } (not installed)
+side-bar-settings-terminal-font-label = Terminal Font
+side-bar-settings-terminal-font-default = Default
+side-bar-settings-terminal-font-choose = Choose...
+side-bar-settings-terminal-font-reset = Reset
+side-bar-settings-terminal-font-not-installed = { $family } (not installed)
 
 
 ## Terminal tab strip

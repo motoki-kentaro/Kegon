@@ -11,7 +11,8 @@ use iced::widget::{
     Space, button, column, container, mouse_area, pick_list, row, space, svg, text, tooltip,
 };
 use iced::{
-    Border, Center, Color, Element, Event, Fill, Font, Subscription, Theme, event, font, mouse,
+    Border, Center, Color, Element, Event, Fill, Font, Size, Subscription, Theme, event, font,
+    mouse,
 };
 
 use crate::cli::{SmokeConfirmationDialog, SmokeFontPicker};
@@ -21,7 +22,10 @@ use crate::dialog::{
     FontPicker, FontPickerFocus, FontPickerMode, FontPickerResult, render_font_picker_overlay,
     render_modal_overlay,
 };
-use crate::font::{FontCache, SystemFontCatalog, UiFontResolution, UiFontStatus, resolve_ui_font};
+use crate::font::{
+    FontCache, SystemFontCatalog, TerminalFontConfig, TerminalFontStatus, UiFontResolution,
+    UiFontStatus, resolve_terminal_font, resolve_ui_font,
+};
 use crate::i18n::{self, FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{ICON_SIZE, activity_icon};
 use crate::settings::{
@@ -29,12 +33,11 @@ use crate::settings::{
     save_settings,
 };
 use crate::terminal::{
-    DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, InputArbiter, InputRoute, SystemClipboard,
-    TerminalEvent, TerminalInputEvent, TerminalKeyEncoder, TerminalProgram, TerminalSession,
-    calculate_grid_size,
+    InputArbiter, InputRoute, SystemClipboard, TerminalEvent, TerminalInputEvent,
+    TerminalKeyEncoder, TerminalProgram, TerminalSession,
 };
 use crate::theme::{KegonTheme, ThemeId, resolve_theme, style};
-use crate::workbench::{ActivityItem, TabId, Workbench};
+use crate::workbench::{ActivityItem, SIDE_BAR_DEFAULT_WIDTH, TabId, Workbench};
 
 const ACTIVITY_BAR_WIDTH: f32 = 48.0;
 const SASH_WIDTH: f32 = 4.0;
@@ -89,6 +92,8 @@ pub enum Message {
     SettingsThemeChanged(ThemeId),
     SettingsChooseUiFontClicked,
     SettingsResetUiFontClicked,
+    SettingsChooseTerminalFontClicked,
+    SettingsResetTerminalFontClicked,
     FontPickerSearchChanged(String),
     FontPickerMonospaceToggled(bool),
     FontPickerCandidateSelected(usize),
@@ -138,6 +143,10 @@ pub struct Kegon {
     active_ui_font: Font,
     /// UI font resolution status.
     ui_font_status: UiFontStatus,
+    /// Active Terminal font configuration and derived cell metrics.
+    terminal_font_config: TerminalFontConfig,
+    /// Current window bounds size.
+    window_size: Size,
     /// The theme every view draws with, resolved from
     /// `settings.appearance.theme`. Views never read the setting directly.
     active_theme: &'static KegonTheme,
@@ -154,6 +163,7 @@ impl std::fmt::Debug for Kegon {
             .field("modal", &self.modal)
             .field("settings", &self.settings)
             .field("ui_font_status", &self.ui_font_status)
+            .field("terminal_font_status", &self.terminal_font_config.status)
             .field("active_theme", &self.active_theme.id)
             .finish()
     }
@@ -167,16 +177,31 @@ impl Kegon {
         smoke_dialog: Option<SmokeConfirmationDialog>,
         smoke_font_picker: Option<SmokeFontPicker>,
     ) -> Self {
+        let font_catalog = SystemFontCatalog::load_system();
+        let mut font_cache = FontCache::default();
+        let terminal_font_config = resolve_terminal_font(
+            settings.appearance.terminal_font_family.as_deref(),
+            &font_catalog,
+            &mut font_cache,
+        );
+
+        let initial_window_size = Size::new(1200.0, 760.0);
+        let side_bar_w = SIDE_BAR_DEFAULT_WIDTH;
+        let main_w =
+            (initial_window_size.width - ACTIVITY_BAR_WIDTH - SASH_WIDTH - side_bar_w).max(10.0);
+        let main_h = (initial_window_size.height - TAB_STRIP_HEIGHT).max(10.0);
+        let (cols, rows) = terminal_font_config.metrics.grid_size(main_w, main_h);
+
         let (tx, rx) = channel();
         if let Ok(mut rx_guard) = TERMINAL_EVENT_RX.lock() {
             *rx_guard = Some(rx);
         }
 
         let terminal_session = TerminalSession::spawn(
-            80,
-            24,
-            DEFAULT_CELL_WIDTH as u16,
-            DEFAULT_CELL_HEIGHT as u16,
+            cols,
+            rows,
+            terminal_font_config.metrics.cell_width as u16,
+            terminal_font_config.metrics.cell_height as u16,
             tx,
         )
         .ok();
@@ -198,18 +223,21 @@ impl Kegon {
             modal: None,
             last_dialog_result: None,
             font_picker: None,
-            font_catalog: None,
-            font_cache: FontCache::default(),
+            font_catalog: Some(font_catalog),
+            font_cache,
             last_font_picker_result: None,
             settings,
             cli_locale_override,
             active_ui_font: Font::DEFAULT,
             ui_font_status: UiFontStatus::SystemDefault,
+            terminal_font_config,
+            window_size: initial_window_size,
             active_theme,
             settings_path: None,
         };
 
         app.apply_ui_font_preference();
+        app.apply_terminal_font_preference();
 
         if let Some(smoke) = smoke_dialog {
             let (kind, title, message, tone) = match smoke {
@@ -302,6 +330,37 @@ impl Kegon {
         self.ui_font_status = resolution.status;
     }
 
+    /// Re-resolves and updates the active Terminal font based on current application settings.
+    pub fn apply_terminal_font_preference(&mut self) {
+        if self.font_catalog.is_none() {
+            self.font_catalog = Some(SystemFontCatalog::load_system());
+        }
+        let catalog = self.font_catalog.as_ref().unwrap();
+        self.terminal_font_config = resolve_terminal_font(
+            self.settings.appearance.terminal_font_family.as_deref(),
+            catalog,
+            &mut self.font_cache,
+        );
+        self.resize_terminal_view();
+    }
+
+    /// Resizes the active terminal session to fit the current viewport size with active cell metrics.
+    fn resize_terminal_view(&mut self) {
+        if let Some(session) = &self.terminal_session {
+            let side_bar_w = self.workbench.side_bar_width();
+            let main_w =
+                (self.window_size.width - ACTIVITY_BAR_WIDTH - SASH_WIDTH - side_bar_w).max(10.0);
+            let main_h = (self.window_size.height - TAB_STRIP_HEIGHT).max(10.0);
+            let (cols, rows) = self.terminal_font_config.metrics.grid_size(main_w, main_h);
+            session.resize(
+                cols,
+                rows,
+                self.terminal_font_config.metrics.cell_width as u16,
+                self.terminal_font_config.metrics.cell_height as u16,
+            );
+        }
+    }
+
     /// Opens a confirmation dialog. Returns true if opened, or false if a modal is already active.
     pub fn open_confirmation_dialog(&mut self, dialog: ConfirmationDialog) -> bool {
         if self.is_modal_open() {
@@ -326,6 +385,10 @@ impl Kegon {
             let mut picker = FontPicker::new(mode, catalog);
             if mode == FontPickerMode::Ui
                 && let Some(family) = &self.settings.appearance.ui_font_family
+            {
+                picker.select_family(family);
+            } else if mode == FontPickerMode::Terminal
+                && let Some(family) = &self.settings.appearance.terminal_font_family
             {
                 picker.select_family(family);
             }
@@ -435,6 +498,15 @@ impl Kegon {
                 self.commit_settings(updated_settings);
                 self.apply_ui_font_preference();
             }
+            Message::SettingsChooseTerminalFontClicked => {
+                self.open_font_picker(FontPickerMode::Terminal);
+            }
+            Message::SettingsResetTerminalFontClicked => {
+                let mut updated_settings = self.settings.clone();
+                updated_settings.appearance.terminal_font_family = None;
+                self.commit_settings(updated_settings);
+                self.apply_terminal_font_preference();
+            }
             Message::FontPickerSearchChanged(query) => {
                 if let Some(picker) = self.font_picker.as_mut() {
                     picker.set_search_query(query);
@@ -462,13 +534,23 @@ impl Kegon {
             Message::FontPickerResultReceived(result) => {
                 if let FontPickerResult::Select(candidate) = &result
                     && let Some(picker) = &self.font_picker
-                    && picker.mode == FontPickerMode::Ui
                 {
-                    let mut updated_settings = self.settings.clone();
-                    updated_settings.appearance.ui_font_family =
-                        Some(candidate.family_name.clone());
-                    self.commit_settings(updated_settings);
-                    self.apply_ui_font_preference();
+                    match picker.mode {
+                        FontPickerMode::Ui => {
+                            let mut updated_settings = self.settings.clone();
+                            updated_settings.appearance.ui_font_family =
+                                Some(candidate.family_name.clone());
+                            self.commit_settings(updated_settings);
+                            self.apply_ui_font_preference();
+                        }
+                        FontPickerMode::Terminal => {
+                            let mut updated_settings = self.settings.clone();
+                            updated_settings.appearance.terminal_font_family =
+                                Some(candidate.family_name.clone());
+                            self.commit_settings(updated_settings);
+                            self.apply_terminal_font_preference();
+                        }
+                    }
                 }
                 self.close_font_picker(result);
             }
@@ -481,19 +563,8 @@ impl Kegon {
     fn handle_iced_event(&mut self, event: Event) {
         match event {
             Event::Window(iced::window::Event::Resized(size)) => {
-                if let Some(session) = &self.terminal_session {
-                    let side_bar_w = self.workbench.side_bar_width();
-                    let main_w =
-                        (size.width - ACTIVITY_BAR_WIDTH - SASH_WIDTH - side_bar_w).max(10.0);
-                    let main_h = (size.height - TAB_STRIP_HEIGHT).max(10.0);
-                    let (cols, rows) = calculate_grid_size(main_w, main_h);
-                    session.resize(
-                        cols,
-                        rows,
-                        DEFAULT_CELL_WIDTH as u16,
-                        DEFAULT_CELL_HEIGHT as u16,
-                    );
-                }
+                self.window_size = size;
+                self.resize_terminal_view();
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 physical_key,
@@ -664,8 +735,9 @@ impl Kegon {
                         if let Some(session) = &self.terminal_session {
                             let local_x = (self.cursor_position.x - term_x).max(0.0);
                             let local_y = (self.cursor_position.y - term_y).max(0.0);
-                            let col = (local_x / DEFAULT_CELL_WIDTH).floor() as usize;
-                            let line = (local_y / DEFAULT_CELL_HEIGHT).floor() as usize;
+                            let metrics = &self.terminal_font_config.metrics;
+                            let col = (local_x / metrics.cell_width).floor() as usize;
+                            let line = (local_y / metrics.cell_height).floor() as usize;
                             session.start_selection(col, line);
                             self.mouse_dragging_selection = true;
                         }
@@ -684,8 +756,9 @@ impl Kegon {
                     let term_y = TAB_STRIP_HEIGHT;
                     let local_x = (position.x - term_x).max(0.0);
                     let local_y = (position.y - term_y).max(0.0);
-                    let col = (local_x / DEFAULT_CELL_WIDTH).floor() as usize;
-                    let line = (local_y / DEFAULT_CELL_HEIGHT).floor() as usize;
+                    let metrics = &self.terminal_font_config.metrics;
+                    let col = (local_x / metrics.cell_width).floor() as usize;
+                    let line = (local_y / metrics.cell_height).floor() as usize;
                     session.update_selection(col, line);
                 }
             }
@@ -961,7 +1034,66 @@ impl Kegon {
 
             let theme_col = column![theme_label, theme_picker].spacing(8);
             let ui_font_col = column![ui_font_label, font_status_val, btn_row].spacing(8);
-            let appearance_col = column![appearance_header, theme_col, ui_font_col].spacing(12);
+
+            let terminal_font_label =
+                self.settings_label(MessageKey::SideBarSettingsTerminalFontLabel);
+
+            let terminal_font_status_text = match &self.terminal_font_config.status {
+                TerminalFontStatus::Default => self
+                    .localizer
+                    .text(MessageKey::SideBarSettingsTerminalFontDefault),
+                TerminalFontStatus::Active(family) => family.clone(),
+                TerminalFontStatus::NotInstalled(family)
+                | TerminalFontStatus::LoadFailed(family) => {
+                    let mut args = FluentArgs::new();
+                    args.set("family", family.clone());
+                    self.localizer
+                        .text_with(MessageKey::SideBarSettingsTerminalFontNotInstalled, &args)
+                }
+            };
+
+            let terminal_font_status_val = text(terminal_font_status_text)
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font)
+                .color(theme.text.muted);
+
+            let choose_terminal_font_btn = button(
+                text(
+                    self.localizer
+                        .text(MessageKey::SideBarSettingsTerminalFontChoose),
+                )
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font),
+            )
+            .style(move |_, status| style::secondary_button(theme, status, false))
+            .on_press(Message::SettingsChooseTerminalFontClicked);
+
+            let mut reset_terminal_font_btn = button(
+                text(
+                    self.localizer
+                        .text(MessageKey::SideBarSettingsTerminalFontReset),
+                )
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font),
+            )
+            .style(move |_, status| style::secondary_button(theme, status, false));
+            if self.settings.appearance.terminal_font_family.is_some() {
+                reset_terminal_font_btn =
+                    reset_terminal_font_btn.on_press(Message::SettingsResetTerminalFontClicked);
+            }
+
+            let terminal_font_btn_row =
+                row![choose_terminal_font_btn, reset_terminal_font_btn].spacing(8);
+
+            let terminal_font_col = column![
+                terminal_font_label,
+                terminal_font_status_val,
+                terminal_font_btn_row
+            ]
+            .spacing(8);
+
+            let appearance_col =
+                column![appearance_header, theme_col, ui_font_col, terminal_font_col].spacing(12);
 
             let settings_col = column![language_col, Space::new().height(16), appearance_col];
 
@@ -1054,6 +1186,7 @@ impl Kegon {
                 preedit_text: self.preedit_text.as_deref(),
                 is_focused: self.terminal_focused,
                 colors: &theme.terminal,
+                font_config: &self.terminal_font_config,
             };
 
             let canvas_widget = Canvas::new(canvas_program).width(Fill).height(Fill);
@@ -1528,6 +1661,7 @@ mod tests {
             appearance: crate::settings::AppearanceSettings {
                 theme: ThemePreference::Unknown("future-theme".into()),
                 ui_font_family: None,
+                terminal_font_family: None,
             },
         };
         let mut app = with_test_settings_path(Kegon::new(Locale::JaJp, settings, None, None, None));
@@ -1752,5 +1886,44 @@ mod tests {
         app.update(Message::SettingsResetUiFontClicked);
         assert_eq!(app.settings.appearance.ui_font_family, None);
         assert_eq!(app.ui_font_status, UiFontStatus::SystemDefault);
+    }
+
+    #[test]
+    fn terminal_font_settings_and_resolution() {
+        let mut settings = ApplicationSettings::default();
+        settings.appearance.terminal_font_family = Some(String::from("Consolas"));
+
+        let app = Kegon::new(Locale::EnUs, settings, None, None, None);
+        assert!(matches!(
+            app.terminal_font_config.status,
+            TerminalFontStatus::Active(_) | TerminalFontStatus::NotInstalled(_)
+        ));
+    }
+
+    #[test]
+    fn terminal_font_choose_open_picker_and_reset() {
+        let mut settings = ApplicationSettings::default();
+        settings.appearance.terminal_font_family = Some(String::from("Consolas"));
+
+        let mut app = with_test_settings_path(Kegon::new(Locale::EnUs, settings, None, None, None));
+        assert_eq!(
+            app.settings.appearance.terminal_font_family,
+            Some("Consolas".into())
+        );
+
+        // Choose clicked opens font picker in Terminal mode
+        app.update(Message::SettingsChooseTerminalFontClicked);
+        assert!(app.is_modal_open());
+        assert_eq!(
+            app.font_picker.as_ref().unwrap().mode,
+            FontPickerMode::Terminal
+        );
+
+        app.close_font_picker(FontPickerResult::Cancel);
+
+        // Reset clicked sets terminal_font_family to None
+        app.update(Message::SettingsResetTerminalFontClicked);
+        assert_eq!(app.settings.appearance.terminal_font_family, None);
+        assert_eq!(app.terminal_font_config.status, TerminalFontStatus::Default);
     }
 }

@@ -53,7 +53,7 @@ On Windows, initial shell discovery prioritizes:
 ## Renderer
 
 - Rendered via iced's `Canvas` widget (`TerminalProgram` implementing `canvas::Program`).
-- Grid cells are measured with fixed cell dimensions (`DEFAULT_CELL_WIDTH = 8.5px`, `DEFAULT_CELL_HEIGHT = 18.0px`).
+- Grid cells are measured with dynamic `TerminalCellMetrics` derived from active font OpenType metrics (`units_per_em`, `ascender`, `descender`, `line_gap`, and monospace advance width). Default fallback metrics are `cell_width = 8.5px`, `cell_height = 18.0px`.
 - Supports:
   - ASCII and Unicode characters
   - Japanese CJK wide characters (`WIDE_CHAR` occupying 2 column widths)

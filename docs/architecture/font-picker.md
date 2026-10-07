@@ -11,7 +11,7 @@ It is designed to serve both UI font selection and Terminal font selection throu
 
 The Font Picker does **not** persist selections to `settings.toml` directly. It returns a `FontPickerResult` (`Select(FontCandidate)` or `Cancel`) to the caller (`Kegon`), which handles settings persistence and runtime UI font application.
 
-When opened from the Settings Side Bar (`Choose...`), if `ui_font_family` is configured in `ApplicationSettings`, the corresponding family candidate is automatically pre-selected and highlighted in the candidate list. If unset or uninstalled, the first candidate is selected by default.
+When opened from the Settings Side Bar (`Choose...`), if `ui_font_family` (in UI mode) or `terminal_font_family` (in Terminal mode) is configured in `ApplicationSettings`, the corresponding family candidate is automatically pre-selected and highlighted in the candidate list. If unset or uninstalled, the first candidate is selected by default.
 
 ---
 
@@ -101,4 +101,4 @@ Invalid values (e.g. `--smoke-font-picker=invalid`) print a warning and exit saf
 ## 9. Known Limitations & Future Work
 
 - **Weight / Style Picker**: Selecting specific font weights (e.g. Light, Medium, Bold) or italic variants is out of scope for this Issue and will be added when theme font customization is implemented.
-- **Terminal Cell Geometry**: Cell width/height calculation for alacritty_terminal remains fixed at default cell metrics until multi-font terminal grid resizing is added in a future Issue.
+- **Dynamic Terminal Cell Geometry**: Terminal cell width and height are derived dynamically from active font OpenType metrics upon Terminal font selection (Issue #23). User-facing font size and custom line height controls remain for future scope.
