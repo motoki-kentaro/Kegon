@@ -1,1 +1,19 @@
 /target
+
+# Local scratch space for experiments and probes.
+/scratch/
+/screenshots/
+
+# Local environment files.
+.env
+.env.*
+
+# Logs and crash dumps.
+*.log
+*.dmp
+
+# Editor and OS state.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

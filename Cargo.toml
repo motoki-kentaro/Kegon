@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A native, Git-native terminal workspace, written in Rust."
+license = "MIT"
 repository = "https://github.com/motoki-kentaro/Kegon"
 publish = false
 

@@ -2,6 +2,14 @@
 
 This directory contains the application icon asset set for Kegon across supported desktop platforms.
 
+## Provenance
+
+The Kegon application icon was generated specifically for Kegon using Gemini, and the project owner adopted it as Kegon's official application icon. It is not derived from Codicons or any other third-party icon set.
+
+The project owner permits redistribution of the icon with this repository and with Kegon distributions.
+
+The canonical raster source is `png/icon_1024x1024.png`; every other file in this directory is derived from it.
+
 ## Canonical source / Master artwork
 
 - `png/icon_1024x1024.png`: Canonical source master asset (1024x1024 transparent PNG).

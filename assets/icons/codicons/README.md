@@ -11,6 +11,9 @@ see [LICENSE](LICENSE).
 | `activity-bar/files.svg` | Activity Bar: File Explorer |
 | `activity-bar/search.svg` | Activity Bar: Search |
 | `activity-bar/git-branch.svg` | Activity Bar: Git |
+| `activity-bar/settings-gear.svg` | Activity Bar: Settings |
+| `dialog/question.svg` | Confirmation dialog: question |
+| `dialog/warning.svg` | Confirmation dialog: warning |
 
 The icons are monochrome (`fill="currentColor"`). Kegon embeds them at build
 time and sets their color at runtime.

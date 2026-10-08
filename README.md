@@ -12,7 +12,7 @@
 
 Kegon is a desktop application that puts the **terminal** at the center of the workspace, not a code editor.
 
-The main area is a set of terminal tabs. Each tab runs its own process: PowerShell, MSYS2, WSL, SSH, Claude Code, Codex CLI, Gemini CLI, or any other command-line tool you use. Around those terminals, Kegon intends to provide just enough GUI to browse the repository, search it, and review changes through Git.
+The main area is designed as a set of terminal tabs, each running its own process: PowerShell, MSYS2, WSL, SSH, Claude Code, Codex CLI, Gemini CLI, or any other command-line tool you use. Around those terminals, Kegon intends to provide just enough GUI to browse the repository, search it, and review changes through Git.
 
 Kegon is **not** an IDE built for AI agents. From Kegon's point of view, an AI coding agent and a plain shell are the same thing: a command running in a terminal.
 
@@ -40,39 +40,6 @@ Kegon aims to sit between them: a terminal-first workspace that is aware of the 
 - **Native and lightweight.** Written fully in Rust as a native desktop application. No WebView, Electron, or Tauri.
 - **Grow incrementally.** Start small and solid, and add features one step at a time instead of building a large IDE up front.
 
-## Planned initial features
-
-None of the following is implemented yet. This section describes the intended direction.
-
-### First milestones
-
-The first technical goals are deliberately narrow:
-
-1. Open a native Rust window.
-2. Display a single terminal.
-3. Operate PowerShell (and similar shells) correctly through a PTY.
-4. Create and switch between multiple terminal tabs.
-5. Run TUI applications such as Claude Code correctly.
-
-### Planned layout
-
-- **Main area:** multi-tab terminal, with each tab backed by an independent PTY / process session.
-- **Activity Bar** (left, VS Code-style), with the initial items, from top to bottom:
-  1. File Explorer
-  2. Search
-  3. Git
-- **Side Bar:** the panel for the selected Activity Bar item.
-
-### Later
-
-After the terminal foundation is stable, the plan is to add, step by step:
-
-- File Explorer
-- Search across the workspace
-- Git status and diff views
-- Terminal profiles (configurable shells and CLI tools to launch)
-- Session and workspace management
-
 ## Non-goals
 
 To keep the scope focused, Kegon intentionally does **not** aim to be:
@@ -85,21 +52,43 @@ To keep the scope focused, Kegon intentionally does **not** aim to be:
 
 ## Current status
 
-Kegon is at the **very beginning** of development.
+Kegon is **experimental and under active development**. It runs day to day, but expect rough edges and breaking changes.
 
-- A proof-of-concept window exists. It shows the workbench layout (Activity Bar, Side Bar, terminal tab strip), but only as placeholders. No terminal, File Explorer, Search, or Git functionality is implemented yet.
-- The GUI toolkit has been chosen for the proof of concept: [iced](https://github.com/iced-rs/iced). See [docs/architecture/gui-stack.md](docs/architecture/gui-stack.md) for the reasoning.
-- The UI is available in English (`en-US`) and Japanese (`ja-JP`). By default it follows the OS language. See [docs/architecture/i18n.md](docs/architecture/i18n.md).
-- The terminal emulation, PTY, and Git libraries are **not yet decided**.
-- The design described in this README may change as development progresses.
+### What works today
 
-This README serves as a statement of intent for the project.
+- A native desktop window built with [iced](https://github.com/iced-rs/iced), laid out as a workbench: Activity Bar, Side Bar, and a terminal tab strip.
+- A real terminal session: the default shell runs in a PTY (ConPTY on Windows), with emulation provided by [alacritty_terminal](https://github.com/alacritty/alacritty). On Windows, PowerShell 7 (`pwsh`) is preferred, falling back to Windows PowerShell and then `cmd.exe`.
+- Terminal rendering with font fallback, cursor, text selection, and scrollback.
+- Keyboard input, including Japanese IME composition.
+- Copy and paste with the system clipboard (bracketed paste aware).
+- The terminal grid and the PTY follow window resizes.
+- Replies to terminal queries from programs (for example cursor position and device attributes).
+- Window and tab titles set by the running program.
+- Settings persisted to a TOML file in the OS configuration directory: UI language, UI font, terminal font, and theme (one built-in dark theme so far).
+- English (`en-US`) and Japanese (`ja-JP`) UI; by default it follows the OS language.
 
-### Running the proof of concept
+### Not yet implemented
 
-Requires a recent stable Rust toolchain.
+- Multiple terminal tabs: one terminal session is shown today.
+- File Explorer, Search, and Git views: their Side Bar panels are placeholders.
+- Terminal profiles and session/workspace management.
+
+### Known limitations
+
+- Windows is the only platform tested so far. The code avoids Windows-only assumptions where it can, but Linux and macOS are **not currently tested**.
+- Some terminal interactions are still being hardened, for example selection and copy usability and compatibility with some TUI applications' key handling.
+
+Design notes for the implemented parts live in [docs/architecture](docs/architecture).
+
+## Building and running
+
+Requirements:
+
+- Rust **1.88** or later (the `rust-version` in `Cargo.toml`).
+- On Windows with the MSVC toolchain, `rc.exe` from the Windows SDK, which the build uses to embed the application icon (installed with the usual Visual Studio Build Tools setup).
 
 ```sh
+cargo build --release
 cargo run
 ```
 
@@ -109,6 +98,14 @@ To override the UI language:
 cargo run -- --locale ja-JP
 cargo run -- --locale en-US
 ```
+
+## License
+
+Kegon is licensed under the [MIT License](LICENSE).
+
+Kegon depends on and bundles third-party components that come with their own licenses, including the [Codicons](assets/icons/codicons/README.md) icons (CC BY 4.0). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+To report a security issue, see [SECURITY.md](SECURITY.md).
 
 ## About the name
 
