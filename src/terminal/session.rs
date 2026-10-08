@@ -242,10 +242,19 @@ impl TerminalSession {
             cell_height,
         };
 
+        // `Msg::Resize` only resizes the PTY; the event loop never touches the `Term` grid, so
+        // it is resized here too. Both happen under the `Term` lock (as upstream Alacritty does)
+        // so the PTY thread cannot parse the child's redraw for the new size into a stale grid.
+        // Lock order `Term` -> `window_size` matches `EventProxy::send_event`.
+        let mut term = self.term.lock();
         if let Ok(mut size_guard) = self.window_size.lock() {
             *size_guard = window_size;
         }
         let _ = self.event_loop_sender.send(Msg::Resize(window_size));
+        term.resize(TermSize {
+            cols: cols as usize,
+            lines: rows as usize,
+        });
     }
 
     /// Whether the child process has exited.
@@ -510,6 +519,78 @@ mod tests {
                 size.cell_height
             ),
             (100, 30, 9, 18)
+        );
+    }
+
+    fn grid_size(session: &TerminalSession) -> (usize, usize) {
+        let term = session.term().lock();
+        (term.columns(), term.screen_lines())
+    }
+
+    #[test]
+    fn resize_updates_term_grid_with_pty_dimensions() {
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
+        assert_eq!(grid_size(&session), (80, 24));
+
+        session.resize(120, 40, 10, 20);
+        assert_eq!(grid_size(&session), (120, 40));
+        let size = *session.window_size.lock().unwrap();
+        assert_eq!((size.num_cols, size.num_lines), (120, 40));
+    }
+
+    #[test]
+    fn repeated_resizes_leave_grid_at_last_size() {
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
+        for (cols, rows) in [(120, 40), (40, 10), (100, 30)] {
+            session.resize(cols, rows, 10, 20);
+            assert_eq!(grid_size(&session), (cols as usize, rows as usize));
+        }
+    }
+
+    #[test]
+    fn zero_resize_is_clamped_identically_for_grid_and_pty() {
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
+        session.resize(0, 0, 0, 0);
+        assert_eq!(grid_size(&session), (1, 1));
+        let size = *session.window_size.lock().unwrap();
+        assert_eq!((size.num_cols, size.num_lines), (1, 1));
+    }
+
+    /// `CSI 18 t` is answered from the `Term` grid and `CSI 14 t` from the shared pixel size,
+    /// so both must follow a resize.
+    #[test]
+    fn size_replies_follow_resized_term() {
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let (proxy, pty_rx, window_size) = proxy_with_pty_channel();
+        let term = FairMutex::new(Term::new(
+            Config::default(),
+            &TermSize {
+                cols: 80,
+                lines: 24,
+            },
+            proxy,
+        ));
+        let mut parser: Processor = Processor::new();
+
+        let mut guard = term.lock();
+        *window_size.lock().unwrap() = WindowSize {
+            num_lines: 40,
+            num_cols: 120,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        guard.resize(TermSize {
+            cols: 120,
+            lines: 40,
+        });
+        parser.advance(&mut *guard, b"\x1b[18t\x1b[14t");
+        assert_eq!(
+            drain(&pty_rx),
+            vec![b"\x1b[8;40;120t".to_vec(), b"\x1b[4;800;1200t".to_vec()]
         );
     }
 

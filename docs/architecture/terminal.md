@@ -135,7 +135,9 @@ Logical key events are mapped to terminal escape sequences and characters:
 ## Resize and Scrollback
 
 - Terminal area pixel bounds compute column/row count: `(width / cell_width, height / cell_height)`.
-- Resizing updates `alacritty_terminal` grid dimensions and sends a `Msg::Resize` command to ConPTY.
+- `TerminalSession::resize` applies one clamped (`>= 1`) cols/rows pair to both sides: it sends `Msg::Resize` to the PTY and calls `Term::resize` on the grid. `Msg::Resize` alone never resizes the grid, because the event loop only forwards it to the PTY.
+- Both updates (and the shared `WindowSize` used for `CSI 14 t`) happen under one `Term` lock, as in upstream Alacritty. As a result, the PTY thread cannot parse the child's redraw for the new size into the old grid.
+- Reflow, cursor clamping, and selection invalidation follow `alacritty_terminal`'s own `Term::resize` semantics.
 - Mouse wheel scrolling shifts the display offset into the scrollback history buffer.
 
 ## Non-Goals (Out of Scope for Issue #27)
