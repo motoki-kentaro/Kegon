@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use iced::futures::channel::mpsc::UnboundedSender;
 
@@ -34,16 +34,68 @@ pub enum TerminalEvent {
     ChildExit(Option<i32>),
 }
 
+/// Destination for terminal-generated responses (DA, DSR, DECRQM, XTWINOPS replies).
+enum PtySink {
+    EventLoop(EventLoopSender),
+    #[cfg(test)]
+    Channel(std::sync::mpsc::Sender<Vec<u8>>),
+}
+
+impl PtySink {
+    fn write(&self, bytes: Vec<u8>) {
+        // Errors only occur once the event loop has shut down, when the child no longer
+        // reads replies anyway.
+        match self {
+            PtySink::EventLoop(sender) => {
+                let _ = sender.send(Msg::Input(bytes.into()));
+            }
+            #[cfg(test)]
+            PtySink::Channel(tx) => {
+                let _ = tx.send(bytes);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct EventProxy {
     event_tx: UnboundedSender<TerminalEvent>,
     title: Arc<Mutex<String>>,
     state: Arc<Mutex<SessionState>>,
+    // The proxy must exist before `EventLoop::new`, which is what creates the sender, so the
+    // sink is injected once the loop is built and before it is spawned.
+    pty_sink: Arc<OnceLock<PtySink>>,
+    window_size: Arc<Mutex<WindowSize>>,
+}
+
+impl EventProxy {
+    /// Writes a terminal-generated reply straight to the PTY event loop.
+    ///
+    /// Replies bypass the iced subscription: a child that blocks on a query must not wait for
+    /// a UI frame, and the event loop queues the bytes instead of re-entering the parser.
+    fn write_to_pty(&self, text: String) {
+        // Matches upstream `Notifier`: writing zero bytes can hang the PTY.
+        if text.is_empty() {
+            return;
+        }
+        if let Some(sink) = self.pty_sink.get() {
+            sink.write(text.into_bytes());
+        }
+    }
 }
 
 impl EventListener for EventProxy {
+    // Called from the PTY event loop thread while it holds the `Term` lock (the parser runs
+    // under it), so nothing here may lock `Term`; `FairMutex` is not reentrant.
     fn send_event(&self, event: AlacrittyEvent) {
         match event {
+            AlacrittyEvent::PtyWrite(text) => self.write_to_pty(text),
+            AlacrittyEvent::TextAreaSizeRequest(format) => {
+                let window_size = self.window_size.lock().ok().map(|size| *size);
+                if let Some(window_size) = window_size {
+                    self.write_to_pty(format(window_size));
+                }
+            }
             AlacrittyEvent::Wakeup => {
                 let _ = self.event_tx.unbounded_send(TerminalEvent::Wakeup);
             }
@@ -92,6 +144,7 @@ pub struct TerminalSession {
     #[allow(dead_code)]
     title: Arc<Mutex<String>>,
     state: Arc<Mutex<SessionState>>,
+    window_size: Arc<Mutex<WindowSize>>,
 }
 
 impl TerminalSession {
@@ -124,11 +177,15 @@ impl TerminalSession {
 
         let title = Arc::new(Mutex::new(String::from("Terminal")));
         let state = Arc::new(Mutex::new(SessionState::Running));
+        let pty_sink = Arc::new(OnceLock::new());
+        let shared_window_size = Arc::new(Mutex::new(window_size));
 
         let proxy = EventProxy {
             event_tx,
             title: title.clone(),
             state: state.clone(),
+            pty_sink: pty_sink.clone(),
+            window_size: shared_window_size.clone(),
         };
 
         let term_size = TermSize {
@@ -144,6 +201,9 @@ impl TerminalSession {
             .map_err(|e| format!("Failed to create event loop: {e}"))?;
 
         let event_loop_sender = event_loop.channel();
+        // Set before `spawn`: no PTY output is parsed until the loop runs, so no reply can be
+        // generated without a sink.
+        let _ = pty_sink.set(PtySink::EventLoop(event_loop_sender.clone()));
         let _join_handle = event_loop.spawn();
 
         Ok(Self {
@@ -151,6 +211,7 @@ impl TerminalSession {
             event_loop_sender,
             title,
             state,
+            window_size: shared_window_size,
         })
     }
 
@@ -181,6 +242,9 @@ impl TerminalSession {
             cell_height,
         };
 
+        if let Ok(mut size_guard) = self.window_size.lock() {
+            *size_guard = window_size;
+        }
         let _ = self.event_loop_sender.send(Msg::Resize(window_size));
     }
 
@@ -319,6 +383,136 @@ mod tests {
         assert!(!session.has_selection());
     }
 
+    const TEST_WINDOW_SIZE: WindowSize = WindowSize {
+        num_lines: 24,
+        num_cols: 80,
+        cell_width: 10,
+        cell_height: 20,
+    };
+
+    /// Builds a proxy whose PTY replies land in a channel instead of a live event loop.
+    fn proxy_with_pty_channel() -> (
+        EventProxy,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        Arc<Mutex<WindowSize>>,
+    ) {
+        let (event_tx, _event_rx) = unbounded();
+        let (pty_tx, pty_rx) = std::sync::mpsc::channel();
+        let pty_sink = Arc::new(OnceLock::new());
+        let _ = pty_sink.set(PtySink::Channel(pty_tx));
+        let window_size = Arc::new(Mutex::new(TEST_WINDOW_SIZE));
+        let proxy = EventProxy {
+            event_tx,
+            title: Arc::new(Mutex::new(String::from("Terminal"))),
+            state: Arc::new(Mutex::new(SessionState::Running)),
+            pty_sink,
+            window_size: window_size.clone(),
+        };
+        (proxy, pty_rx, window_size)
+    }
+
+    fn drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+        rx.try_iter().collect()
+    }
+
+    #[test]
+    fn pty_write_forwards_exact_bytes() {
+        let (proxy, pty_rx, _) = proxy_with_pty_channel();
+        proxy.send_event(AlacrittyEvent::PtyWrite(String::from("\x1b[?6c")));
+        assert_eq!(drain(&pty_rx), vec![b"\x1b[?6c".to_vec()]);
+    }
+
+    #[test]
+    fn empty_pty_write_is_not_forwarded() {
+        let (proxy, pty_rx, _) = proxy_with_pty_channel();
+        proxy.send_event(AlacrittyEvent::PtyWrite(String::new()));
+        assert!(drain(&pty_rx).is_empty());
+    }
+
+    #[test]
+    fn text_area_size_request_formats_current_window_size() {
+        let (proxy, pty_rx, window_size) = proxy_with_pty_channel();
+        let request = || {
+            AlacrittyEvent::TextAreaSizeRequest(Arc::new(|size: WindowSize| {
+                format!("{}x{}", size.num_cols * size.cell_width, size.num_lines)
+            }))
+        };
+
+        proxy.send_event(request());
+        *window_size.lock().unwrap() = WindowSize {
+            num_lines: 30,
+            num_cols: 100,
+            cell_width: 9,
+            cell_height: 18,
+        };
+        proxy.send_event(request());
+
+        assert_eq!(drain(&pty_rx), vec![b"800x24".to_vec(), b"900x30".to_vec()]);
+    }
+
+    #[test]
+    fn replies_without_sink_or_after_shutdown_are_dropped_silently() {
+        let (event_tx, _event_rx) = unbounded();
+        let proxy = EventProxy {
+            event_tx,
+            title: Arc::new(Mutex::new(String::new())),
+            state: Arc::new(Mutex::new(SessionState::Running)),
+            pty_sink: Arc::new(OnceLock::new()),
+            window_size: Arc::new(Mutex::new(TEST_WINDOW_SIZE)),
+        };
+        proxy.send_event(AlacrittyEvent::PtyWrite(String::from("\x1b[0n")));
+
+        let (proxy, pty_rx, _) = proxy_with_pty_channel();
+        drop(pty_rx);
+        proxy.send_event(AlacrittyEvent::PtyWrite(String::from("\x1b[0n")));
+    }
+
+    /// Drives real query sequences through `Term` while its lock is held, as the PTY event
+    /// loop does; a re-lock inside the proxy would deadlock this test.
+    #[test]
+    fn terminal_queries_reply_through_proxy_while_term_is_locked() {
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let (proxy, pty_rx, _) = proxy_with_pty_channel();
+        let size = TermSize {
+            cols: 80,
+            lines: 24,
+        };
+        let term = FairMutex::new(Term::new(Config::default(), &size, proxy));
+        let mut parser: Processor = Processor::new();
+
+        let mut guard = term.lock();
+        let mut query = |bytes: &[u8]| {
+            parser.advance(&mut *guard, bytes);
+            drain(&pty_rx)
+        };
+
+        assert_eq!(query(b"\x1b[c"), vec![b"\x1b[?6c".to_vec()]);
+        assert_eq!(query(b"\x1b[>c"), vec![b"\x1b[>0;2600;1c".to_vec()]);
+        assert_eq!(query(b"\x1b[5n"), vec![b"\x1b[0n".to_vec()]);
+        assert_eq!(query(b"abc\x1b[6n"), vec![b"\x1b[1;4R".to_vec()]);
+        assert_eq!(query(b"\x1b[?2004$p"), vec![b"\x1b[?2004;2$y".to_vec()]);
+        assert_eq!(query(b"\x1b[18t"), vec![b"\x1b[8;24;80t".to_vec()]);
+        assert_eq!(query(b"\x1b[14t"), vec![b"\x1b[4;480;800t".to_vec()]);
+    }
+
+    #[test]
+    fn resize_updates_size_used_for_text_area_replies() {
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
+        session.resize(100, 30, 9, 18);
+        let size = *session.window_size.lock().unwrap();
+        assert_eq!(
+            (
+                size.num_cols,
+                size.num_lines,
+                size.cell_width,
+                size.cell_height
+            ),
+            (100, 30, 9, 18)
+        );
+    }
+
     #[test]
     fn event_proxy_delivers_events_in_exact_order() {
         let (tx, mut rx) = unbounded();
@@ -329,6 +523,8 @@ mod tests {
             event_tx: tx,
             title: title.clone(),
             state: state.clone(),
+            pty_sink: Arc::new(OnceLock::new()),
+            window_size: Arc::new(Mutex::new(TEST_WINDOW_SIZE)),
         };
 
         proxy.send_event(AlacrittyEvent::Wakeup);
