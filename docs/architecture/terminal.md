@@ -50,6 +50,15 @@ On Windows, initial shell discovery prioritizes:
 - Background process I/O is managed by `alacritty_terminal::event_loop::EventLoop`, which polls the PTY reader/writer pipes and updates `Term` grid state in a dedicated thread.
 - Asynchronous events (`Wakeup`, `Title`, `ChildExit`) are posted to an channel and consumed by iced's event subscription loop to trigger UI redraws.
 
+### Terminal-Generated Query Responses
+
+- Replies that `alacritty_terminal` generates for child queries (`Event::PtyWrite`: DA, DSR, DECRQM, `CSI 18 t`; `Event::TextAreaSizeRequest`: `CSI 14 t`) are written by `EventProxy` straight back to the PTY through the session's `EventLoopSender` (`Msg::Input`), mirroring upstream Alacritty's `Notifier`.
+- They deliberately bypass the iced subscription so a child blocked on a query never waits for a UI frame.
+- `EventProxy::send_event` runs on the PTY thread with the `Term` lock held, so it must never lock `Term`. `TextAreaSizeRequest` reads the `WindowSize` that `TerminalSession::resize` records instead.
+- The sender is injected through a `OnceLock` after `EventLoop::new` and before `spawn`, so no reply can be generated without a sink.
+- On Windows, the inbox conhost answers most queries itself (DA1/DA2/DSR/DECRQM/`CSI 18 t`) and does not forward them; `CSI 14 t` is forwarded and answered by Kegon. No duplicate replies were observed.
+- `ColorRequest`, `ClipboardStore`, and `ClipboardLoad` remain unhandled.
+
 ## Renderer
 
 - Rendered via iced's `Canvas` widget (`TerminalProgram` implementing `canvas::Program`).
