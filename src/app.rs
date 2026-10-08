@@ -44,6 +44,8 @@ use crate::workbench::{ActivityItem, SIDE_BAR_DEFAULT_WIDTH, TabId, Workbench};
 const ACTIVITY_BAR_WIDTH: f32 = 48.0;
 const SASH_WIDTH: f32 = 4.0;
 const TAB_STRIP_HEIGHT: f32 = 35.0;
+/// Keeps a long child-provided title from pushing the rest of the tab strip away.
+const TAB_TITLE_MAX_WIDTH: f32 = 240.0;
 const UI_TEXT_SIZE: f32 = 13.0;
 
 static TERMINAL_EVENT_RX: Mutex<Option<UnboundedReceiver<TerminalEvent>>> = Mutex::new(None);
@@ -140,6 +142,9 @@ pub struct Kegon {
     hovered_activity: Option<ActivityItem>,
     /// Active terminal session.
     terminal_session: Option<TerminalSession>,
+    /// Normalized title set by the terminal's child, if any. `None` shows the default tab
+    /// label and plain `Kegon` window title. This is the only copy of the title.
+    terminal_title: Option<String>,
     /// System clipboard interface.
     system_clipboard: SystemClipboard,
     /// Transient Japanese IME preedit composition string.
@@ -243,6 +248,7 @@ impl Kegon {
             resizing_side_bar: false,
             hovered_activity: None,
             terminal_session,
+            terminal_title: None,
             system_clipboard: SystemClipboard::new(),
             preedit_text: None,
             terminal_focused: true,
@@ -304,9 +310,9 @@ impl Kegon {
         app
     }
 
-    /// The window title: the product name, which is not translated.
+    /// The window title: `<terminal title> - Kegon`, or the untranslated product name alone.
     pub fn title(&self) -> String {
-        String::from("Kegon")
+        crate::terminal::title::window_title(self.terminal_title.as_deref())
     }
 
     /// The iced theme for widgets Kegon does not style itself.
@@ -489,9 +495,15 @@ impl Kegon {
                     self.terminal_focused = true;
                 }
             }
-            Message::TerminalEventReceived(_event) => {
-                // Terminal event arrived; iced will re-render automatically.
-            }
+            Message::TerminalEventReceived(event) => match event {
+                TerminalEvent::Title(raw) => {
+                    self.terminal_title = crate::terminal::title::normalize_terminal_title(&raw);
+                }
+                TerminalEvent::ResetTitle => self.terminal_title = None,
+                // Redraw happens because a message was processed; the last title is kept after
+                // exit since the terminal contents stay on screen.
+                TerminalEvent::Wakeup | TerminalEvent::ChildExit(_) => {}
+            },
             Message::IcedEventReceived(event) => {
                 self.handle_iced_event(event);
             }
@@ -1284,18 +1296,37 @@ impl Kegon {
         column![tab_strip, terminal_view].width(Fill).into()
     }
 
+    /// Label of the active terminal tab: the child's title, or the translated default.
+    fn active_tab_title(&self) -> String {
+        self.terminal_title
+            .clone()
+            .unwrap_or_else(|| self.localizer.text(MessageKey::TerminalTabDefaultTitle))
+    }
+
     fn tab_strip(&self) -> Element<'_, Message> {
         let theme = self.active_theme;
         let tabs = self.workbench.terminal_tabs();
 
         let tab_buttons = tabs.iter().map(|tab| {
             let is_active = tabs.is_active(tab.id);
-            let title = self.localizer.text(MessageKey::TerminalTabDefaultTitle);
+            // The single terminal session belongs to the active tab.
+            let title = if is_active {
+                self.active_tab_title()
+            } else {
+                self.localizer.text(MessageKey::TerminalTabDefaultTitle)
+            };
 
             button(
-                container(text(title).size(UI_TEXT_SIZE).font(self.active_ui_font))
-                    .height(Fill)
-                    .align_y(Center),
+                container(
+                    text(title)
+                        .size(UI_TEXT_SIZE)
+                        .font(self.active_ui_font)
+                        .wrapping(text::Wrapping::None),
+                )
+                .height(Fill)
+                .max_width(TAB_TITLE_MAX_WIDTH)
+                .clip(true)
+                .align_y(Center),
             )
             .height(TAB_STRIP_HEIGHT)
             .padding([0, 16])
@@ -1894,6 +1925,61 @@ mod tests {
         app.update(Message::SettingsLocaleChanged(LocalePreference::JaJp));
         let updated_text = app.localizer.text(MessageKey::ActivitySettings);
         assert_eq!(updated_text, "設定");
+    }
+
+    #[test]
+    fn terminal_title_events_drive_tab_and_window_titles() {
+        let mut app = new_test_app(Locale::EnUs);
+        let default_label = app.localizer.text(MessageKey::TerminalTabDefaultTitle);
+        assert_eq!(app.title(), "Kegon");
+        assert_eq!(app.active_tab_title(), default_label);
+
+        app.update(Message::TerminalEventReceived(TerminalEvent::Title(
+            String::from("Kegon title test"),
+        )));
+        assert_eq!(app.title(), "Kegon title test - Kegon");
+        assert_eq!(app.active_tab_title(), "Kegon title test");
+
+        app.update(Message::TerminalEventReceived(TerminalEvent::ResetTitle));
+        assert_eq!(app.title(), "Kegon");
+        assert_eq!(app.active_tab_title(), default_label);
+    }
+
+    #[test]
+    fn last_terminal_title_event_wins() {
+        let mut app = new_test_app(Locale::EnUs);
+        for event in [
+            TerminalEvent::Title(String::from("A")),
+            TerminalEvent::Title(String::from("B")),
+            TerminalEvent::ResetTitle,
+            TerminalEvent::Title(String::from("C")),
+        ] {
+            app.update(Message::TerminalEventReceived(event));
+        }
+        assert_eq!(app.title(), "C - Kegon");
+    }
+
+    #[test]
+    fn blank_terminal_title_falls_back_and_exit_keeps_title() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.update(Message::TerminalEventReceived(TerminalEvent::Title(
+            String::from("pwsh"),
+        )));
+        app.update(Message::TerminalEventReceived(TerminalEvent::ChildExit(
+            Some(0),
+        )));
+        assert_eq!(app.title(), "pwsh - Kegon");
+        assert_eq!(app.active_tab_title(), "pwsh");
+
+        app.update(Message::TerminalEventReceived(TerminalEvent::Title(
+            String::from(" \x07 "),
+        )));
+        assert_eq!(app.title(), "Kegon");
+        assert_eq!(
+            app.active_tab_title(),
+            app.localizer.text(MessageKey::TerminalTabDefaultTitle)
+        );
+        assert_eq!(app.terminal_title, None);
     }
 
     #[test]

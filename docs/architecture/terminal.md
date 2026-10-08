@@ -48,7 +48,13 @@ On Windows, initial shell discovery prioritizes:
 
 - On Windows, `alacritty_terminal::tty::new` initializes Windows ConPTY natively.
 - Background process I/O is managed by `alacritty_terminal::event_loop::EventLoop`, which polls the PTY reader/writer pipes and updates `Term` grid state in a dedicated thread.
-- Asynchronous events (`Wakeup`, `Title`, `ChildExit`) are posted to an channel and consumed by iced's event subscription loop to trigger UI redraws.
+- Asynchronous events (`Wakeup`, `Title`, `ResetTitle`, `ChildExit`) are posted to an channel and consumed by iced's event subscription loop to trigger UI redraws.
+
+### Terminal Title
+
+- `Title` (OSC 0 / OSC 2) and `ResetTitle` are forwarded raw to the app. `terminal::title::normalize_terminal_title` then drops control characters, trims, and caps the title at 120 chars with `…`. A title that ends up empty counts as no title.
+- `Kegon::terminal_title: Option<String>` is the only copy of the title. The active tab shows it (falling back to the translated default label), and the window title is `<title> - Kegon` (or `Kegon`). iced re-reads `title()` after each update.
+- On Windows, conhost reports the child's executable path as the initial title. `CSI 22 t` / `CSI 23 t` stay inside conhost, so `ResetTitle` is not observed there.
 
 ### Terminal-Generated Query Responses
 

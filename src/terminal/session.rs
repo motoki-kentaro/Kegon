@@ -28,8 +28,11 @@ pub enum SessionState {
 pub enum TerminalEvent {
     /// Terminal buffer state updated; re-render needed.
     Wakeup,
-    /// Terminal window title changed by escape sequence.
+    /// Child set a title (OSC 0 / OSC 2); raw, normalized by the UI before display.
     Title(String),
+    /// Child restored an unset title (`CSI 23 t` popping a title pushed before any was set);
+    /// show the default.
+    ResetTitle,
     /// Child process exited.
     ChildExit(Option<i32>),
 }
@@ -60,7 +63,6 @@ impl PtySink {
 #[derive(Clone)]
 pub(crate) struct EventProxy {
     event_tx: UnboundedSender<TerminalEvent>,
-    title: Arc<Mutex<String>>,
     state: Arc<Mutex<SessionState>>,
     // The proxy must exist before `EventLoop::new`, which is what creates the sender, so the
     // sink is injected once the loop is built and before it is spawned.
@@ -100,10 +102,10 @@ impl EventListener for EventProxy {
                 let _ = self.event_tx.unbounded_send(TerminalEvent::Wakeup);
             }
             AlacrittyEvent::Title(t) => {
-                if let Ok(mut title_guard) = self.title.lock() {
-                    *title_guard = t.clone();
-                }
                 let _ = self.event_tx.unbounded_send(TerminalEvent::Title(t));
+            }
+            AlacrittyEvent::ResetTitle => {
+                let _ = self.event_tx.unbounded_send(TerminalEvent::ResetTitle);
             }
             AlacrittyEvent::ChildExit(status) => {
                 let code = status.code();
@@ -141,8 +143,6 @@ impl Dimensions for TermSize {
 pub struct TerminalSession {
     term: Arc<FairMutex<Term<EventProxy>>>,
     event_loop_sender: EventLoopSender,
-    #[allow(dead_code)]
-    title: Arc<Mutex<String>>,
     state: Arc<Mutex<SessionState>>,
     window_size: Arc<Mutex<WindowSize>>,
 }
@@ -175,14 +175,12 @@ impl TerminalSession {
         let pty =
             tty::new(&options, window_size, 0).map_err(|e| format!("Failed to spawn PTY: {e}"))?;
 
-        let title = Arc::new(Mutex::new(String::from("Terminal")));
         let state = Arc::new(Mutex::new(SessionState::Running));
         let pty_sink = Arc::new(OnceLock::new());
         let shared_window_size = Arc::new(Mutex::new(window_size));
 
         let proxy = EventProxy {
             event_tx,
-            title: title.clone(),
             state: state.clone(),
             pty_sink: pty_sink.clone(),
             window_size: shared_window_size.clone(),
@@ -209,7 +207,6 @@ impl TerminalSession {
         Ok(Self {
             term,
             event_loop_sender,
-            title,
             state,
             window_size: shared_window_size,
         })
@@ -269,12 +266,6 @@ impl TerminalSession {
         } else {
             None
         }
-    }
-
-    /// Current window title set by the terminal.
-    #[allow(dead_code)]
-    pub fn title(&self) -> String {
-        self.title.lock().unwrap().clone()
     }
 
     /// Returns the active terminal cursor column and row in display grid coordinates.
@@ -375,7 +366,6 @@ mod tests {
         let session = session.unwrap();
         assert!(!session.is_exited());
         assert_eq!(session.exit_code(), None);
-        assert!(!session.title().is_empty());
     }
 
     #[test]
@@ -412,7 +402,6 @@ mod tests {
         let window_size = Arc::new(Mutex::new(TEST_WINDOW_SIZE));
         let proxy = EventProxy {
             event_tx,
-            title: Arc::new(Mutex::new(String::from("Terminal"))),
             state: Arc::new(Mutex::new(SessionState::Running)),
             pty_sink,
             window_size: window_size.clone(),
@@ -464,7 +453,6 @@ mod tests {
         let (event_tx, _event_rx) = unbounded();
         let proxy = EventProxy {
             event_tx,
-            title: Arc::new(Mutex::new(String::new())),
             state: Arc::new(Mutex::new(SessionState::Running)),
             pty_sink: Arc::new(OnceLock::new()),
             window_size: Arc::new(Mutex::new(TEST_WINDOW_SIZE)),
@@ -597,12 +585,10 @@ mod tests {
     #[test]
     fn event_proxy_delivers_events_in_exact_order() {
         let (tx, mut rx) = unbounded();
-        let title = Arc::new(Mutex::new(String::from("Terminal")));
         let state = Arc::new(Mutex::new(SessionState::Running));
 
         let proxy = EventProxy {
             event_tx: tx,
-            title: title.clone(),
             state: state.clone(),
             pty_sink: Arc::new(OnceLock::new()),
             window_size: Arc::new(Mutex::new(TEST_WINDOW_SIZE)),
@@ -610,6 +596,7 @@ mod tests {
 
         proxy.send_event(AlacrittyEvent::Wakeup);
         proxy.send_event(AlacrittyEvent::Title("Custom Title".to_string()));
+        proxy.send_event(AlacrittyEvent::ResetTitle);
 
         assert_eq!(
             rx.next().now_or_never().flatten(),
@@ -619,7 +606,10 @@ mod tests {
             rx.next().now_or_never().flatten(),
             Some(TerminalEvent::Title("Custom Title".to_string()))
         );
-        assert_eq!(*title.lock().unwrap(), "Custom Title");
+        assert_eq!(
+            rx.next().now_or_never().flatten(),
+            Some(TerminalEvent::ResetTitle)
+        );
         assert_eq!(*state.lock().unwrap(), SessionState::Running);
     }
 
