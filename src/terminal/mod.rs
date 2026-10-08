@@ -15,6 +15,7 @@ pub mod renderer;
 pub mod session;
 pub mod shell;
 pub mod surface;
+pub mod title;
 
 pub use arbitration::{InputArbiter, InputRoute};
 pub use clipboard::SystemClipboard;
