@@ -88,3 +88,58 @@ impl CommandDispatcher {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::futures::channel::mpsc::unbounded;
+
+    #[test]
+    fn copy_or_interrupt_with_selection_copies_text() {
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
+        {
+            let mut term = session.term().lock();
+            use alacritty_terminal::vte::ansi::Processor;
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut *term, b"Copy Target Text\r\n");
+        }
+
+        session.start_selection(0, 0);
+        session.update_selection(10, 0);
+        assert!(session.has_selection());
+
+        let mut workbench = Workbench::default();
+        let mut clipboard = SystemClipboard::new();
+        let outcome = CommandDispatcher::dispatch(
+            CommandId::TerminalCopyOrInterrupt,
+            &mut workbench,
+            Some(&session),
+            &mut clipboard,
+        );
+
+        assert_eq!(outcome, CommandOutcome::Executed);
+        assert!(
+            !session.has_selection(),
+            "Selection should be cleared after copy"
+        );
+    }
+
+    #[test]
+    fn copy_or_interrupt_without_selection_does_not_panic() {
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
+        assert!(!session.has_selection());
+
+        let mut workbench = Workbench::default();
+        let mut clipboard = SystemClipboard::new();
+        let outcome = CommandDispatcher::dispatch(
+            CommandId::TerminalCopyOrInterrupt,
+            &mut workbench,
+            Some(&session),
+            &mut clipboard,
+        );
+
+        assert_eq!(outcome, CommandOutcome::Executed);
+    }
+}

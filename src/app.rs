@@ -115,7 +115,6 @@ pub enum Message {
     SashReleased,
     IcedEventReceived(Event),
     TerminalEventReceived(TerminalEvent),
-    TerminalClicked,
     DialogPrimaryClicked,
     DialogSecondaryClicked,
     DialogBackdropClicked,
@@ -490,11 +489,6 @@ impl Kegon {
                 }
             }
             Message::SashReleased => self.resizing_side_bar = false,
-            Message::TerminalClicked => {
-                if !self.is_modal_open() {
-                    self.terminal_focused = true;
-                }
-            }
             Message::TerminalEventReceived(event) => match event {
                 TerminalEvent::Title(raw) => {
                     self.terminal_title = crate::terminal::title::normalize_terminal_title(&raw);
@@ -1241,12 +1235,8 @@ impl Kegon {
 
             let is_focused = self.terminal_focused && !self.is_modal_open();
 
-            let main_content: Element<'_, Message> = TerminalSurface::new(
-                mouse_area(canvas_widget).on_press(Message::TerminalClicked),
-                is_focused,
-                Some(cursor_rect),
-            )
-            .into();
+            let main_content: Element<'_, Message> =
+                TerminalSurface::new(canvas_widget, is_focused, Some(cursor_rect)).into();
 
             if session.is_exited() {
                 let code_str = session
@@ -2118,7 +2108,12 @@ mod tests {
         app.terminal_focused = true;
 
         // Terminal click keeps focus when no modal
-        app.update(Message::TerminalClicked);
+        let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + app.workbench.side_bar_width();
+        let term_y = TAB_STRIP_HEIGHT;
+        app.cursor_position = Point::new(term_x + 5.0, term_y + 5.0);
+        app.update(Message::IcedEventReceived(Event::Mouse(
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+        )));
         assert!(app.terminal_focused);
 
         // Open modal
@@ -2137,5 +2132,63 @@ mod tests {
         app.close_modal(ConfirmationResult::Primary);
         assert!(!app.is_modal_open());
         assert!(app.terminal_focused);
+    }
+
+    #[test]
+    fn mouse_drag_selection_lifecycle_and_persistence() {
+        let mut app = new_test_app(Locale::EnUs);
+
+        {
+            let session = app.terminal_session.as_ref().unwrap();
+            let mut term = session.term().lock();
+            use alacritty_terminal::vte::ansi::Processor;
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut *term, b"Hello World\r\n");
+        }
+
+        assert!(!app.terminal_session.as_ref().unwrap().has_selection());
+
+        let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + app.workbench.side_bar_width();
+        let term_y = TAB_STRIP_HEIGHT;
+
+        // Press mouse down at (0,0) cell position
+        app.cursor_position = Point::new(term_x + 5.0, term_y + 5.0);
+        app.update(Message::IcedEventReceived(Event::Mouse(
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+        )));
+        assert!(app.mouse_dragging_selection);
+        assert!(!app.terminal_session.as_ref().unwrap().has_selection()); // Single click is not copyable
+
+        // Move mouse to select (0,0)->(4,0) ("Hello")
+        let cell_w = app.terminal_font_config.metrics.cell_width;
+        app.update(Message::IcedEventReceived(Event::Mouse(
+            mouse::Event::CursorMoved {
+                position: Point::new(term_x + cell_w * 4.5, term_y + 5.0),
+            },
+        )));
+        assert!(app.terminal_session.as_ref().unwrap().has_selection());
+        assert_eq!(
+            app.terminal_session
+                .as_ref()
+                .unwrap()
+                .copy_selection()
+                .as_deref(),
+            Some("Hello")
+        );
+
+        // Release mouse button: selection persists!
+        app.update(Message::IcedEventReceived(Event::Mouse(
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        )));
+        assert!(!app.mouse_dragging_selection);
+        assert!(app.terminal_session.as_ref().unwrap().has_selection());
+        assert_eq!(
+            app.terminal_session
+                .as_ref()
+                .unwrap()
+                .copy_selection()
+                .as_deref(),
+            Some("Hello")
+        );
     }
 }

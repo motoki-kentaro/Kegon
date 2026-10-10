@@ -145,6 +145,7 @@ pub struct TerminalSession {
     event_loop_sender: EventLoopSender,
     state: Arc<Mutex<SessionState>>,
     window_size: Arc<Mutex<WindowSize>>,
+    selection_anchor: Mutex<Option<alacritty_terminal::index::Point>>,
 }
 
 impl TerminalSession {
@@ -209,6 +210,7 @@ impl TerminalSession {
             event_loop_sender,
             state,
             window_size: shared_window_size,
+            selection_anchor: Mutex::new(None),
         })
     }
 
@@ -280,7 +282,10 @@ impl TerminalSession {
     /// Whether there is an active text selection in the terminal.
     pub fn has_selection(&self) -> bool {
         let term = self.term.lock();
-        term.selection.is_some()
+        term.selection
+            .as_ref()
+            .and_then(|s| s.to_range(&term))
+            .is_some()
     }
 
     /// Copies selected text from the terminal grid, if any selection exists.
@@ -293,6 +298,9 @@ impl TerminalSession {
     pub fn clear_selection(&self) {
         let mut term = self.term.lock();
         term.selection = None;
+        if let Ok(mut anchor) = self.selection_anchor.lock() {
+            *anchor = None;
+        }
     }
 
     /// Starts a simple mouse drag selection at the specified grid cell.
@@ -300,19 +308,43 @@ impl TerminalSession {
         use alacritty_terminal::index::{Column, Line, Point as TermPoint, Side};
         use alacritty_terminal::selection::{Selection, SelectionType};
         let mut term = self.term.lock();
+        let cols = term.columns();
+        let lines = term.screen_lines();
+        let col = col.min(cols.saturating_sub(1));
+        let line = line.min(lines.saturating_sub(1));
         let display_offset = term.grid().display_offset() as i32;
         let point = TermPoint::new(Line(line as i32 - display_offset), Column(col));
+        if let Ok(mut anchor) = self.selection_anchor.lock() {
+            *anchor = Some(point);
+        }
         term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
     }
 
     /// Extends the active mouse drag selection to the specified grid cell.
     pub fn update_selection(&self, col: usize, line: usize) {
         use alacritty_terminal::index::{Column, Line, Point as TermPoint, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
         let mut term = self.term.lock();
+        let cols = term.columns();
+        let lines = term.screen_lines();
+        let col = col.min(cols.saturating_sub(1));
+        let line = line.min(lines.saturating_sub(1));
         let display_offset = term.grid().display_offset() as i32;
-        if let Some(selection) = term.selection.as_mut() {
-            let point = TermPoint::new(Line(line as i32 - display_offset), Column(col));
-            selection.update(point, Side::Right);
+        let point = TermPoint::new(Line(line as i32 - display_offset), Column(col));
+        let anchor_point = self.selection_anchor.lock().ok().and_then(|guard| *guard);
+        if let Some(anchor) = anchor_point {
+            let mut selection = if point < anchor {
+                Selection::new(SelectionType::Simple, anchor, Side::Right)
+            } else {
+                Selection::new(SelectionType::Simple, anchor, Side::Left)
+            };
+            let side = if point < anchor {
+                Side::Left
+            } else {
+                Side::Right
+            };
+            selection.update(point, side);
+            term.selection = Some(selection);
         }
     }
 
@@ -380,6 +412,53 @@ mod tests {
 
         session.clear_selection();
         assert!(!session.has_selection());
+    }
+
+    #[test]
+    fn test_selection_details() {
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
+        {
+            let mut term = session.term.lock();
+            use alacritty_terminal::vte::ansi::Processor;
+            let mut parser: Processor = Processor::new();
+            parser.advance(
+                &mut *term,
+                b"Hello World\r\n\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\r\nLine Three\r\n",
+            );
+        }
+
+        // Single click (start_selection only) -> degenerate selection, not copyable
+        session.start_selection(0, 0);
+        assert!(!session.has_selection());
+        assert_eq!(session.copy_selection(), None);
+
+        // Drag forward (0,0) to (4,0) -> "Hello"
+        session.start_selection(0, 0);
+        session.update_selection(4, 0);
+        assert!(session.has_selection());
+        assert_eq!(session.copy_selection().as_deref(), Some("Hello"));
+
+        // Drag backward (4,0) to (0,0) -> "Hello"
+        session.start_selection(4, 0);
+        session.update_selection(0, 0);
+        assert!(session.has_selection());
+        assert_eq!(session.copy_selection().as_deref(), Some("Hello"));
+
+        // Multiline drag forward (0,0) to (2,1)
+        session.start_selection(0, 0);
+        session.update_selection(2, 1);
+        assert!(session.has_selection());
+        assert_eq!(
+            session.copy_selection().as_deref(),
+            Some("Hello World\n日本")
+        );
+
+        // Japanese text drag (0,1) to (5,1) -> "日本語"
+        session.start_selection(0, 1);
+        session.update_selection(5, 1);
+        assert!(session.has_selection());
+        assert_eq!(session.copy_selection().as_deref(), Some("日本語"));
     }
 
     const TEST_WINDOW_SIZE: WindowSize = WindowSize {
