@@ -32,7 +32,7 @@ pub fn calculate_grid_size(width: f32, height: f32, metrics: &TerminalCellMetric
 /// Named and indexed 0–15 colors come from the theme. Explicit RGB colors
 /// sent by the application, and the generated 256-color cube and grayscale
 /// ramp, are used as-is.
-pub fn convert_color(color: AnsiColor, is_fg: bool, colors: &TerminalColors) -> Color {
+pub fn convert_color(color: AnsiColor, _is_fg: bool, colors: &TerminalColors) -> Color {
     let ansi = &colors.ansi;
     match color {
         AnsiColor::Named(named) => match named {
@@ -52,19 +52,49 @@ pub fn convert_color(color: AnsiColor, is_fg: bool, colors: &TerminalColors) -> 
             NamedColor::BrightMagenta => ansi.bright_magenta,
             NamedColor::BrightCyan => ansi.bright_cyan,
             NamedColor::BrightWhite => ansi.bright_white,
+            NamedColor::DimBlack => dim_color(ansi.black),
+            NamedColor::DimRed => dim_color(ansi.red),
+            NamedColor::DimGreen => dim_color(ansi.green),
+            NamedColor::DimYellow => dim_color(ansi.yellow),
+            NamedColor::DimBlue => dim_color(ansi.blue),
+            NamedColor::DimMagenta => dim_color(ansi.magenta),
+            NamedColor::DimCyan => dim_color(ansi.cyan),
+            NamedColor::DimWhite => dim_color(ansi.white),
             NamedColor::Foreground => colors.foreground,
             NamedColor::Background => colors.background,
-            _ => {
-                if is_fg {
-                    colors.foreground
-                } else {
-                    colors.background
-                }
-            }
+            NamedColor::BrightForeground => ansi.bright_white,
+            NamedColor::DimForeground => dim_color(colors.foreground),
+            NamedColor::Cursor => colors.cursor,
         },
         AnsiColor::Spec(Rgb { r, g, b }) => Color::from_rgb8(r, g, b),
         AnsiColor::Indexed(idx) => convert_indexed_color(idx, colors),
     }
+}
+
+pub fn dim_color(color: Color) -> Color {
+    Color {
+        r: color.r * 0.66,
+        g: color.g * 0.66,
+        b: color.b * 0.66,
+        a: color.a,
+    }
+}
+
+fn is_already_dim_named_color(color: AnsiColor) -> bool {
+    matches!(
+        color,
+        AnsiColor::Named(
+            NamedColor::DimBlack
+                | NamedColor::DimRed
+                | NamedColor::DimGreen
+                | NamedColor::DimYellow
+                | NamedColor::DimBlue
+                | NamedColor::DimMagenta
+                | NamedColor::DimCyan
+                | NamedColor::DimWhite
+                | NamedColor::DimForeground
+        )
+    )
 }
 
 fn convert_indexed_color(idx: u8, colors: &TerminalColors) -> Color {
@@ -95,8 +125,8 @@ pub fn compute_cell_colors(
     let mut fg = convert_color(cell_fg, true, colors);
     let mut bg = convert_color(cell_bg, false, colors);
 
-    if flags.contains(Flags::DIM) {
-        fg.a *= 0.66;
+    if flags.contains(Flags::DIM) && !is_already_dim_named_color(cell_fg) {
+        fg = dim_color(fg);
     }
 
     if flags.contains(Flags::INVERSE) {
@@ -406,9 +436,22 @@ mod tests {
     fn default_foreground_and_background_come_from_the_theme() {
         assert_eq!(named(NamedColor::Foreground, true), COLORS.foreground);
         assert_eq!(named(NamedColor::Background, false), COLORS.background);
-        // Other named colors (cursor, dim variants) keep falling back by role.
-        assert_eq!(named(NamedColor::Cursor, true), COLORS.foreground);
-        assert_eq!(named(NamedColor::Cursor, false), COLORS.background);
+        assert_eq!(named(NamedColor::Cursor, true), COLORS.cursor);
+        assert_eq!(
+            named(NamedColor::BrightForeground, true),
+            COLORS.ansi.bright_white
+        );
+    }
+
+    #[test]
+    fn dim_named_colors_scale_rgb_components() {
+        let dim_red = named(NamedColor::DimRed, true);
+        assert_eq!(dim_red.r, COLORS.ansi.red.r * 0.66);
+        assert_eq!(dim_red.g, COLORS.ansi.red.g * 0.66);
+        assert_eq!(dim_red.b, COLORS.ansi.red.b * 0.66);
+
+        let dim_fg = named(NamedColor::DimForeground, true);
+        assert_eq!(dim_fg.r, COLORS.foreground.r * 0.66);
     }
 
     #[test]
@@ -496,7 +539,7 @@ mod tests {
         assert_eq!(fg, COLORS.foreground);
         assert_eq!(bg, COLORS.background);
 
-        // Dim scales foreground alpha
+        // Dim scales foreground RGB components while keeping alpha intact
         let (dim_fg, _) = compute_cell_colors(
             AnsiColor::Named(NamedColor::Foreground),
             AnsiColor::Named(NamedColor::Background),
@@ -504,7 +547,20 @@ mod tests {
             false,
             COLORS,
         );
-        assert!((dim_fg.a - COLORS.foreground.a * 0.66).abs() < 0.01);
+        assert_eq!(dim_fg.r, COLORS.foreground.r * 0.66);
+        assert_eq!(dim_fg.g, COLORS.foreground.g * 0.66);
+        assert_eq!(dim_fg.b, COLORS.foreground.b * 0.66);
+        assert_eq!(dim_fg.a, COLORS.foreground.a);
+
+        // DimRed with Flags::DIM is not double dimmed
+        let (dim_red_fg, _) = compute_cell_colors(
+            AnsiColor::Named(NamedColor::DimRed),
+            AnsiColor::Named(NamedColor::Background),
+            Flags::DIM,
+            false,
+            COLORS,
+        );
+        assert_eq!(dim_red_fg.r, COLORS.ansi.red.r * 0.66);
 
         // Inverse swaps fg and bg
         let (inv_fg, inv_bg) = compute_cell_colors(
