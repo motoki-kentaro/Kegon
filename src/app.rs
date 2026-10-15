@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use iced::advanced::input_method::Event as ImeEvent;
 use iced::futures::SinkExt;
 use iced::futures::StreamExt;
-use iced::futures::channel::mpsc::{UnboundedReceiver, unbounded};
+use iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use iced::keyboard;
 use iced::widget::canvas::Canvas;
 use iced::widget::{
@@ -34,9 +34,9 @@ use crate::settings::{
     save_settings,
 };
 use crate::terminal::{
-    InputArbiter, InputRoute, SystemClipboard, TerminalEvent, TerminalInputEvent,
-    TerminalKeyEncoder, TerminalProgram, TerminalSession, TerminalSurface,
-    calculate_cursor_rectangle,
+    EventSink, InputArbiter, InputRoute, SystemClipboard, TerminalEvent, TerminalInputEvent,
+    TerminalKeyEncoder, TerminalProgram, TerminalRegistry, TerminalSession, TerminalSurface,
+    calculate_cursor_rectangle, registry::TerminalEntry,
 };
 use crate::theme::{KegonTheme, ThemeId, resolve_theme, style};
 use crate::workbench::{ActivityItem, SIDE_BAR_DEFAULT_WIDTH, TabId, Workbench};
@@ -48,7 +48,27 @@ const TAB_STRIP_HEIGHT: f32 = 35.0;
 const TAB_TITLE_MAX_WIDTH: f32 = 240.0;
 const UI_TEXT_SIZE: f32 = 13.0;
 
-static TERMINAL_EVENT_RX: Mutex<Option<UnboundedReceiver<TerminalEvent>>> = Mutex::new(None);
+/// A terminal event tagged with the tab whose session produced it.
+type TabTerminalEvent = (TabId, TerminalEvent);
+
+/// An event sink that tags everything a session emits with its owning tab.
+fn tagged_sink(tx: &UnboundedSender<TabTerminalEvent>, tab: TabId) -> EventSink {
+    let tx = tx.clone();
+    EventSink::from_fn(move |event| {
+        // Fails only once the application has dropped the receiver.
+        let _ = tx.unbounded_send((tab, event));
+    })
+}
+
+/// Field-level form of [`Kegon::active_terminal`], for call sites that also borrow other fields.
+fn active_entry<'a>(
+    workbench: &Workbench,
+    terminals: &'a TerminalRegistry,
+) -> Option<&'a TerminalEntry> {
+    terminals.get(workbench.tabs().active()?.id)
+}
+
+static TERMINAL_EVENT_RX: Mutex<Option<UnboundedReceiver<TabTerminalEvent>>> = Mutex::new(None);
 
 fn terminal_events_stream() -> impl iced::futures::Stream<Item = Message> {
     iced::stream::channel(
@@ -66,9 +86,9 @@ fn terminal_events_stream() -> impl iced::futures::Stream<Item = Message> {
                 return;
             };
 
-            while let Some(evt) = rx.next().await {
+            while let Some((tab, evt)) = rx.next().await {
                 if output
-                    .send(Message::TerminalEventReceived(evt))
+                    .send(Message::TerminalEventReceived(tab, evt))
                     .await
                     .is_err()
                 {
@@ -114,7 +134,7 @@ pub enum Message {
     SashDragged(f32),
     SashReleased,
     IcedEventReceived(Event),
-    TerminalEventReceived(TerminalEvent),
+    TerminalEventReceived(TabId, TerminalEvent),
     DialogPrimaryClicked,
     DialogSecondaryClicked,
     DialogBackdropClicked,
@@ -139,11 +159,12 @@ pub struct Kegon {
     resizing_side_bar: bool,
     /// The Activity Bar entry under the pointer, if any.
     hovered_activity: Option<ActivityItem>,
-    /// Active terminal session.
-    terminal_session: Option<TerminalSession>,
-    /// Normalized title set by the terminal's child, if any. `None` shows the default tab
-    /// label and plain `Kegon` window title. This is the only copy of the title.
-    terminal_title: Option<String>,
+    /// Terminal sessions (and their titles) by tab. Only the active tab's session receives
+    /// input and is drawn; the others keep running in the background.
+    terminals: TerminalRegistry,
+    /// Sender cloned into every session, tagging its events with the owning tab.
+    #[allow(dead_code)] // Used by the tab UI to spawn further sessions.
+    terminal_event_tx: UnboundedSender<TabTerminalEvent>,
     /// System clipboard interface.
     system_clipboard: SystemClipboard,
     /// Transient Japanese IME preedit composition string.
@@ -230,24 +251,29 @@ impl Kegon {
             *rx_guard = Some(rx);
         }
 
-        let terminal_session = TerminalSession::spawn(
-            cols,
-            rows,
-            terminal_font_config.metrics.cell_width as u16,
-            terminal_font_config.metrics.cell_height as u16,
-            tx,
-        )
-        .ok();
+        let workbench = Workbench::default();
+        let mut terminals = TerminalRegistry::new();
+        if let Some(tab) = workbench.tabs().active().map(|tab| tab.id)
+            && let Ok(session) = TerminalSession::spawn(
+                cols,
+                rows,
+                terminal_font_config.metrics.cell_width as u16,
+                terminal_font_config.metrics.cell_height as u16,
+                tagged_sink(&tx, tab),
+            )
+        {
+            let _ = terminals.insert(tab, session);
+        }
 
         let active_theme = resolve_theme(settings.appearance.theme.effective_id());
 
         let mut app = Self {
             localizer: Localizer::new(locale),
-            workbench: Workbench::default(),
+            workbench,
             resizing_side_bar: false,
             hovered_activity: None,
-            terminal_session,
-            terminal_title: None,
+            terminals,
+            terminal_event_tx: tx,
             system_clipboard: SystemClipboard::new(),
             preedit_text: None,
             terminal_focused: true,
@@ -311,7 +337,7 @@ impl Kegon {
 
     /// The window title: `<terminal title> - Kegon`, or the untranslated product name alone.
     pub fn title(&self) -> String {
-        crate::terminal::title::window_title(self.terminal_title.as_deref())
+        crate::terminal::title::window_title(self.active_terminal().and_then(TerminalEntry::title))
     }
 
     /// The iced theme for widgets Kegon does not style itself.
@@ -378,20 +404,35 @@ impl Kegon {
         self.resize_terminal_view();
     }
 
-    /// Resizes the active terminal session to fit the current viewport size with active cell metrics.
+    /// The entry of the active tab, if the active tab hosts a terminal.
+    fn active_terminal(&self) -> Option<&TerminalEntry> {
+        active_entry(&self.workbench, &self.terminals)
+    }
+
+    /// The session of the active tab: the single target of input, selection, and scrolling.
+    fn active_session(&self) -> Option<&TerminalSession> {
+        self.active_terminal().map(TerminalEntry::session)
+    }
+
+    /// Resizes every terminal session to fit the current viewport with active cell metrics.
+    ///
+    /// All sessions share one viewport, so background terminals follow it too: switching tabs then
+    /// needs no resize, and the PTY and grid never lag behind what is shown.
     fn resize_terminal_view(&mut self) {
-        if let Some(session) = &self.terminal_session {
+        {
             let side_bar_w = self.workbench.side_bar_width();
             let main_w =
                 (self.window_size.width - ACTIVITY_BAR_WIDTH - SASH_WIDTH - side_bar_w).max(10.0);
             let main_h = (self.window_size.height - TAB_STRIP_HEIGHT).max(10.0);
             let (cols, rows) = self.terminal_font_config.metrics.grid_size(main_w, main_h);
-            session.resize(
-                cols,
-                rows,
-                self.terminal_font_config.metrics.cell_width as u16,
-                self.terminal_font_config.metrics.cell_height as u16,
-            );
+            for (_, session) in self.terminals.sessions() {
+                session.resize(
+                    cols,
+                    rows,
+                    self.terminal_font_config.metrics.cell_width as u16,
+                    self.terminal_font_config.metrics.cell_height as u16,
+                );
+            }
         }
     }
 
@@ -480,7 +521,15 @@ impl Kegon {
                     self.hovered_activity = None;
                 }
             }
-            Message::TabSelected(id) => self.workbench.select_tab(id),
+            Message::TabSelected(id) => {
+                let previous = self.workbench.tabs().active().map(|tab| tab.id);
+                self.workbench.select_tab(id);
+                if self.workbench.tabs().active().map(|tab| tab.id) != previous {
+                    // Composition and drag state belong to the terminal being left.
+                    self.preedit_text = None;
+                    self.mouse_dragging_selection = false;
+                }
+            }
             Message::SashPressed => self.resizing_side_bar = true,
             Message::SashDragged(cursor_x) => {
                 if self.resizing_side_bar {
@@ -489,15 +538,10 @@ impl Kegon {
                 }
             }
             Message::SashReleased => self.resizing_side_bar = false,
-            Message::TerminalEventReceived(event) => match event {
-                TerminalEvent::Title(raw) => {
-                    self.terminal_title = crate::terminal::title::normalize_terminal_title(&raw);
-                }
-                TerminalEvent::ResetTitle => self.terminal_title = None,
-                // Redraw happens because a message was processed; the last title is kept after
-                // exit since the terminal contents stay on screen.
-                TerminalEvent::Wakeup | TerminalEvent::ChildExit(_) => {}
-            },
+            // Events from removed sessions are dropped by the registry.
+            Message::TerminalEventReceived(tab, event) => {
+                self.terminals.handle_event(tab, event);
+            }
             Message::IcedEventReceived(event) => {
                 self.handle_iced_event(event);
             }
@@ -695,16 +739,19 @@ impl Kegon {
                     }
                     InputRoute::Ime => {}
                     InputRoute::Command(command_id) => {
+                        let active_tab = self.workbench.tabs().active().map(|tab| tab.id);
                         CommandDispatcher::dispatch(
                             command_id,
                             &mut self.workbench,
-                            self.terminal_session.as_ref(),
+                            active_tab
+                                .and_then(|id| self.terminals.get(id))
+                                .map(TerminalEntry::session),
                             &mut self.system_clipboard,
                         );
                     }
                     InputRoute::Terminal => {
                         if self.terminal_focused
-                            && let Some(session) = &self.terminal_session
+                            && let Some(session) = self.active_session()
                         {
                             let input_evt = TerminalInputEvent::press(
                                 logical_key,
@@ -728,7 +775,7 @@ impl Kegon {
             }) => {
                 if !self.is_modal_open()
                     && self.terminal_focused
-                    && let Some(session) = &self.terminal_session
+                    && let Some(session) = self.active_session()
                 {
                     let mode = session.keyboard_mode();
                     if mode.report_event_types {
@@ -743,7 +790,8 @@ impl Kegon {
             Event::InputMethod(ime_event) => {
                 if !self.is_modal_open()
                     && self.terminal_focused
-                    && let Some(session) = &self.terminal_session
+                    && let Some(session) =
+                        active_entry(&self.workbench, &self.terminals).map(TerminalEntry::session)
                 {
                     match ime_event {
                         ImeEvent::Preedit(text, _) => {
@@ -767,7 +815,7 @@ impl Kegon {
 
                     if self.cursor_position.x >= term_x && self.cursor_position.y >= term_y {
                         self.terminal_focused = true;
-                        if let Some(session) = &self.terminal_session {
+                        if let Some(session) = self.active_session() {
                             let (col, line) = calculate_terminal_cell_point(
                                 self.cursor_position,
                                 self.window_size,
@@ -786,7 +834,7 @@ impl Kegon {
                 self.cursor_position = position;
                 if !self.is_modal_open()
                     && self.mouse_dragging_selection
-                    && let Some(session) = &self.terminal_session
+                    && let Some(session) = self.active_session()
                 {
                     let (col, line) = calculate_terminal_cell_point(
                         position,
@@ -804,7 +852,7 @@ impl Kegon {
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 if !self.is_modal_open()
-                    && let Some(session) = &self.terminal_session
+                    && let Some(session) = self.active_session()
                 {
                     let lines = match delta {
                         mouse::ScrollDelta::Lines { y, .. } => (y * 3.0) as i32,
@@ -1215,7 +1263,7 @@ impl Kegon {
         let theme = self.active_theme;
         let tab_strip = self.tab_strip();
 
-        let terminal_view: Element<'_, Message> = if let Some(session) = &self.terminal_session {
+        let terminal_view: Element<'_, Message> = if let Some(session) = self.active_session() {
             let canvas_program = TerminalProgram {
                 session,
                 preedit_text: self.preedit_text.as_deref(),
@@ -1287,9 +1335,21 @@ impl Kegon {
     }
 
     /// Label of the active terminal tab: the child's title, or the translated default.
+    #[cfg(test)]
     fn active_tab_title(&self) -> String {
-        self.terminal_title
-            .clone()
+        self.workbench
+            .tabs()
+            .active()
+            .map(|tab| self.tab_title(tab.id))
+            .unwrap_or_else(|| self.localizer.text(MessageKey::TerminalTabDefaultTitle))
+    }
+
+    /// Label of a tab: its terminal's title, or the translated default.
+    fn tab_title(&self, tab: TabId) -> String {
+        self.terminals
+            .get(tab)
+            .and_then(TerminalEntry::title)
+            .map(str::to_string)
             .unwrap_or_else(|| self.localizer.text(MessageKey::TerminalTabDefaultTitle))
     }
 
@@ -1299,12 +1359,7 @@ impl Kegon {
 
         let tab_buttons = tabs.iter().map(|tab| {
             let is_active = tabs.is_active(tab.id);
-            // The single terminal session belongs to the active tab.
-            let title = if is_active {
-                self.active_tab_title()
-            } else {
-                self.localizer.text(MessageKey::TerminalTabDefaultTitle)
-            };
+            let title = self.tab_title(tab.id);
 
             button(
                 container(
@@ -1906,6 +1961,99 @@ mod tests {
         );
     }
 
+    fn active_tab(app: &Kegon) -> TabId {
+        app.workbench.tabs().active().unwrap().id
+    }
+
+    /// Adds a second terminal tab with its own session, tagging events the way production does.
+    fn add_terminal_tab(app: &mut Kegon) -> TabId {
+        let tab = app
+            .workbench
+            .tabs_mut_for_test()
+            .add(crate::workbench::TabKind::Terminal);
+        let session =
+            TerminalSession::spawn(80, 24, 10, 20, tagged_sink(&app.terminal_event_tx, tab))
+                .unwrap();
+        assert!(app.terminals.insert(tab, session).is_ok());
+        tab
+    }
+
+    #[test]
+    fn startup_registers_a_session_for_the_active_terminal_tab() {
+        let app = new_test_app(Locale::EnUs);
+        let tab = active_tab(&app);
+        assert_eq!(app.terminals.len(), 1);
+        assert!(app.terminals.contains(tab));
+        assert!(app.active_session().is_some());
+    }
+
+    #[test]
+    fn background_terminal_events_update_only_their_own_tab() {
+        let mut app = new_test_app(Locale::EnUs);
+        let first = active_tab(&app);
+        let second = add_terminal_tab(&mut app);
+
+        app.update(Message::TerminalEventReceived(
+            second,
+            TerminalEvent::Title(String::from("background")),
+        ));
+        assert_eq!(app.title(), "Kegon");
+        assert_eq!(app.tab_title(second), "background");
+        assert_eq!(
+            app.tab_title(first),
+            app.localizer.text(MessageKey::TerminalTabDefaultTitle)
+        );
+
+        app.update(Message::TabSelected(second));
+        assert_eq!(app.title(), "background - Kegon");
+    }
+
+    #[test]
+    fn selecting_a_tab_switches_the_input_target() {
+        let mut app = new_test_app(Locale::EnUs);
+        let first = active_tab(&app);
+        let second = add_terminal_tab(&mut app);
+        app.active_session().unwrap().start_selection(0, 0);
+        app.active_session().unwrap().update_selection(3, 0);
+        assert!(app.terminals.get(first).unwrap().session().has_selection());
+
+        app.preedit_text = Some(String::from("あ"));
+        app.update(Message::TabSelected(second));
+        assert_eq!(active_tab(&app), second);
+        assert!(app.preedit_text.is_none());
+        assert!(!app.active_session().unwrap().has_selection());
+        assert!(app.terminals.get(first).unwrap().session().has_selection());
+    }
+
+    #[test]
+    fn late_events_from_removed_terminals_are_ignored() {
+        let mut app = new_test_app(Locale::EnUs);
+        let second = add_terminal_tab(&mut app);
+        app.terminals.remove(second);
+
+        app.update(Message::TerminalEventReceived(
+            second,
+            TerminalEvent::Title(String::from("late")),
+        ));
+        assert_eq!(app.title(), "Kegon");
+    }
+
+    #[test]
+    fn viewport_resize_reaches_every_session() {
+        let mut app = new_test_app(Locale::EnUs);
+        let second = add_terminal_tab(&mut app);
+        app.window_size = Size::new(900.0, 500.0);
+        app.resize_terminal_view();
+
+        use alacritty_terminal::grid::Dimensions;
+        let size = |app: &Kegon, tab| {
+            let term = app.terminals.get(tab).unwrap().session().term().lock();
+            (term.columns(), term.screen_lines())
+        };
+        assert_eq!(size(&app, active_tab(&app)), size(&app, second));
+        assert_ne!(size(&app, second), (80, 24));
+    }
+
     #[test]
     fn runtime_locale_switch_preserves_terminal_session() {
         let mut app = new_test_app(Locale::EnUs);
@@ -1924,13 +2072,17 @@ mod tests {
         assert_eq!(app.title(), "Kegon");
         assert_eq!(app.active_tab_title(), default_label);
 
-        app.update(Message::TerminalEventReceived(TerminalEvent::Title(
-            String::from("Kegon title test"),
-        )));
+        app.update(Message::TerminalEventReceived(
+            active_tab(&app),
+            TerminalEvent::Title(String::from("Kegon title test")),
+        ));
         assert_eq!(app.title(), "Kegon title test - Kegon");
         assert_eq!(app.active_tab_title(), "Kegon title test");
 
-        app.update(Message::TerminalEventReceived(TerminalEvent::ResetTitle));
+        app.update(Message::TerminalEventReceived(
+            active_tab(&app),
+            TerminalEvent::ResetTitle,
+        ));
         assert_eq!(app.title(), "Kegon");
         assert_eq!(app.active_tab_title(), default_label);
     }
@@ -1944,7 +2096,7 @@ mod tests {
             TerminalEvent::ResetTitle,
             TerminalEvent::Title(String::from("C")),
         ] {
-            app.update(Message::TerminalEventReceived(event));
+            app.update(Message::TerminalEventReceived(active_tab(&app), event));
         }
         assert_eq!(app.title(), "C - Kegon");
     }
@@ -1952,24 +2104,27 @@ mod tests {
     #[test]
     fn blank_terminal_title_falls_back_and_exit_keeps_title() {
         let mut app = new_test_app(Locale::EnUs);
-        app.update(Message::TerminalEventReceived(TerminalEvent::Title(
-            String::from("pwsh"),
-        )));
-        app.update(Message::TerminalEventReceived(TerminalEvent::ChildExit(
-            Some(0),
-        )));
+        app.update(Message::TerminalEventReceived(
+            active_tab(&app),
+            TerminalEvent::Title(String::from("pwsh")),
+        ));
+        app.update(Message::TerminalEventReceived(
+            active_tab(&app),
+            TerminalEvent::ChildExit(Some(0)),
+        ));
         assert_eq!(app.title(), "pwsh - Kegon");
         assert_eq!(app.active_tab_title(), "pwsh");
 
-        app.update(Message::TerminalEventReceived(TerminalEvent::Title(
-            String::from(" \x07 "),
-        )));
+        app.update(Message::TerminalEventReceived(
+            active_tab(&app),
+            TerminalEvent::Title(String::from(" \x07 ")),
+        ));
         assert_eq!(app.title(), "Kegon");
         assert_eq!(
             app.active_tab_title(),
             app.localizer.text(MessageKey::TerminalTabDefaultTitle)
         );
-        assert_eq!(app.terminal_title, None);
+        assert_eq!(app.active_terminal().and_then(TerminalEntry::title), None);
     }
 
     #[test]
@@ -2139,14 +2294,14 @@ mod tests {
         let mut app = new_test_app(Locale::EnUs);
 
         {
-            let session = app.terminal_session.as_ref().unwrap();
+            let session = app.active_session().unwrap();
             let mut term = session.term().lock();
             use alacritty_terminal::vte::ansi::Processor;
             let mut parser: Processor = Processor::new();
             parser.advance(&mut *term, b"Hello World\r\n");
         }
 
-        assert!(!app.terminal_session.as_ref().unwrap().has_selection());
+        assert!(!app.active_session().unwrap().has_selection());
 
         let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + app.workbench.side_bar_width();
         let term_y = TAB_STRIP_HEIGHT;
@@ -2157,7 +2312,7 @@ mod tests {
             mouse::Event::ButtonPressed(mouse::Button::Left),
         )));
         assert!(app.mouse_dragging_selection);
-        assert!(!app.terminal_session.as_ref().unwrap().has_selection()); // Single click is not copyable
+        assert!(!app.active_session().unwrap().has_selection()); // Single click is not copyable
 
         // Move mouse to select (0,0)->(4,0) ("Hello")
         let cell_w = app.terminal_font_config.metrics.cell_width;
@@ -2166,13 +2321,9 @@ mod tests {
                 position: Point::new(term_x + cell_w * 4.5, term_y + 5.0),
             },
         )));
-        assert!(app.terminal_session.as_ref().unwrap().has_selection());
+        assert!(app.active_session().unwrap().has_selection());
         assert_eq!(
-            app.terminal_session
-                .as_ref()
-                .unwrap()
-                .copy_selection()
-                .as_deref(),
+            app.active_session().unwrap().copy_selection().as_deref(),
             Some("Hello")
         );
 
@@ -2181,13 +2332,9 @@ mod tests {
             mouse::Event::ButtonReleased(mouse::Button::Left),
         )));
         assert!(!app.mouse_dragging_selection);
-        assert!(app.terminal_session.as_ref().unwrap().has_selection());
+        assert!(app.active_session().unwrap().has_selection());
         assert_eq!(
-            app.terminal_session
-                .as_ref()
-                .unwrap()
-                .copy_selection()
-                .as_deref(),
+            app.active_session().unwrap().copy_selection().as_deref(),
             Some("Hello")
         );
     }

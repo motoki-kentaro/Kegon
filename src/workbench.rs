@@ -84,6 +84,12 @@ impl Workbench {
         &self.tabs
     }
 
+    /// Direct tab mutation for tests that stand in for the tab UI.
+    #[cfg(test)]
+    pub fn tabs_mut_for_test(&mut self) -> &mut WorkbenchTabs {
+        &mut self.tabs
+    }
+
     pub fn select_tab(&mut self, id: TabId) {
         self.tabs.activate(id);
     }

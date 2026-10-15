@@ -60,9 +60,37 @@ impl PtySink {
     }
 }
 
+/// Where a session delivers its [`TerminalEvent`]s.
+///
+/// Type-erased so an owner can tag each event with the identity of the session that produced it
+/// (see [`EventSink::from_fn`]) without the session knowing about that identity.
+#[derive(Clone)]
+pub struct EventSink(Arc<dyn Fn(TerminalEvent) + Send + Sync>);
+
+impl EventSink {
+    /// Delivers each event to `deliver`, which runs on the PTY event loop thread.
+    pub fn from_fn(deliver: impl Fn(TerminalEvent) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(deliver))
+    }
+
+    fn unbounded_send(&self, event: TerminalEvent) -> Result<(), ()> {
+        (self.0)(event);
+        Ok(())
+    }
+}
+
+impl From<UnboundedSender<TerminalEvent>> for EventSink {
+    fn from(tx: UnboundedSender<TerminalEvent>) -> Self {
+        Self::from_fn(move |event| {
+            // Fails only once the receiver is gone, when nobody is left to notify.
+            let _ = tx.unbounded_send(event);
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct EventProxy {
-    event_tx: UnboundedSender<TerminalEvent>,
+    event_tx: EventSink,
     state: Arc<Mutex<SessionState>>,
     // The proxy must exist before `EventLoop::new`, which is what creates the sender, so the
     // sink is injected once the loop is built and before it is spawned.
@@ -155,8 +183,9 @@ impl TerminalSession {
         rows: u16,
         cell_width: u16,
         cell_height: u16,
-        event_tx: UnboundedSender<TerminalEvent>,
+        event_tx: impl Into<EventSink>,
     ) -> Result<Self, String> {
+        let event_tx = event_tx.into();
         let shell_cfg = ShellConfig::resolve_default();
         let options = Options {
             drain_on_exit: true,
@@ -229,6 +258,9 @@ impl TerminalSession {
 
     /// Resizes the terminal grid and PTY.
     pub fn resize(&self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
+        if self.is_exited() {
+            return;
+        }
         let cols = cols.max(1);
         let rows = rows.max(1);
         let cell_width = cell_width.max(1);
@@ -384,6 +416,14 @@ impl TerminalSession {
     }
 }
 
+impl Drop for TerminalSession {
+    /// Stops the PTY event loop, which closes the PTY and with it the child process. Safe after a
+    /// natural exit: the send just fails once the loop has already ended.
+    fn drop(&mut self) {
+        let _ = self.event_loop_sender.send(Msg::Shutdown);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,7 +520,7 @@ mod tests {
         let _ = pty_sink.set(PtySink::Channel(pty_tx));
         let window_size = Arc::new(Mutex::new(TEST_WINDOW_SIZE));
         let proxy = EventProxy {
-            event_tx,
+            event_tx: event_tx.into(),
             state: Arc::new(Mutex::new(SessionState::Running)),
             pty_sink,
             window_size: window_size.clone(),
@@ -531,7 +571,7 @@ mod tests {
     fn replies_without_sink_or_after_shutdown_are_dropped_silently() {
         let (event_tx, _event_rx) = unbounded();
         let proxy = EventProxy {
-            event_tx,
+            event_tx: event_tx.into(),
             state: Arc::new(Mutex::new(SessionState::Running)),
             pty_sink: Arc::new(OnceLock::new()),
             window_size: Arc::new(Mutex::new(TEST_WINDOW_SIZE)),
@@ -667,7 +707,7 @@ mod tests {
         let state = Arc::new(Mutex::new(SessionState::Running));
 
         let proxy = EventProxy {
-            event_tx: tx,
+            event_tx: tx.into(),
             state: state.clone(),
             pty_sink: Arc::new(OnceLock::new()),
             window_size: Arc::new(Mutex::new(TEST_WINDOW_SIZE)),
