@@ -4,6 +4,10 @@
 //! workbench model can be unit tested and later grow into real session and
 //! panel management without being tangled with rendering code.
 
+mod tabs;
+
+pub use tabs::{TabId, TabKind, WorkbenchTabs};
+
 /// Default width of the Side Bar, in logical pixels.
 pub const SIDE_BAR_DEFAULT_WIDTH: f32 = 260.0;
 /// Narrowest the Side Bar can be resized to, in logical pixels.
@@ -29,63 +33,21 @@ impl ActivityItem {
     pub const ALL: [Self; 4] = [Self::Explorer, Self::Search, Self::Git, Self::Settings];
 }
 
-/// Identifies a terminal tab independently of its position in the strip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TabId(u64);
-
-/// A tab in the terminal tab strip.
-///
-/// For now a tab is only an identity. It is expected to own a terminal
-/// session once PTY support exists. The model holds no display text: the UI
-/// labels the tab with a localized default title.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalTab {
-    pub id: TabId,
-}
-
-/// The terminal tab strip.
-///
-/// Invariant: there is always at least one tab, and `active` is a valid index.
-#[derive(Debug, Clone)]
-pub struct TerminalTabs {
-    tabs: Vec<TerminalTab>,
-    active: usize,
-}
-
-impl TerminalTabs {
-    fn new() -> Self {
-        Self {
-            tabs: vec![TerminalTab { id: TabId(0) }],
-            active: 0,
-        }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &TerminalTab> {
-        self.tabs.iter()
-    }
-
-    pub fn active(&self) -> &TerminalTab {
-        &self.tabs[self.active]
-    }
-
-    pub fn is_active(&self, id: TabId) -> bool {
-        self.active().id == id
-    }
-
-    /// Activates the tab with the given id. Unknown ids are ignored.
-    pub fn select(&mut self, id: TabId) {
-        if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
-            self.active = index;
-        }
-    }
-}
-
 /// The state of the whole workbench window.
 #[derive(Debug, Clone)]
 pub struct Workbench {
     active_activity: ActivityItem,
     side_bar_width: f32,
-    terminal_tabs: TerminalTabs,
+    tabs: WorkbenchTabs,
+}
+
+impl Workbench {
+    /// A fresh workbench starts with one active Terminal tab.
+    fn initial_tabs() -> WorkbenchTabs {
+        let mut tabs = WorkbenchTabs::new();
+        tabs.add(TabKind::Terminal);
+        tabs
+    }
 }
 
 impl Default for Workbench {
@@ -93,7 +55,7 @@ impl Default for Workbench {
         Self {
             active_activity: ActivityItem::Explorer,
             side_bar_width: SIDE_BAR_DEFAULT_WIDTH,
-            terminal_tabs: TerminalTabs::new(),
+            tabs: Self::initial_tabs(),
         }
     }
 }
@@ -118,12 +80,12 @@ impl Workbench {
         }
     }
 
-    pub fn terminal_tabs(&self) -> &TerminalTabs {
-        &self.terminal_tabs
+    pub fn tabs(&self) -> &WorkbenchTabs {
+        &self.tabs
     }
 
-    pub fn select_terminal_tab(&mut self, id: TabId) {
-        self.terminal_tabs.select(id);
+    pub fn select_tab(&mut self, id: TabId) {
+        self.tabs.activate(id);
     }
 }
 
@@ -207,18 +169,23 @@ mod tests {
     #[test]
     fn starts_with_a_single_active_terminal_tab() {
         let workbench = Workbench::default();
-        let tabs = workbench.terminal_tabs();
+        let tabs = workbench.tabs();
 
-        assert_eq!(tabs.iter().count(), 1);
-        assert!(tabs.is_active(tabs.active().id));
+        assert_eq!(tabs.len(), 1);
+        let active = tabs.active().expect("active tab");
+        assert_eq!(active.kind, TabKind::Terminal);
+        assert!(tabs.is_active(active.id));
     }
 
     #[test]
     fn selecting_an_unknown_tab_is_ignored() {
         let mut workbench = Workbench::default();
-        let active = workbench.terminal_tabs().active().id;
+        let active = workbench.tabs().active().map(|tab| tab.id);
+        let mut other = WorkbenchTabs::new();
+        other.add(TabKind::Terminal);
+        let unknown = other.add(TabKind::Terminal);
 
-        workbench.select_terminal_tab(TabId(42));
-        assert_eq!(workbench.terminal_tabs().active().id, active);
+        workbench.select_tab(unknown);
+        assert_eq!(workbench.tabs().active().map(|tab| tab.id), active);
     }
 }

@@ -109,7 +109,7 @@ pub enum Message {
     ActivitySelected(ActivityItem),
     ActivityHovered(ActivityItem),
     ActivityUnhovered(ActivityItem),
-    TerminalTabSelected(TabId),
+    TabSelected(TabId),
     SashPressed,
     SashDragged(f32),
     SashReleased,
@@ -480,7 +480,7 @@ impl Kegon {
                     self.hovered_activity = None;
                 }
             }
-            Message::TerminalTabSelected(id) => self.workbench.select_terminal_tab(id),
+            Message::TabSelected(id) => self.workbench.select_tab(id),
             Message::SashPressed => self.resizing_side_bar = true,
             Message::SashDragged(cursor_x) => {
                 if self.resizing_side_bar {
@@ -1295,7 +1295,7 @@ impl Kegon {
 
     fn tab_strip(&self) -> Element<'_, Message> {
         let theme = self.active_theme;
-        let tabs = self.workbench.terminal_tabs();
+        let tabs = self.workbench.tabs();
 
         let tab_buttons = tabs.iter().map(|tab| {
             let is_active = tabs.is_active(tab.id);
@@ -1320,7 +1320,7 @@ impl Kegon {
             )
             .height(TAB_STRIP_HEIGHT)
             .padding([0, 16])
-            .on_press(Message::TerminalTabSelected(tab.id))
+            .on_press(Message::TabSelected(tab.id))
             .style(move |_, status| tab_style(theme, is_active, status))
             .into()
         });
