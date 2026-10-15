@@ -24,9 +24,11 @@ Every direct dependency uses a permissive license. Crates offered under a choice
 
 ### alacritty_terminal
 
-- **Version**: 0.26.0
+- **Version**: 0.26.0 (patched fork)
 - **License**: Apache-2.0
-- **Source**: <https://github.com/alacritty/alacritty>
+- **Source**: <https://github.com/motoki-kentaro/alacritty> (branch `kegon/0.26.0-conpty-fixes`, commit `9825ed254f94c41c3bcd3e1e149a2c40865c25a0`)
+- **Upstream**: <https://github.com/alacritty/alacritty> (tag `alacritty_terminal_v0.26.0`)
+- **Changes**: fixes Windows ConPTY handle leaks in `tty/windows/conpty.rs`. The fork keeps the upstream `LICENSE-APACHE` and copyright notices unchanged. See [terminal architecture](docs/architecture/terminal.md#patched-alacritty_terminal-issue-50).
 
 ### arboard
 

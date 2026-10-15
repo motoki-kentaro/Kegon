@@ -9,7 +9,7 @@ Kegon integrates a real terminal emulator and PTY session behind a Kegon-owned a
 
 ## Core Selection
 
-- **Crate**: `alacritty_terminal` `0.26.0`
+- **Crate**: `alacritty_terminal` `0.26.0` (patched fork; see [Patched alacritty_terminal](#patched-alacritty_terminal-issue-50))
 - **Rust Version Requirement**: `1.85.0+` (Kegon uses `1.88+`)
 - **License**: `Apache-2.0` (Compatible with Kegon's `MIT` license with attribution retaining required notices)
 
@@ -17,6 +17,39 @@ Kegon integrates a real terminal emulator and PTY session behind a Kegon-owned a
 1. It is a battle-tested, high-performance terminal emulator core written entirely in Rust.
 2. It provides built-in PTY and ConPTY support via `alacritty_terminal::tty` on Windows.
 3. It cleanly separates the terminal grid state machine (`Term`) and parser (`vte`) from window creation and rendering.
+
+## Patched alacritty_terminal (Issue #50)
+
+Kegon depends on a patched fork of `alacritty_terminal` instead of the crates.io release. Windows ConPTY leaked OS handles every time a PTY was created, which accumulates across opening and closing terminal tabs (Issue #49).
+
+- **Dependency**: Git dependency on `https://github.com/motoki-kentaro/alacritty`, pinned by full commit SHA in `Cargo.toml` (`rev`) and recorded in `Cargo.lock`.
+- **Branch**: `kegon/0.26.0-conpty-fixes`, based on the upstream tag `alacritty_terminal_v0.26.0` (commit `68ca510074ed4000ae5d1b0cba82f5154752e8cf`). The crate version stays `0.26.0` and the only changes are the ConPTY fixes, so the public API and behavior (for example the DA2 reply `2600`) match upstream 0.26.0.
+- **Current pin**: `9825ed254f94c41c3bcd3e1e149a2c40865c25a0`.
+- **Upstream reference**: the fix was developed against upstream master `29dc55375da817d53540f4caefbe708703c57b07` (kept as `fix/windows-conpty-handle-leaks` in the fork) and then cherry-picked onto 0.26.0 to avoid pulling unreleased upstream changes.
+- **License**: the fork remains Apache-2.0 with the upstream `LICENSE-APACHE` and copyright notices unchanged. Kegon stays MIT. The patch is not submitted upstream.
+
+### Handle leaks found (4 per PTY)
+
+Measured with a standalone reproduction (`GetProcessHandleCount` over repeated create/drop cycles): about +4 handles per PTY on upstream 0.26.0.
+
+| Handle | Status |
+|---|---|
+| ConPTY input pipe, PTY-side end | Fixed (Slice 1) |
+| ConPTY output pipe, PTY-side end | Fixed (Slice 1) |
+| `hThread` from `CreateProcessW` | Fixed (Slice 1) |
+| `hProcess` held by `ChildExitWatcher` | Open, planned for Slice 2 |
+
+With Slice 1, 10 and 50 iterations (3 runs each) measure +1.00 handle per PTY (only `hProcess` remains).
+
+### Updating
+
+1. Fetch upstream tags and create a new branch from the new `alacritty_terminal_v*` tag.
+2. Cherry-pick the fix commits, run Kegon's checks, and push the branch to the fork.
+3. Update `rev` in `Cargo.toml` and run `cargo update -p alacritty_terminal`. Review the `Cargo.lock` diff so that only `alacritty_terminal` (and any dependencies it needs) changes. Update the version in `THIRD_PARTY_NOTICES.md`.
+
+### Reverting to upstream
+
+When a released `alacritty_terminal` contains the fixes, replace the dependency in `Cargo.toml` with `alacritty_terminal = "<version>"`, run `cargo update -p alacritty_terminal`, and remove this section and the fork note in `THIRD_PARTY_NOTICES.md`. The fork branches may then be archived.
 
 ## Abstraction Boundary
 

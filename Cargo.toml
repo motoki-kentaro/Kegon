@@ -17,7 +17,8 @@ fluent-bundle = "0.16"
 unic-langid = "0.9"
 sys-locale = "0.3"
 # Terminal core emulation and system clipboard
-alacritty_terminal = "0.26.0"
+# alacritty_terminal is pinned to Kegon's patched fork (upstream 0.26.0 + ConPTY handle-leak fixes); see docs/architecture/terminal.md.
+alacritty_terminal = { git = "https://github.com/motoki-kentaro/alacritty", rev = "9825ed254f94c41c3bcd3e1e149a2c40865c25a0" }
 arboard = "3.6.1"
 # Event types in the PTY wrapper that taps shell output (must match alacritty_terminal's version).
 polling = "3"
