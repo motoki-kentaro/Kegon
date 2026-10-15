@@ -54,7 +54,9 @@ struct TappedPty<P> {
 impl<P: EventedReadWrite> io::Read for TappedPty<P> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let read = io::Read::read(self.inner.reader(), buf)?;
-        for path in self.scanner.scan(&buf[..read]) {
+        // Only the last report of a read matters: it supersedes the others, and forwarding just
+        // one keeps a flood of reports from flooding the event channel.
+        if let Some(path) = self.scanner.scan(&buf[..read]).pop() {
             let _ = self
                 .sink
                 .unbounded_send(TerminalEvent::WorkingDirectory(path));
@@ -1045,5 +1047,164 @@ mod tests {
         assert_shell_reports_directories(program, |target| {
             format!("cd /d \"{}\"", target.display())
         });
+    }
+
+    /// Starts an integrated shell, runs `setup`, then `cd`s into a fresh directory and reports
+    /// whether that directory was ever reported. Used to pin down known staleness limits.
+    #[cfg(windows)]
+    fn reports_after_setup(
+        program: String,
+        setup: &str,
+        cd: impl Fn(&std::path::Path) -> String,
+    ) -> bool {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let start = scratch_dir("stale-start");
+        let target = scratch_dir("stale-target");
+        let (tx, rx) = mpsc::channel();
+        let sink = EventSink::from_fn(move |event| {
+            if let TerminalEvent::WorkingDirectory(path) = event {
+                let _ = tx.send(path);
+            }
+        });
+        let launch = Launch::new(
+            crate::terminal::shell::ShellConfig {
+                program,
+                args: vec![],
+            },
+            true,
+            &local_host_name(),
+            None,
+        );
+        let session =
+            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(Instant::now() < deadline, "no initial report");
+            if rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_ok_and(|p| same_dir(&p, &start))
+            {
+                break;
+            }
+        }
+        session.write_input(format!("{setup}\r").into_bytes());
+        std::thread::sleep(Duration::from_millis(500));
+        session.write_input(format!("{}\r", cd(&target)).into_bytes());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut reported = false;
+        while Instant::now() < deadline && !reported {
+            reported = rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_ok_and(|p| same_dir(&p, &target));
+        }
+        let _ = std::fs::remove_dir_all(&start);
+        let _ = std::fs::remove_dir_all(&target);
+        reported
+    }
+
+    /// Characterizes a known limit (see docs/architecture/terminal.md): once the user replaces
+    /// the prompt, the shell stops reporting, so the last report goes stale.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs PowerShell 7 and ConPTY; takes several seconds"]
+    fn redefining_the_powershell_prompt_stops_reports() {
+        let program = crate::terminal::shell::installed::pwsh().expect("pwsh is not installed");
+        assert!(!reports_after_setup(
+            program,
+            "function prompt { 'plain> ' }",
+            powershell_cd
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs cmd.exe and ConPTY; takes several seconds"]
+    fn changing_the_cmd_prompt_stops_reports() {
+        let program = crate::terminal::shell::installed::cmd().expect("cmd is not installed");
+        assert!(!reports_after_setup(program, "prompt $G", |target| {
+            format!("cd /d \"{}\"", target.display())
+        }));
+    }
+
+    /// Prints how long sessions take to absorb a large output through the whole stack (ConPTY,
+    /// `TappedPty`, event loop, emulator) with one terminal, then four at once.
+    ///
+    /// A measurement, not a speed assertion: it only fails if the output never finishes.
+    /// Run with `cargo test --release end_to_end_output -- --ignored --nocapture`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "benchmark; spawns real shells and prints timings"]
+    fn end_to_end_output_throughput() {
+        use std::time::{Duration, Instant};
+
+        let dir = scratch_dir("e2e");
+        let file = dir.join("big.txt");
+        let line = "line 0123456789 \x1b[32mgreen\x1b[0m the quick brown fox 日本語の全角文字\r\n";
+        let body = line.repeat(8 * 1024 * 1024 / line.len());
+        std::fs::write(&file, &body).unwrap();
+        let megabytes = body.len() as f64 / 1_048_576.0;
+
+        let run = |sessions: usize| -> Duration {
+            let (tx, _rx) = iced::futures::channel::mpsc::unbounded();
+            let started = Instant::now();
+            let all: Vec<TerminalSession> = (0..sessions)
+                .map(|_| {
+                    let launch = Launch::new(
+                        crate::terminal::shell::ShellConfig {
+                            program: crate::terminal::shell::installed::cmd().unwrap(),
+                            args: vec![],
+                        },
+                        true,
+                        &local_host_name(),
+                        None,
+                    );
+                    TerminalSession::spawn_launch(launch, 120, 40, 10, 20, tx.clone(), None)
+                        .unwrap()
+                })
+                .collect();
+            for session in &all {
+                session.write_input(
+                    format!("type \"{}\" & echo KEGONDONE\r", file.display()).into_bytes(),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(180);
+            for session in &all {
+                while !marker_printed(session) {
+                    assert!(Instant::now() < deadline, "output never finished");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            started.elapsed()
+        };
+
+        // The first run also warms the file cache and the shell start-up.
+        let _ = run(1);
+        for sessions in [1, 1, 4] {
+            let elapsed = run(sessions);
+            println!(
+                "{sessions} session(s): {:.2?} for {megabytes:.1} MiB each ({:.1} MiB/s per session)",
+                elapsed,
+                megabytes / elapsed.as_secs_f64()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// True once `echo KEGONDONE` has produced its output line, i.e. the marker appears on a line
+    /// that does not also contain the command text.
+    #[cfg(windows)]
+    fn marker_printed(session: &TerminalSession) -> bool {
+        use alacritty_terminal::index::{Column, Line, Point};
+        let term = session.term().lock();
+        let grid = term.grid();
+        (0..grid.screen_lines() as i32).any(|line| {
+            let text: String = (0..grid.columns())
+                .map(|col| grid[Point::new(Line(line), Column(col))].c)
+                .collect();
+            text.trim() == "KEGONDONE"
+        })
     }
 }

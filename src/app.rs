@@ -2385,6 +2385,231 @@ mod tests {
         assert!(app.exit_requested);
     }
 
+    /// Drives the tab/session state with a long pseudo-random mix of every operation (open, failed
+    /// open, select, close, unknown ids, events for live, closed and never-issued tabs) and checks
+    /// the invariants after each step.
+    #[test]
+    fn random_operation_sequences_keep_tabs_and_sessions_consistent() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let mut app = new_test_app(Locale::EnUs);
+        let mut ever_issued = tab_order(&app);
+        let mut closed: Vec<TabId> = Vec::new();
+
+        for step in 0..120 {
+            let live = tab_order(&app);
+            match next(8) {
+                0 | 1 => {
+                    if live.len() < 6 {
+                        app.update(Message::NewTerminalTab);
+                        let tab = active_tab(&app);
+                        assert!(!ever_issued.contains(&tab), "tab id reused at step {step}");
+                        ever_issued.push(tab);
+                    }
+                }
+                2 => {
+                    let before = tab_order(&app);
+                    let opened = app.open_terminal_tab_with(|_, _| Err(String::from("no")));
+                    assert!(opened.is_none());
+                    assert_eq!(tab_order(&app), before);
+                }
+                3 | 4 => {
+                    if let Some(&tab) = live.get(next(live.len().max(1))) {
+                        app.update(Message::TabSelected(tab));
+                        assert_eq!(active_tab(&app), tab);
+                    }
+                }
+                5 => {
+                    // Keep at least one tab: closing the last one is the exit path.
+                    if live.len() > 1 {
+                        let tab = live[next(live.len())];
+                        let was_active = app.workbench.tabs().is_active(tab);
+                        let others: Vec<TabId> =
+                            live.iter().copied().filter(|t| *t != tab).collect();
+                        let active_before = active_tab(&app);
+                        app.update(Message::TabClosed(tab));
+                        closed.push(tab);
+                        if !was_active {
+                            assert_eq!(active_tab(&app), active_before);
+                        }
+                        assert!(others.contains(&active_tab(&app)));
+                    }
+                }
+                6 => {
+                    // Events for closed tabs must change nothing visible.
+                    if let Some(&tab) = closed.get(next(closed.len().max(1))) {
+                        let title_before = app.title();
+                        app.update(Message::TerminalEventReceived(
+                            tab,
+                            TerminalEvent::Title(String::from("ghost")),
+                        ));
+                        app.update(Message::TerminalEventReceived(
+                            tab,
+                            TerminalEvent::WorkingDirectory(std::env::temp_dir()),
+                        ));
+                        app.update(Message::TabClosed(tab));
+                        app.update(Message::TabSelected(tab));
+                        assert_eq!(app.title(), title_before);
+                        assert!(app.inheritable_cwd().is_none() || app.active_session().is_some());
+                    }
+                }
+                _ => {
+                    if let Some(&tab) = live.get(next(live.len().max(1))) {
+                        app.update(Message::TerminalEventReceived(
+                            tab,
+                            TerminalEvent::Title(format!("t{step}")),
+                        ));
+                        assert_eq!(app.tab_title(tab), format!("t{step}"));
+                    }
+                }
+            }
+            assert_tabs_and_terminals_agree(&app);
+            assert!(!app.exit_requested);
+            assert!(
+                app.active_session().is_some(),
+                "active tab lost its session at step {step}"
+            );
+            for gone in &closed {
+                assert!(
+                    !app.terminals.contains(*gone) && app.workbench.tabs().get(*gone).is_none()
+                );
+            }
+        }
+    }
+
+    /// (handle count of this process, number of its direct child processes), read from the OS.
+    #[cfg(windows)]
+    fn process_stats() -> (usize, usize) {
+        let pid = std::process::id();
+        let script = format!(
+            "$p = Get-Process -Id {pid}; $c = (Get-CimInstance Win32_Process -Filter 'ParentProcessId={pid}' | Measure-Object).Count; \"$($p.HandleCount) $c\""
+        );
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let mut numbers = text.split_whitespace().map(|n| n.parse::<usize>().unwrap());
+        (numbers.next().unwrap(), numbers.next().unwrap())
+    }
+
+    /// Opens and closes terminal tabs against real shells and ConPTYs, comparing the process's
+    /// handle count and child processes before and after. Prints every measurement.
+    ///
+    /// Run with `cargo test repeated_tab_open_close -- --ignored --nocapture`. Child processes
+    /// must return to the baseline exactly. Handles do not: `alacritty_terminal` 0.26 leaks four
+    /// per pseudoconsole on Windows (the child's process and thread handles, and the two pipe
+    /// ends given to `CreatePseudoConsole`; none is closed by its `conpty::new` or
+    /// `ChildExitWatcher`). The handle assertion allows that known rate and catches anything
+    /// faster; the printed numbers show the actual trend.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawns many real shells; measures OS process and handle counts"]
+    fn repeated_tab_open_close_does_not_accumulate_resources() {
+        const HANDLES_LEAKED_PER_PTY: usize = 6; // 4 known upstream, plus margin
+        let settle = || std::thread::sleep(std::time::Duration::from_secs(3));
+        let mut app = new_test_app(Locale::EnUs);
+        let first = active_tab(&app);
+
+        // Warm up so one-time allocations are not counted as growth.
+        for _ in 0..3 {
+            app.update(Message::NewTerminalTab);
+            let tab = active_tab(&app);
+            app.update(Message::TabClosed(tab));
+        }
+        settle();
+        // The measuring PowerShell is itself a child, and shells from earlier tests may still be
+        // winding down, so take the lowest of a few readings as the baseline.
+        let readings: Vec<_> = (0..3)
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                process_stats()
+            })
+            .collect();
+        let base_handles = readings.iter().map(|r| r.0).min().unwrap();
+        let base_children = readings.iter().map(|r| r.1).min().unwrap();
+        // Later readings wait (bounded) for the child count to come back down before judging it.
+        let settled_stats = || {
+            let mut stats = process_stats();
+            for _ in 0..10 {
+                if stats.1 <= base_children {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                stats = process_stats();
+            }
+            stats
+        };
+        println!("baseline          handles={base_handles} children={base_children}");
+
+        let mut trend = Vec::new();
+        let mut slowest_close = std::time::Duration::ZERO;
+        for (label, cycles) in [("10 cycles", 10), ("50 cycles", 50)] {
+            for _ in 0..cycles {
+                app.update(Message::NewTerminalTab);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let tab = active_tab(&app);
+                let started = std::time::Instant::now();
+                app.update(Message::TabClosed(tab));
+                slowest_close = slowest_close.max(started.elapsed());
+                assert_eq!(tab_order(&app), vec![first]);
+            }
+            settle();
+            let (handles, children) = settled_stats();
+            println!("after {label:<9} handles={handles} children={children}");
+            trend.push((handles, children));
+        }
+
+        // Several tabs held at once, closed in a different order than opened.
+        let mut held = Vec::new();
+        for _ in 0..6 {
+            app.update(Message::NewTerminalTab);
+            held.push(active_tab(&app));
+        }
+        settle();
+        let (peak_handles, peak_children) = process_stats();
+        println!("6 extra tabs open handles={peak_handles} children={peak_children}");
+        for index in [3, 0, 5, 1, 4, 2] {
+            app.update(Message::TabClosed(held[index]));
+        }
+        settle();
+        let (end_handles, end_children) = settled_stats();
+        println!("after closing all handles={end_handles} children={end_children}");
+        assert_tabs_and_terminals_agree(&app);
+
+        assert!(
+            peak_children > base_children,
+            "extra tabs should have started shells"
+        );
+        assert_eq!(
+            end_children, base_children,
+            "child processes were left behind"
+        );
+        println!("slowest tab close on the UI thread: {slowest_close:?}");
+        assert!(
+            slowest_close < std::time::Duration::from_millis(250),
+            "closing a tab blocked the UI thread for {slowest_close:?}"
+        );
+        let mut cycles = 0;
+        for ((handles, children), batch) in trend.into_iter().zip([10, 50]) {
+            cycles += batch;
+            assert_eq!(children, base_children, "child processes were left behind");
+            assert!(
+                handles <= base_handles + HANDLES_LEAKED_PER_PTY * cycles + 30,
+                "handles grew faster than the known upstream leak: {base_handles} -> {handles}                  after {cycles} cycles"
+            );
+        }
+        assert!(
+            end_handles <= base_handles + HANDLES_LEAKED_PER_PTY * (cycles + 6) + 30,
+            "handles grew: {base_handles} -> {end_handles}"
+        );
+    }
+
     #[test]
     fn an_exited_terminal_can_be_switched_away_from_and_closed() {
         let mut app = new_test_app(Locale::EnUs);

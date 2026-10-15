@@ -65,7 +65,6 @@ impl WorkbenchTabs {
     ///
     /// Removing the active tab activates its right neighbour, or its left
     /// neighbour when it was last. Removing any other tab keeps the active one.
-    #[allow(dead_code)]
     pub fn remove(&mut self, id: TabId) -> Option<WorkbenchTab> {
         let index = self.tabs.iter().position(|tab| tab.id == id)?;
         let removed = self.tabs.remove(index);
@@ -83,7 +82,6 @@ impl WorkbenchTabs {
         self.tabs.iter().find(|tab| tab.id == id)
     }
 
-    #[allow(dead_code)]
     pub fn active(&self) -> Option<&WorkbenchTab> {
         self.active.and_then(|id| self.get(id))
     }
@@ -97,12 +95,11 @@ impl WorkbenchTabs {
         self.tabs.iter()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.tabs.len()
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }

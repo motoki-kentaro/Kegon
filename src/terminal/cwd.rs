@@ -1,8 +1,7 @@
 //! Working-directory reports from the shell.
 //!
-//! `alacritty_terminal` (via `vte`) ignores OSC 7, so the PTY output is also fed to a second,
-//! tiny `vte` parser that only looks at the OSC sequences below and ignores everything else. The
-//! sequences are produced by the Shell Integration in [`crate::terminal::shell`]:
+//! `alacritty_terminal` (via `vte`) ignores OSC 7, so the PTY output is also passed through a
+//! small framer ([`CwdScanner`]) that picks out only the OSC sequences below. They are produced by the Shell Integration in [`crate::terminal::shell`]:
 //!
 //! * `OSC 7 ; file://<host>/<percent-encoded path> ST` — PowerShell (and any shell that speaks
 //!   OSC 7, such as one on a remote host).
@@ -13,8 +12,6 @@
 //! not name a local directory (another host, malformed, relative) are dropped, never guessed at.
 
 use std::path::PathBuf;
-
-use vte::{Parser, Perform};
 
 /// Why a report was not accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,54 +131,145 @@ pub fn local_host_name() -> String {
         .unwrap_or_default()
 }
 
-/// Streaming extractor of working-directory reports from raw PTY output.
-///
-/// Holds `vte` state, so a sequence split across reads is still recognized.
-pub struct CwdScanner {
-    parser: Parser,
-    collector: Collector,
+/// Longest OSC payload kept. Real reports are a few hundred bytes; anything longer is discarded.
+const MAX_PAYLOAD: usize = 8 * 1024;
+
+const ESC: u8 = 0x1b;
+const BEL: u8 = 0x07;
+const CAN: u8 = 0x18;
+const SUB: u8 = 0x1a;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// Outside any escape sequence.
+    Ground,
+    /// After `ESC`.
+    Esc,
+    /// Inside `ESC ]` … waiting for the terminator.
+    Osc,
+    /// Inside an OSC, after an `ESC` that may begin `ST` (`ESC \`).
+    OscEsc,
 }
 
-struct Collector {
+/// Streaming extractor of working-directory reports from raw PTY output.
+///
+/// A deliberately small framer for exactly two OSC sequences, not a terminal parser: the
+/// emulator proper stays `alacritty_terminal`'s. `vte`'s own parser was rejected for this job
+/// because its OSC buffer is unbounded and it dispatches a sequence that was merely interrupted,
+/// which would turn a truncated path into a "report".
+///
+/// Rules: a report counts only when closed by `BEL` or `ESC \`. `CAN`, `SUB`, or an `ESC`
+/// followed by anything else abandons the sequence. The payload is capped at [`MAX_PAYLOAD`]; an
+/// overlong one is discarded unread, so memory stays bounded however much output arrives. State
+/// carries across `scan` calls, so a sequence split across reads is still recognized.
+pub struct CwdScanner {
     local_host: String,
-    found: Vec<PathBuf>,
+    state: Framing,
+    payload: Vec<u8>,
+    /// The current OSC exceeded the cap; skip it to its end without dispatching.
+    overlong: bool,
 }
 
 impl CwdScanner {
     pub fn new(local_host: String) -> Self {
         Self {
-            parser: Parser::new(),
-            collector: Collector {
-                local_host,
-                found: Vec::new(),
-            },
+            local_host,
+            state: Framing::Ground,
+            payload: Vec::new(),
+            overlong: false,
         }
     }
 
     /// Feeds PTY output and returns the working directories reported in it, in order.
     pub fn scan(&mut self, bytes: &[u8]) -> Vec<PathBuf> {
-        self.parser.advance(&mut self.collector, bytes);
-        std::mem::take(&mut self.collector.found)
-    }
-}
-
-impl Perform for Collector {
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        let text = |index: usize| params.get(index).and_then(|p| std::str::from_utf8(p).ok());
-        let parsed = match params.first().copied() {
-            Some(b"7") => text(1).map(|uri| parse_osc7_uri(uri, &self.local_host)),
-            // The path may itself contain `;`, which `vte` splits on.
-            Some(b"9") if params.get(1).copied() == Some(b"9") => {
-                let joined: Option<Vec<&str>> = params[2..]
-                    .iter()
-                    .map(|p| std::str::from_utf8(p).ok())
-                    .collect();
-                joined.map(|parts| parse_osc9_9_path(&parts.join(";")))
+        let mut found = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            match self.state {
+                Framing::Ground => match bytes[i..].iter().position(|&b| b == ESC) {
+                    Some(offset) => {
+                        i += offset + 1;
+                        self.state = Framing::Esc;
+                    }
+                    None => i = bytes.len(),
+                },
+                Framing::Esc => {
+                    let b = bytes[i];
+                    i += 1;
+                    match b {
+                        b']' => self.begin_osc(),
+                        ESC => {}
+                        _ => self.state = Framing::Ground,
+                    }
+                }
+                Framing::Osc => {
+                    let run = bytes[i..]
+                        .iter()
+                        .position(|&b| matches!(b, BEL | ESC | CAN | SUB))
+                        .unwrap_or(bytes.len() - i);
+                    self.absorb(&bytes[i..i + run]);
+                    i += run;
+                    if let Some(&terminator) = bytes.get(i) {
+                        i += 1;
+                        match terminator {
+                            BEL => self.finish(&mut found),
+                            ESC => self.state = Framing::OscEsc,
+                            _ => self.state = Framing::Ground,
+                        }
+                    }
+                }
+                Framing::OscEsc => {
+                    let b = bytes[i];
+                    i += 1;
+                    match b {
+                        b'\\' => self.finish(&mut found),
+                        b']' => self.begin_osc(),
+                        ESC => self.state = Framing::Esc,
+                        _ => self.state = Framing::Ground,
+                    }
+                }
             }
+        }
+        found
+    }
+
+    fn begin_osc(&mut self) {
+        self.payload.clear();
+        self.overlong = false;
+        self.state = Framing::Osc;
+    }
+
+    fn absorb(&mut self, chunk: &[u8]) {
+        if self.overlong {
+            return;
+        }
+        if self.payload.len() + chunk.len() > MAX_PAYLOAD {
+            self.overlong = true;
+            self.payload.clear();
+            self.payload.shrink_to(MAX_PAYLOAD);
+        } else {
+            self.payload.extend_from_slice(chunk);
+        }
+    }
+
+    fn finish(&mut self, found: &mut Vec<PathBuf>) {
+        self.state = Framing::Ground;
+        if self.overlong {
+            return;
+        }
+        if let Some(path) = self.interpret() {
+            found.push(path);
+        }
+    }
+
+    /// Reads the closed payload (`7;<uri>` or `9;9;<path>`) into a local path.
+    fn interpret(&self) -> Option<PathBuf> {
+        let text = std::str::from_utf8(&self.payload).ok()?;
+        let (code, rest) = text.split_once(';')?;
+        match code {
+            "7" => parse_osc7_uri(rest, &self.local_host).ok(),
+            "9" => parse_osc9_9_path(rest.strip_prefix("9;")?).ok(),
             _ => None,
-        };
-        if let Some(Ok(path)) = parsed {
-            self.found.push(path);
         }
     }
 }
@@ -313,5 +401,177 @@ mod tests {
             b"\x1b[31mred\x1b[0m \x1b]0;title\x07 \x1b]7;file://other/home\x07 \x1b]7;garbage\x07 \x1b]8;;http://x\x07",
         ]);
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn interrupted_or_aborted_sequences_are_not_reported() {
+        let found = scan_all(&[
+            // Cut off by a new escape sequence, by CAN, by SUB, and never terminated.
+            b"\x1b]7;file://KEGON-PC/C:/trunc\x1b[0m",
+            b"\x1b]7;file://KEGON-PC/C:/can\x18 tail \x07",
+            b"\x1b]7;file://KEGON-PC/C:/sub\x1a tail \x07",
+            b"\x1b]7;file://KEGON-PC/C:/never",
+            b" more output with no terminator",
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_new_osc_after_an_interrupted_one_is_still_read() {
+        let found = scan_all(&[b"\x1b]7;file://KEGON-PC/C:/a\x1b]7;file://KEGON-PC/C:/b\x07"]);
+        assert_eq!(found, [PathBuf::from("C:\\b")]);
+    }
+
+    #[test]
+    fn overlong_payloads_are_discarded_with_bounded_memory() {
+        let mut scanner = CwdScanner::new(String::from(HOST));
+        let mut head = b"\x1b]7;file://KEGON-PC/C:/".to_vec();
+        head.extend(std::iter::repeat_n(b'a', 4 * MAX_PAYLOAD));
+        assert!(scanner.scan(&head).is_empty());
+        for _ in 0..1000 {
+            assert!(scanner.scan(&[b'a'; 65_536]).is_empty());
+            assert!(scanner.payload.capacity() <= 2 * MAX_PAYLOAD);
+        }
+        // Closing the overlong sequence reports nothing, and the next one works normally.
+        assert!(scanner.scan(b"\x07").is_empty());
+        let found = scanner.scan(b"\x1b]7;file://KEGON-PC/C:/ok\x07");
+        assert_eq!(found, [PathBuf::from("C:\\ok")]);
+    }
+
+    #[test]
+    fn nul_control_and_invalid_utf8_payloads_are_rejected() {
+        let found = scan_all(&[
+            b"\x1b]7;file://KEGON-PC/C:/a\x00b\x07",
+            b"\x1b]7;file://KEGON-PC/C:/a\xff\xfeb\x07",
+            b"\x1b]7;file://KEGON-PC/C:/a%00b\x07",
+            b"\x1b]7;\x07\x1b]7\x07\x1b];\x07\x1b]9;9\x07\x1b]9;9;\x07",
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn splitting_a_stream_anywhere_gives_the_same_reports() {
+        let stream: &[u8] = b"x\x1b[1mhi\x1b]0;t\x07\x1b]7;file://KEGON-PC/C:/one%20dir\x1b\\y\x1b]7;file://KEGON-PC/D:/two\x07\x1b]7;bad\x07z";
+        let whole = scan_all(&[stream]);
+        assert_eq!(whole.len(), 2);
+        for cut in 0..=stream.len() {
+            assert_eq!(
+                scan_all(&[&stream[..cut], &stream[cut..]]),
+                whole,
+                "cut {cut}"
+            );
+        }
+        let bytewise: Vec<&[u8]> = stream.chunks(1).collect();
+        assert_eq!(scan_all(&bytewise), whole);
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic_or_report_garbage() {
+        // Deterministic pseudo-random noise, biased towards the bytes that matter.
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet: &[u8] = b"\x1b\x1b]\\\x07\x18\x1a79;:/%0Fa C\xe6\x97\xff\x00";
+        let mut scanner = CwdScanner::new(String::from(HOST));
+        for _ in 0..200 {
+            let chunk: Vec<u8> = (0..1000)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            for path in scanner.scan(&chunk) {
+                assert!(path.is_absolute(), "relative path reported: {path:?}");
+            }
+        }
+    }
+
+    /// Throughput of the scanner against the cost of the emulator that parses the same bytes.
+    ///
+    /// Not a pass/fail check on speed (that is environment dependent); it prints MB/s for each
+    /// corpus. Run with: `cargo test --release scanner_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; prints numbers, run in release mode"]
+    fn scanner_throughput() {
+        use alacritty_terminal::event::{Event, EventListener};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        use std::time::Instant;
+
+        #[derive(Clone)]
+        struct Quiet;
+        impl EventListener for Quiet {
+            fn send_event(&self, _: Event) {}
+        }
+        struct Size;
+        impl alacritty_terminal::grid::Dimensions for Size {
+            fn total_lines(&self) -> usize {
+                50
+            }
+            fn screen_lines(&self) -> usize {
+                50
+            }
+            fn columns(&self) -> usize {
+                200
+            }
+        }
+
+        let repeat = |unit: &[u8], total: usize| unit.repeat(total / unit.len() + 1);
+        const TOTAL: usize = 32 * 1024 * 1024;
+        let corpora: Vec<(&str, Vec<u8>)> =
+            vec![
+            (
+                "plain ASCII lines",
+                repeat(b"The quick brown fox jumps over the lazy dog 0123456789\r\n", TOTAL),
+            ),
+            (
+                "ANSI colors",
+                repeat(
+                    b"\x1b[1;32mok\x1b[0m  \x1b[38;2;10;20;30mfile_name.rs\x1b[0m  42 lines\r\n",
+                    TOTAL,
+                ),
+            ),
+            (
+                "CJK text",
+                repeat("日本語の全角文字を大量に出力するテストです。\r\n".as_bytes(), TOTAL),
+            ),
+            (
+                "OSC 7 every line",
+                repeat(b"\x1b]7;file://PC/C:/Users/me/src%20dir\x1b\\prompt> ls\r\n", TOTAL),
+            ),
+            (
+                "unterminated OSC flood",
+                repeat(b"\x1b]7;file://PC/C:/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", TOTAL),
+            ),
+        ];
+
+        let mb = |bytes: usize, secs: f64| bytes as f64 / 1_048_576.0 / secs;
+        println!(
+            "{:<26} {:>14} {:>14}",
+            "corpus (32 MiB)", "scanner MB/s", "Term MB/s"
+        );
+        for (name, data) in &corpora {
+            let mut scanner = CwdScanner::new(String::from("PC"));
+            let started = Instant::now();
+            let mut reports = 0usize;
+            for chunk in data.chunks(65_536) {
+                reports += scanner.scan(chunk).len();
+            }
+            let scan_secs = started.elapsed().as_secs_f64();
+
+            let mut term = Term::new(Config::default(), &Size, Quiet);
+            let mut processor: Processor = Processor::new();
+            let started = Instant::now();
+            for chunk in data.chunks(65_536) {
+                processor.advance(&mut term, chunk);
+            }
+            let term_secs = started.elapsed().as_secs_f64();
+            println!(
+                "{name:<26} {:>14.0} {:>14.0}   ({reports} reports)",
+                mb(data.len(), scan_secs),
+                mb(data.len(), term_secs)
+            );
+        }
     }
 }

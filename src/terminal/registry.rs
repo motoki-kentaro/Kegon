@@ -80,18 +80,17 @@ impl TerminalRegistry {
         self.entries.get(&tab)
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Part of the session-management API; no caller needs it yet.
     pub fn get_mut(&mut self, tab: TabId) -> Option<&mut TerminalEntry> {
         self.entries.get_mut(&tab)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn contains(&self, tab: TabId) -> bool {
         self.entries.contains_key(&tab)
     }
 
     /// Removes the entry for `tab`; dropping the returned entry shuts its session down.
-    #[allow(dead_code)]
     pub fn remove(&mut self, tab: TabId) -> Option<TerminalEntry> {
         self.entries.remove(&tab)
     }
@@ -103,7 +102,7 @@ impl TerminalRegistry {
             .map(|(tab, entry)| (*tab, &entry.session))
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
