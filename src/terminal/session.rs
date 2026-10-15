@@ -1,20 +1,22 @@
 //! Encapsulates a terminal session, PTY lifecycle, and alacritty_terminal emulation state.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use iced::futures::channel::mpsc::UnboundedSender;
 
-use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, WindowSize};
+use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, OnResize, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Config;
 use alacritty_terminal::term::{Term, TermMode};
-use alacritty_terminal::tty::{self, Options, Shell};
+use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 
-use crate::terminal::shell::ShellConfig;
+use crate::terminal::cwd::{CwdScanner, local_host_name};
+use crate::terminal::shell::Launch;
 
 /// State of a terminal session lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,79 @@ pub enum TerminalEvent {
     ResetTitle,
     /// Child process exited.
     ChildExit(Option<i32>),
+    /// The shell reported its current local working directory (Shell Integration).
+    WorkingDirectory(PathBuf),
+}
+
+/// The PTY with a tap on its output: every read is also scanned for working-directory reports.
+///
+/// `alacritty_terminal` ignores OSC 7, and the event loop owns the only read path, so the tap sits
+/// between the loop and the real PTY. Bytes are passed through unchanged.
+struct TappedPty<P> {
+    inner: P,
+    scanner: CwdScanner,
+    sink: EventSink,
+}
+
+impl<P: EventedReadWrite> io::Read for TappedPty<P> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = io::Read::read(self.inner.reader(), buf)?;
+        // Only the last report of a read matters: it supersedes the others, and forwarding just
+        // one keeps a flood of reports from flooding the event channel.
+        if let Some(path) = self.scanner.scan(&buf[..read]).pop() {
+            let _ = self
+                .sink
+                .unbounded_send(TerminalEvent::WorkingDirectory(path));
+        }
+        Ok(read)
+    }
+}
+
+impl<P: EventedReadWrite> EventedReadWrite for TappedPty<P> {
+    type Reader = Self;
+    type Writer = P::Writer;
+
+    unsafe fn register(
+        &mut self,
+        poller: &Arc<polling::Poller>,
+        interest: polling::Event,
+        mode: polling::PollMode,
+    ) -> io::Result<()> {
+        unsafe { self.inner.register(poller, interest, mode) }
+    }
+
+    fn reregister(
+        &mut self,
+        poller: &Arc<polling::Poller>,
+        interest: polling::Event,
+        mode: polling::PollMode,
+    ) -> io::Result<()> {
+        self.inner.reregister(poller, interest, mode)
+    }
+
+    fn deregister(&mut self, poller: &Arc<polling::Poller>) -> io::Result<()> {
+        self.inner.deregister(poller)
+    }
+
+    fn reader(&mut self) -> &mut Self::Reader {
+        self
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.inner.writer()
+    }
+}
+
+impl<P: EventedPty> EventedPty for TappedPty<P> {
+    fn next_child_event(&mut self) -> Option<ChildEvent> {
+        self.inner.next_child_event()
+    }
+}
+
+impl<P: OnResize> OnResize for TappedPty<P> {
+    fn on_resize(&mut self, window_size: WindowSize) {
+        self.inner.on_resize(window_size);
+    }
 }
 
 /// Destination for terminal-generated responses (DA, DSR, DECRQM, XTWINOPS replies).
@@ -60,9 +135,37 @@ impl PtySink {
     }
 }
 
+/// Where a session delivers its [`TerminalEvent`]s.
+///
+/// Type-erased so an owner can tag each event with the identity of the session that produced it
+/// (see [`EventSink::from_fn`]) without the session knowing about that identity.
+#[derive(Clone)]
+pub struct EventSink(Arc<dyn Fn(TerminalEvent) + Send + Sync>);
+
+impl EventSink {
+    /// Delivers each event to `deliver`, which runs on the PTY event loop thread.
+    pub fn from_fn(deliver: impl Fn(TerminalEvent) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(deliver))
+    }
+
+    fn unbounded_send(&self, event: TerminalEvent) -> Result<(), ()> {
+        (self.0)(event);
+        Ok(())
+    }
+}
+
+impl From<UnboundedSender<TerminalEvent>> for EventSink {
+    fn from(tx: UnboundedSender<TerminalEvent>) -> Self {
+        Self::from_fn(move |event| {
+            // Fails only once the receiver is gone, when nobody is left to notify.
+            let _ = tx.unbounded_send(event);
+        })
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct EventProxy {
-    event_tx: UnboundedSender<TerminalEvent>,
+    event_tx: EventSink,
     state: Arc<Mutex<SessionState>>,
     // The proxy must exist before `EventLoop::new`, which is what creates the sender, so the
     // sink is injected once the loop is built and before it is spawned.
@@ -149,20 +252,54 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    /// Spawns a new terminal session with the default shell.
+    /// Spawns a new terminal session with the default shell, in the default directory.
     pub fn spawn(
         cols: u16,
         rows: u16,
         cell_width: u16,
         cell_height: u16,
-        event_tx: UnboundedSender<TerminalEvent>,
+        event_tx: impl Into<EventSink>,
     ) -> Result<Self, String> {
-        let shell_cfg = ShellConfig::resolve_default();
+        Self::spawn_in(cols, rows, cell_width, cell_height, event_tx, None)
+    }
+
+    /// Spawns a new terminal session with the default shell, started in `working_directory` when
+    /// given. The shell is set up to report its directory (see [`Launch`]).
+    pub fn spawn_in(
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+        event_tx: impl Into<EventSink>,
+        working_directory: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        Self::spawn_launch(
+            Launch::resolve_default(),
+            cols,
+            rows,
+            cell_width,
+            cell_height,
+            event_tx,
+            working_directory,
+        )
+    }
+
+    /// Spawns a session for an explicit [`Launch`] (shell, arguments, environment).
+    pub(crate) fn spawn_launch(
+        launch: Launch,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+        event_tx: impl Into<EventSink>,
+        working_directory: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let event_tx = event_tx.into();
         let options = Options {
             drain_on_exit: true,
-            shell: Some(Shell::new(shell_cfg.program, shell_cfg.args)),
-            working_directory: None,
-            env: HashMap::new(),
+            shell: Some(Shell::new(launch.config.program, launch.config.args)),
+            working_directory,
+            env: launch.env,
             escape_args: false,
         };
 
@@ -175,6 +312,11 @@ impl TerminalSession {
 
         let pty =
             tty::new(&options, window_size, 0).map_err(|e| format!("Failed to spawn PTY: {e}"))?;
+        let pty = TappedPty {
+            inner: pty,
+            scanner: CwdScanner::new(local_host_name()),
+            sink: event_tx.clone(),
+        };
 
         let state = Arc::new(Mutex::new(SessionState::Running));
         let pty_sink = Arc::new(OnceLock::new());
@@ -229,6 +371,9 @@ impl TerminalSession {
 
     /// Resizes the terminal grid and PTY.
     pub fn resize(&self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
+        if self.is_exited() {
+            return;
+        }
         let cols = cols.max(1);
         let rows = rows.max(1);
         let cell_width = cell_width.max(1);
@@ -384,6 +529,14 @@ impl TerminalSession {
     }
 }
 
+impl Drop for TerminalSession {
+    /// Stops the PTY event loop, which closes the PTY and with it the child process. Safe after a
+    /// natural exit: the send just fails once the loop has already ended.
+    fn drop(&mut self) {
+        let _ = self.event_loop_sender.send(Msg::Shutdown);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,7 +633,7 @@ mod tests {
         let _ = pty_sink.set(PtySink::Channel(pty_tx));
         let window_size = Arc::new(Mutex::new(TEST_WINDOW_SIZE));
         let proxy = EventProxy {
-            event_tx,
+            event_tx: event_tx.into(),
             state: Arc::new(Mutex::new(SessionState::Running)),
             pty_sink,
             window_size: window_size.clone(),
@@ -531,7 +684,7 @@ mod tests {
     fn replies_without_sink_or_after_shutdown_are_dropped_silently() {
         let (event_tx, _event_rx) = unbounded();
         let proxy = EventProxy {
-            event_tx,
+            event_tx: event_tx.into(),
             state: Arc::new(Mutex::new(SessionState::Running)),
             pty_sink: Arc::new(OnceLock::new()),
             window_size: Arc::new(Mutex::new(TEST_WINDOW_SIZE)),
@@ -667,7 +820,7 @@ mod tests {
         let state = Arc::new(Mutex::new(SessionState::Running));
 
         let proxy = EventProxy {
-            event_tx: tx,
+            event_tx: tx.into(),
             state: state.clone(),
             pty_sink: Arc::new(OnceLock::new()),
             window_size: Arc::new(Mutex::new(TEST_WINDOW_SIZE)),
@@ -724,5 +877,334 @@ mod tests {
         let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
         let (col, line) = session.cursor_position();
         assert_eq!((col, line), (0, 0));
+    }
+
+    /// Number of live processes whose command line contains `marker`, excluding the query itself.
+    #[cfg(windows)]
+    fn processes_with_marker(marker: &str) -> usize {
+        let script = format!(
+            "(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{marker}*' -and $_.ProcessId -ne $PID }} | Measure-Object).Count"
+        );
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// Dropping a session must end its child processes, not merely stop the event loop. Spawns a
+    /// real long-running child, so it is opt-in: `cargo test -- --ignored`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawns real processes and inspects the OS process table"]
+    fn dropping_a_session_terminates_its_child_processes() {
+        let marker = format!("KegonDropMarker{}", std::process::id());
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
+        session.write_input(
+            format!("powershell -NoProfile -Command 'Start-Sleep 300; Write-Output {marker}'\r\n")
+                .into_bytes(),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while processes_with_marker(&marker) == 0 {
+            assert!(std::time::Instant::now() < deadline, "child never started");
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+
+        drop(session);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while processes_with_marker(&marker) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child survived the session"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    /// A scratch directory whose name has spaces and non-ASCII text.
+    #[cfg(windows)]
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kegon cwd 日本語 {tag} {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(windows)]
+    fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+        let norm = |p: &std::path::Path| {
+            p.to_string_lossy()
+                .trim_start_matches("\\\\?\\")
+                .trim_end_matches('\\')
+                .to_lowercase()
+        };
+        norm(a) == norm(b)
+    }
+
+    /// Starts `program` with Shell Integration in `start`, moves it to `target` with `command`, and
+    /// checks that both the initial prompt and the `cd` are reported.
+    #[cfg(windows)]
+    fn assert_shell_reports_directories(
+        program: String,
+        command: impl Fn(&std::path::Path) -> String,
+    ) {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let start = scratch_dir("start");
+        let target = scratch_dir("target");
+        let (tx, rx) = mpsc::channel();
+        let sink = EventSink::from_fn(move |event| {
+            if let TerminalEvent::WorkingDirectory(path) = event {
+                let _ = tx.send(path);
+            }
+        });
+        let launch = Launch::new(
+            crate::terminal::shell::ShellConfig {
+                program,
+                args: vec![],
+            },
+            true,
+            &local_host_name(),
+            None,
+        );
+        assert!(launch.integrated);
+        let session =
+            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
+                .unwrap();
+
+        let wait_for = |expected: &std::path::Path| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if let Ok(path) = rx.recv_timeout(Duration::from_millis(200))
+                    && same_dir(&path, expected)
+                {
+                    return;
+                }
+            }
+            panic!("no report for {expected:?}");
+        };
+        wait_for(&start);
+        session.write_input(format!("{}\r", command(&target)).into_bytes());
+        wait_for(&target);
+        // The visible screen must not contain the control sequence.
+        let text = {
+            let term = session.term().lock();
+            let grid = term.grid();
+            (0..grid.screen_lines() as i32)
+                .map(|l| {
+                    (0..grid.columns())
+                        .map(|c| {
+                            grid[alacritty_terminal::index::Point::new(
+                                alacritty_terminal::index::Line(l),
+                                alacritty_terminal::index::Column(c),
+                            )]
+                            .c
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                )
+        };
+        assert!(!text.contains("]7;") && !text.contains("file://"), "{text}");
+        let _ = std::fs::remove_dir_all(&start);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[cfg(windows)]
+    fn powershell_cd(target: &std::path::Path) -> String {
+        format!("Set-Location -LiteralPath '{}'", target.display())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a real PowerShell 7 and ConPTY"]
+    fn pwsh_reports_its_directory() {
+        let program = crate::terminal::shell::installed::pwsh().expect("pwsh is not installed");
+        assert_shell_reports_directories(program, powershell_cd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Windows PowerShell 5.1 and ConPTY"]
+    fn windows_powershell_reports_its_directory() {
+        let program = crate::terminal::shell::installed::windows_powershell()
+            .expect("Windows PowerShell is not installed");
+        assert_shell_reports_directories(program, powershell_cd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs cmd.exe and ConPTY"]
+    fn cmd_reports_its_directory() {
+        let program = crate::terminal::shell::installed::cmd().expect("cmd is not installed");
+        assert_shell_reports_directories(program, |target| {
+            format!("cd /d \"{}\"", target.display())
+        });
+    }
+
+    /// Starts an integrated shell, runs `setup`, then `cd`s into a fresh directory and reports
+    /// whether that directory was ever reported. Used to pin down known staleness limits.
+    #[cfg(windows)]
+    fn reports_after_setup(
+        program: String,
+        setup: &str,
+        cd: impl Fn(&std::path::Path) -> String,
+    ) -> bool {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let start = scratch_dir("stale-start");
+        let target = scratch_dir("stale-target");
+        let (tx, rx) = mpsc::channel();
+        let sink = EventSink::from_fn(move |event| {
+            if let TerminalEvent::WorkingDirectory(path) = event {
+                let _ = tx.send(path);
+            }
+        });
+        let launch = Launch::new(
+            crate::terminal::shell::ShellConfig {
+                program,
+                args: vec![],
+            },
+            true,
+            &local_host_name(),
+            None,
+        );
+        let session =
+            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(Instant::now() < deadline, "no initial report");
+            if rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_ok_and(|p| same_dir(&p, &start))
+            {
+                break;
+            }
+        }
+        session.write_input(format!("{setup}\r").into_bytes());
+        std::thread::sleep(Duration::from_millis(500));
+        session.write_input(format!("{}\r", cd(&target)).into_bytes());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut reported = false;
+        while Instant::now() < deadline && !reported {
+            reported = rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_ok_and(|p| same_dir(&p, &target));
+        }
+        let _ = std::fs::remove_dir_all(&start);
+        let _ = std::fs::remove_dir_all(&target);
+        reported
+    }
+
+    /// Characterizes a known limit (see docs/architecture/terminal.md): once the user replaces
+    /// the prompt, the shell stops reporting, so the last report goes stale.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs PowerShell 7 and ConPTY; takes several seconds"]
+    fn redefining_the_powershell_prompt_stops_reports() {
+        let program = crate::terminal::shell::installed::pwsh().expect("pwsh is not installed");
+        assert!(!reports_after_setup(
+            program,
+            "function prompt { 'plain> ' }",
+            powershell_cd
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs cmd.exe and ConPTY; takes several seconds"]
+    fn changing_the_cmd_prompt_stops_reports() {
+        let program = crate::terminal::shell::installed::cmd().expect("cmd is not installed");
+        assert!(!reports_after_setup(program, "prompt $G", |target| {
+            format!("cd /d \"{}\"", target.display())
+        }));
+    }
+
+    /// Prints how long sessions take to absorb a large output through the whole stack (ConPTY,
+    /// `TappedPty`, event loop, emulator) with one terminal, then four at once.
+    ///
+    /// A measurement, not a speed assertion: it only fails if the output never finishes.
+    /// Run with `cargo test --release end_to_end_output -- --ignored --nocapture`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "benchmark; spawns real shells and prints timings"]
+    fn end_to_end_output_throughput() {
+        use std::time::{Duration, Instant};
+
+        let dir = scratch_dir("e2e");
+        let file = dir.join("big.txt");
+        let line = "line 0123456789 \x1b[32mgreen\x1b[0m the quick brown fox 日本語の全角文字\r\n";
+        let body = line.repeat(8 * 1024 * 1024 / line.len());
+        std::fs::write(&file, &body).unwrap();
+        let megabytes = body.len() as f64 / 1_048_576.0;
+
+        let run = |sessions: usize| -> Duration {
+            let (tx, _rx) = iced::futures::channel::mpsc::unbounded();
+            let started = Instant::now();
+            let all: Vec<TerminalSession> = (0..sessions)
+                .map(|_| {
+                    let launch = Launch::new(
+                        crate::terminal::shell::ShellConfig {
+                            program: crate::terminal::shell::installed::cmd().unwrap(),
+                            args: vec![],
+                        },
+                        true,
+                        &local_host_name(),
+                        None,
+                    );
+                    TerminalSession::spawn_launch(launch, 120, 40, 10, 20, tx.clone(), None)
+                        .unwrap()
+                })
+                .collect();
+            for session in &all {
+                session.write_input(
+                    format!("type \"{}\" & echo KEGONDONE\r", file.display()).into_bytes(),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(180);
+            for session in &all {
+                while !marker_printed(session) {
+                    assert!(Instant::now() < deadline, "output never finished");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            started.elapsed()
+        };
+
+        // The first run also warms the file cache and the shell start-up.
+        let _ = run(1);
+        for sessions in [1, 1, 4] {
+            let elapsed = run(sessions);
+            println!(
+                "{sessions} session(s): {:.2?} for {megabytes:.1} MiB each ({:.1} MiB/s per session)",
+                elapsed,
+                megabytes / elapsed.as_secs_f64()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// True once `echo KEGONDONE` has produced its output line, i.e. the marker appears on a line
+    /// that does not also contain the command text.
+    #[cfg(windows)]
+    fn marker_printed(session: &TerminalSession) -> bool {
+        use alacritty_terminal::index::{Column, Line, Point};
+        let term = session.term().lock();
+        let grid = term.grid();
+        (0..grid.screen_lines() as i32).any(|line| {
+            let text: String = (0..grid.columns())
+                .map(|col| grid[Point::new(Line(line), Column(col))].c)
+                .collect();
+            text.trim() == "KEGONDONE"
+        })
     }
 }

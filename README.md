@@ -64,18 +64,20 @@ Kegon is **experimental and under active development**. It runs day to day, but 
 - The terminal grid and the PTY follow window resizes.
 - Replies to terminal queries from programs (for example cursor position and device attributes).
 - Window and tab titles set by the running program.
+- Multiple terminal tabs, each with its own shell; a new tab opens in the directory the active tab's shell last reported (PowerShell 7, Windows PowerShell 5.1 and `cmd.exe`, with no change to your profile).
 - Settings persisted to a TOML file in the OS configuration directory: UI language, UI font, terminal font, and theme (one built-in dark theme so far).
 - English (`en-US`) and Japanese (`ja-JP`) UI; by default it follows the OS language.
 
 ### Not yet implemented
 
-- Multiple terminal tabs: one terminal session is shown today.
 - File Explorer, Search, and Git views: their Side Bar panels are placeholders.
 - Terminal profiles and session/workspace management.
 
 ### Known limitations
 
 - Windows is the only platform tested so far. The code avoids Windows-only assumptions where it can, but Linux and macOS are **not currently tested**.
+- A new tab's starting directory comes from the shell's own reports. If you replace the shell prompt or start a shell without that support (anything other than PowerShell or `cmd.exe`), the last reported directory may be out of date; set `KEGON_SHELL_INTEGRATION=0` to turn the feature off.
+- On Windows, each terminal tab ever opened leaves about four OS handles behind (an `alacritty_terminal` leak); the shell processes themselves do exit.
 - Some terminal interactions are still being hardened, for example selection and copy usability and compatibility with some TUI applications' key handling.
 
 Design notes for the implemented parts live in [docs/architecture](docs/architecture).

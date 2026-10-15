@@ -146,6 +146,53 @@ Logical key events are mapped to terminal escape sequences and characters:
 - Reflow, cursor clamping, and selection invalidation follow `alacritty_terminal`'s own `Term::resize` semantics.
 - Mouse wheel scrolling shifts the display offset into the scrollback history buffer.
 
+## Multiple Terminal Tabs (Issue #49)
+
+Responsibilities are split so that other tab kinds can be added without touching terminal code:
+
+| Piece | Owns | Does not know about |
+| --- | --- | --- |
+| `workbench::WorkbenchTabs` | Tab order, `TabKind`, the active tab, never-reused `TabId`s. `remove` implements the "right neighbour, else left" rule; the UI never repeats it. | Sessions, PTYs, rendering |
+| `terminal::TerminalRegistry` | Every `TerminalSession`, keyed by `TabId`, with per-terminal state derived from its events: title and last reported working directory. Rejects duplicate registration; unknown ids fail safely. | Tab order, selection |
+| `app::Kegon` | The pairing of the two: opens and closes tabs and sessions together, resolves the active session, and keeps window-level state (focus, IME preedit, drag selection). | PTY details |
+
+- **Opening a tab** adds the tab, spawns the session, registers it, then activates it and focuses the terminal. If the session cannot be started the tab is removed again, so a tab never points at a missing session.
+- **Closing a tab** removes the registry entry (dropping the session) and then the tab. Closing the last tab exits the application.
+- **Event routing.** Every session reports through an `EventSink` that tags each event with its `TabId`; the registry applies it to that tab only. Ids are never reused, so a late event from a closed tab can only be dropped, never misdelivered. Background terminals keep receiving output and titles.
+- **Input and drawing** go to the active tab's session only. Switching tabs clears the IME preedit and any drag selection and focuses the terminal.
+- **Resize.** All sessions share one viewport, so every running session is resized together; switching tabs needs no resize. Exited sessions are never written to or resized.
+- **Lifecycle.** A shell that exits on its own keeps its tab and shows the exit banner until the tab is closed. `TerminalSession::drop` sends `Msg::Shutdown`; the event loop thread then drops the PTY, which closes the pseudoconsole and ends the child. The UI thread never waits for this.
+
+Known cost: `alacritty_terminal` 0.26 on Windows leaks four handles per pseudoconsole (the child's process and thread handles and the two pipe ends given to `CreatePseudoConsole` are never closed). Child processes do end; only the handles accumulate, about 4 per tab ever opened. Fixing it needs a patched or newer `alacritty_terminal`.
+
+## Shell Integration and Working Directory (Issue #49)
+
+`alacritty_terminal` (through `vte`) ignores OSC 7 and exposes no working-directory API, so Kegon reads the reports itself:
+
+- `TappedPty` wraps the real PTY handed to `EventLoop`. Every read is passed through unchanged and also scanned by `cwd::CwdScanner`, a small framer that recognizes only `OSC 7` and `OSC 9;9`. Complete reports become `TerminalEvent::WorkingDirectory`, tagged with the tab like any other event; only the last report of a read is forwarded.
+- `vte`'s parser was not used for this: with the `std` feature (which `alacritty_terminal` turns on) its OSC buffer is unbounded, and it dispatches a sequence that was merely interrupted, so a truncated path would count as a report. The framer caps the payload at 8 KiB (an overlong one is discarded unread), accepts a report only when closed by `BEL` or `ESC \`, and abandons it on `CAN`, `SUB`, or any other escape. State carries across reads.
+- `OSC 7` carries `file://<host>/<percent-encoded path>`. A host that is empty, `localhost`, or this machine is local; any other host (for example a remote shell over SSH) is rejected, never read as a UNC server. UNC paths use an empty host and a `//server/share` path. Malformed URIs, queries, fragments, control characters and relative paths are rejected.
+- `OSC 9;9;<path>` is the form `cmd.exe` can print from `PROMPT` (it cannot percent-encode).
+- The shell is the only source of truth. `TerminalEntry::reported_cwd` starts as `None` and is set only by a report; the directory a session was started in is never recorded as its current directory. A new tab inherits the active tab's reported directory only if it still exists as a directory, and otherwise starts in the default directory (as it also does if the shell cannot start there).
+
+How shells are made to report (`shell::Launch`), without touching profiles, execution policy or any persistent setting:
+
+| Shell | Method |
+| --- | --- |
+| PowerShell 7 / Windows PowerShell 5.1 | `-NoExit -EncodedCommand`: after the user's profile, wraps the existing `prompt` function and prepends an invisible OSC 7. Runs inside `try`/`catch`, so a failure leaves the shell as the profile made it. |
+| `cmd.exe` | Child-only `PROMPT` environment variable prefixed with an `OSC 9;9` sequence; an existing `PROMPT` is kept after it. |
+| Anything else, or a shell started with custom arguments | Started exactly as before; no directory reports, so new tabs use the default directory. |
+
+Set `KEGON_SHELL_INTEGRATION=0` to disable it.
+
+**Known limit: stale directories.** A report is only as fresh as the shell's last prompt. If the user replaces the prompt (`function prompt { … }` in PowerShell, `prompt $G` in cmd) or moves into a shell without integration (for example starting `pwsh` or `bash` from inside it), reports stop and `reported_cwd` keeps the last value, so a new tab can start in a directory the user has since left. Both prompt cases are pinned by ignored tests. Detecting this reliably needs prompt boundaries (for example OSC 133 marks) so that "a prompt appeared without a report" can reset the directory to unknown; that is a separate design.
+
+## Testing the Terminal Stack
+
+- `cargo test` runs the unit tests: tab and registry state, event routing, CWD parsing and the OSC framer (including malformed, split, overlong and random input), shell launch planning, and randomized tab operation sequences.
+- `cargo test -- --ignored` also runs the tests that need real shells and ConPTY (Windows with PowerShell 7, Windows PowerShell 5.1 and `cmd.exe`): directory reports for each shell, child processes ending when a session is dropped, prompt-staleness characterization, and repeated tab open/close with process and handle counts. They fail rather than skip when a shell is missing or a timeout passes.
+- Measurements (they print numbers and assert nothing about speed): `cargo test --release scanner_throughput -- --ignored --nocapture` and `cargo test --release end_to_end_output -- --ignored --nocapture`.
+
 ## Non-Goals (Out of Scope for Issue #27)
 
 - Right-click paste and terminal context menus.
