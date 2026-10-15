@@ -5,6 +5,7 @@
 //! arrives after its tab was removed can never reach a different session.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::terminal::session::{TerminalEvent, TerminalSession};
 use crate::terminal::title::normalize_terminal_title;
@@ -15,6 +16,10 @@ pub struct TerminalEntry {
     session: TerminalSession,
     /// Normalized title set by the child, if any. `None` shows the default label.
     title: Option<String>,
+    /// The directory the shell last reported through Shell Integration. `None` means unknown:
+    /// never filled from a guess or from the directory the session was started in, since the
+    /// shell may have changed directory since without being able to tell us.
+    reported_cwd: Option<PathBuf>,
 }
 
 impl TerminalEntry {
@@ -26,10 +31,16 @@ impl TerminalEntry {
         self.title.as_deref()
     }
 
+    /// The last directory the shell reported, if it has reported any.
+    pub fn reported_cwd(&self) -> Option<&Path> {
+        self.reported_cwd.as_deref()
+    }
+
     fn apply(&mut self, event: TerminalEvent) {
         match event {
             TerminalEvent::Title(raw) => self.title = normalize_terminal_title(&raw),
             TerminalEvent::ResetTitle => self.title = None,
+            TerminalEvent::WorkingDirectory(path) => self.reported_cwd = Some(path),
             // Redraw happens because a message was processed; the last title is kept after exit
             // since the terminal contents stay on screen.
             TerminalEvent::Wakeup | TerminalEvent::ChildExit(_) => {}
@@ -59,6 +70,7 @@ impl TerminalRegistry {
             TerminalEntry {
                 session,
                 title: None,
+                reported_cwd: None,
             },
         );
         Ok(())
@@ -284,5 +296,50 @@ mod tests {
         use alacritty_terminal::grid::Dimensions;
         assert_eq!(entry.session().term().lock().columns(), 80);
         assert!(registry.contains(ids[0]));
+    }
+
+    #[test]
+    fn cwd_is_unknown_until_reported_and_tracked_per_tab() {
+        let ids = tab_ids(2);
+        let mut registry = TerminalRegistry::new();
+        registry.insert(ids[0], session()).ok().unwrap();
+        registry.insert(ids[1], session()).ok().unwrap();
+        assert!(registry.get(ids[0]).unwrap().reported_cwd().is_none());
+
+        let dir = PathBuf::from(r"C:\work dir\日本語");
+        assert!(registry.handle_event(ids[1], TerminalEvent::WorkingDirectory(dir.clone())));
+        assert!(registry.get(ids[0]).unwrap().reported_cwd().is_none());
+        assert_eq!(
+            registry.get(ids[1]).unwrap().reported_cwd(),
+            Some(dir.as_path())
+        );
+
+        registry.handle_event(
+            ids[1],
+            TerminalEvent::WorkingDirectory(PathBuf::from(r"D:\x")),
+        );
+        assert_eq!(
+            registry.get(ids[1]).unwrap().reported_cwd(),
+            Some(Path::new(r"D:\x"))
+        );
+        // Title and exit events never touch it.
+        registry.handle_event(ids[1], TerminalEvent::ResetTitle);
+        registry.handle_event(ids[1], TerminalEvent::ChildExit(Some(0)));
+        assert_eq!(
+            registry.get(ids[1]).unwrap().reported_cwd(),
+            Some(Path::new(r"D:\x"))
+        );
+    }
+
+    #[test]
+    fn cwd_reports_for_removed_tabs_are_ignored() {
+        let ids = tab_ids(2);
+        let mut registry = TerminalRegistry::new();
+        registry.insert(ids[0], session()).ok().unwrap();
+        registry.remove(ids[0]);
+        assert!(!registry.handle_event(
+            ids[0],
+            TerminalEvent::WorkingDirectory(PathBuf::from(r"C:\x"))
+        ));
     }
 }

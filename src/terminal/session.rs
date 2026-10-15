@@ -1,20 +1,22 @@
 //! Encapsulates a terminal session, PTY lifecycle, and alacritty_terminal emulation state.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use iced::futures::channel::mpsc::UnboundedSender;
 
-use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, WindowSize};
+use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener, OnResize, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::Config;
 use alacritty_terminal::term::{Term, TermMode};
-use alacritty_terminal::tty::{self, Options, Shell};
+use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 
-use crate::terminal::shell::ShellConfig;
+use crate::terminal::cwd::{CwdScanner, local_host_name};
+use crate::terminal::shell::Launch;
 
 /// State of a terminal session lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,77 @@ pub enum TerminalEvent {
     ResetTitle,
     /// Child process exited.
     ChildExit(Option<i32>),
+    /// The shell reported its current local working directory (Shell Integration).
+    WorkingDirectory(PathBuf),
+}
+
+/// The PTY with a tap on its output: every read is also scanned for working-directory reports.
+///
+/// `alacritty_terminal` ignores OSC 7, and the event loop owns the only read path, so the tap sits
+/// between the loop and the real PTY. Bytes are passed through unchanged.
+struct TappedPty<P> {
+    inner: P,
+    scanner: CwdScanner,
+    sink: EventSink,
+}
+
+impl<P: EventedReadWrite> io::Read for TappedPty<P> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = io::Read::read(self.inner.reader(), buf)?;
+        for path in self.scanner.scan(&buf[..read]) {
+            let _ = self
+                .sink
+                .unbounded_send(TerminalEvent::WorkingDirectory(path));
+        }
+        Ok(read)
+    }
+}
+
+impl<P: EventedReadWrite> EventedReadWrite for TappedPty<P> {
+    type Reader = Self;
+    type Writer = P::Writer;
+
+    unsafe fn register(
+        &mut self,
+        poller: &Arc<polling::Poller>,
+        interest: polling::Event,
+        mode: polling::PollMode,
+    ) -> io::Result<()> {
+        unsafe { self.inner.register(poller, interest, mode) }
+    }
+
+    fn reregister(
+        &mut self,
+        poller: &Arc<polling::Poller>,
+        interest: polling::Event,
+        mode: polling::PollMode,
+    ) -> io::Result<()> {
+        self.inner.reregister(poller, interest, mode)
+    }
+
+    fn deregister(&mut self, poller: &Arc<polling::Poller>) -> io::Result<()> {
+        self.inner.deregister(poller)
+    }
+
+    fn reader(&mut self) -> &mut Self::Reader {
+        self
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.inner.writer()
+    }
+}
+
+impl<P: EventedPty> EventedPty for TappedPty<P> {
+    fn next_child_event(&mut self) -> Option<ChildEvent> {
+        self.inner.next_child_event()
+    }
+}
+
+impl<P: OnResize> OnResize for TappedPty<P> {
+    fn on_resize(&mut self, window_size: WindowSize) {
+        self.inner.on_resize(window_size);
+    }
 }
 
 /// Destination for terminal-generated responses (DA, DSR, DECRQM, XTWINOPS replies).
@@ -177,7 +250,7 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
-    /// Spawns a new terminal session with the default shell.
+    /// Spawns a new terminal session with the default shell, in the default directory.
     pub fn spawn(
         cols: u16,
         rows: u16,
@@ -185,13 +258,46 @@ impl TerminalSession {
         cell_height: u16,
         event_tx: impl Into<EventSink>,
     ) -> Result<Self, String> {
+        Self::spawn_in(cols, rows, cell_width, cell_height, event_tx, None)
+    }
+
+    /// Spawns a new terminal session with the default shell, started in `working_directory` when
+    /// given. The shell is set up to report its directory (see [`Launch`]).
+    pub fn spawn_in(
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+        event_tx: impl Into<EventSink>,
+        working_directory: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        Self::spawn_launch(
+            Launch::resolve_default(),
+            cols,
+            rows,
+            cell_width,
+            cell_height,
+            event_tx,
+            working_directory,
+        )
+    }
+
+    /// Spawns a session for an explicit [`Launch`] (shell, arguments, environment).
+    pub(crate) fn spawn_launch(
+        launch: Launch,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+        event_tx: impl Into<EventSink>,
+        working_directory: Option<PathBuf>,
+    ) -> Result<Self, String> {
         let event_tx = event_tx.into();
-        let shell_cfg = ShellConfig::resolve_default();
         let options = Options {
             drain_on_exit: true,
-            shell: Some(Shell::new(shell_cfg.program, shell_cfg.args)),
-            working_directory: None,
-            env: HashMap::new(),
+            shell: Some(Shell::new(launch.config.program, launch.config.args)),
+            working_directory,
+            env: launch.env,
             escape_args: false,
         };
 
@@ -204,6 +310,11 @@ impl TerminalSession {
 
         let pty =
             tty::new(&options, window_size, 0).map_err(|e| format!("Failed to spawn PTY: {e}"))?;
+        let pty = TappedPty {
+            inner: pty,
+            scanner: CwdScanner::new(local_host_name()),
+            sink: event_tx.clone(),
+        };
 
         let state = Arc::new(Mutex::new(SessionState::Running));
         let pty_sink = Arc::new(OnceLock::new());
@@ -809,5 +920,130 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
+    }
+
+    /// A scratch directory whose name has spaces and non-ASCII text.
+    #[cfg(windows)]
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kegon cwd 日本語 {tag} {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(windows)]
+    fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+        let norm = |p: &std::path::Path| {
+            p.to_string_lossy()
+                .trim_start_matches("\\\\?\\")
+                .trim_end_matches('\\')
+                .to_lowercase()
+        };
+        norm(a) == norm(b)
+    }
+
+    /// Starts `program` with Shell Integration in `start`, moves it to `target` with `command`, and
+    /// checks that both the initial prompt and the `cd` are reported.
+    #[cfg(windows)]
+    fn assert_shell_reports_directories(
+        program: String,
+        command: impl Fn(&std::path::Path) -> String,
+    ) {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let start = scratch_dir("start");
+        let target = scratch_dir("target");
+        let (tx, rx) = mpsc::channel();
+        let sink = EventSink::from_fn(move |event| {
+            if let TerminalEvent::WorkingDirectory(path) = event {
+                let _ = tx.send(path);
+            }
+        });
+        let launch = Launch::new(
+            crate::terminal::shell::ShellConfig {
+                program,
+                args: vec![],
+            },
+            true,
+            &local_host_name(),
+            None,
+        );
+        assert!(launch.integrated);
+        let session =
+            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
+                .unwrap();
+
+        let wait_for = |expected: &std::path::Path| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if let Ok(path) = rx.recv_timeout(Duration::from_millis(200))
+                    && same_dir(&path, expected)
+                {
+                    return;
+                }
+            }
+            panic!("no report for {expected:?}");
+        };
+        wait_for(&start);
+        session.write_input(format!("{}\r", command(&target)).into_bytes());
+        wait_for(&target);
+        // The visible screen must not contain the control sequence.
+        let text = {
+            let term = session.term().lock();
+            let grid = term.grid();
+            (0..grid.screen_lines() as i32)
+                .map(|l| {
+                    (0..grid.columns())
+                        .map(|c| {
+                            grid[alacritty_terminal::index::Point::new(
+                                alacritty_terminal::index::Line(l),
+                                alacritty_terminal::index::Column(c),
+                            )]
+                            .c
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                )
+        };
+        assert!(!text.contains("]7;") && !text.contains("file://"), "{text}");
+        let _ = std::fs::remove_dir_all(&start);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[cfg(windows)]
+    fn powershell_cd(target: &std::path::Path) -> String {
+        format!("Set-Location -LiteralPath '{}'", target.display())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a real PowerShell 7 and ConPTY"]
+    fn pwsh_reports_its_directory() {
+        let program = crate::terminal::shell::installed::pwsh().expect("pwsh is not installed");
+        assert_shell_reports_directories(program, powershell_cd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Windows PowerShell 5.1 and ConPTY"]
+    fn windows_powershell_reports_its_directory() {
+        let program = crate::terminal::shell::installed::windows_powershell()
+            .expect("Windows PowerShell is not installed");
+        assert_shell_reports_directories(program, powershell_cd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs cmd.exe and ConPTY"]
+    fn cmd_reports_its_directory() {
+        let program = crate::terminal::shell::installed::cmd().expect("cmd is not installed");
+        assert_shell_reports_directories(program, |target| {
+            format!("cd /d \"{}\"", target.display())
+        });
     }
 }

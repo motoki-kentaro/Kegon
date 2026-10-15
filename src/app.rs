@@ -1,5 +1,6 @@
 //! The iced application: messages, update logic, and the workbench view.
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use iced::advanced::input_method::Event as ImeEvent;
@@ -444,23 +445,40 @@ impl Kegon {
         let (cols, rows) = self.terminal_grid_size();
         let metrics = self.terminal_font_config.metrics;
         let tx = self.terminal_event_tx.clone();
-        self.open_terminal_tab_with(|tab| {
-            TerminalSession::spawn(
-                cols,
-                rows,
-                metrics.cell_width as u16,
-                metrics.cell_height as u16,
-                tagged_sink(&tx, tab),
-            )
+        self.open_terminal_tab_with(|tab, cwd| {
+            let spawn = |cwd| {
+                TerminalSession::spawn_in(
+                    cols,
+                    rows,
+                    metrics.cell_width as u16,
+                    metrics.cell_height as u16,
+                    tagged_sink(&tx, tab),
+                    cwd,
+                )
+            };
+            // A directory that cannot be entered must not stop the tab from opening.
+            match cwd {
+                Some(cwd) => spawn(Some(cwd)).or_else(|_| spawn(None)),
+                None => spawn(None),
+            }
         })
+    }
+
+    /// The directory a new terminal should start in: the one the active terminal's shell last
+    /// reported, if it still exists. `None` means "use the default directory"; a directory the
+    /// shell has not reported is never guessed.
+    fn inheritable_cwd(&self) -> Option<PathBuf> {
+        let cwd = self.active_terminal()?.reported_cwd()?;
+        cwd.is_dir().then(|| cwd.to_path_buf())
     }
 
     fn open_terminal_tab_with(
         &mut self,
-        spawn: impl FnOnce(TabId) -> Result<TerminalSession, String>,
+        spawn: impl FnOnce(TabId, Option<PathBuf>) -> Result<TerminalSession, String>,
     ) -> Option<TabId> {
+        let cwd = self.inheritable_cwd();
         let tab = self.workbench.add_tab(TabKind::Terminal);
-        let registered = match spawn(tab) {
+        let registered = match spawn(tab, cwd) {
             Ok(session) => self.terminals.insert(tab, session).is_ok(),
             Err(error) => {
                 eprintln!("kegon: {error}");
@@ -2099,6 +2117,135 @@ mod tests {
         }
     }
 
+    fn report_cwd(app: &mut Kegon, tab: TabId, path: &std::path::Path) {
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::WorkingDirectory(path.to_path_buf()),
+        ));
+    }
+
+    /// A real, uniquely named directory with a space and Japanese text in its name.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kegon test 日本語 {tag} {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn unreported_cwd_means_default_directory() {
+        let mut app = new_test_app(Locale::EnUs);
+        assert!(app.inheritable_cwd().is_none());
+
+        let mut seen = None;
+        app.open_terminal_tab_with(|tab, cwd| {
+            seen = Some(cwd);
+            TerminalSession::spawn(80, 24, 10, 20, tagged_sink(&app_tx_for_test(), tab))
+        });
+        assert_eq!(seen, Some(None));
+    }
+
+    fn app_tx_for_test() -> UnboundedSender<TabTerminalEvent> {
+        unbounded().0
+    }
+
+    #[test]
+    fn reported_cwd_is_passed_to_the_new_session() {
+        let dir = temp_dir("inherit");
+        let mut app = new_test_app(Locale::EnUs);
+        let first = active_tab(&app);
+        report_cwd(&mut app, first, &dir);
+
+        let mut seen = None;
+        let tx = app.terminal_event_tx.clone();
+        let opened = app.open_terminal_tab_with(|tab, cwd| {
+            seen = Some(cwd.clone());
+            TerminalSession::spawn_in(80, 24, 10, 20, tagged_sink(&tx, tab), cwd)
+        });
+
+        assert!(opened.is_some());
+        assert_eq!(seen, Some(Some(dir.clone())));
+        // The source terminal's own record is untouched.
+        assert_eq!(
+            app.terminals.get(first).unwrap().reported_cwd(),
+            Some(dir.as_path())
+        );
+        // The new tab has not reported anything yet, so it is not assumed to be in `dir`.
+        assert!(app.inheritable_cwd().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deleted_directories_are_not_inherited() {
+        let dir = temp_dir("deleted");
+        let mut app = new_test_app(Locale::EnUs);
+        let first = active_tab(&app);
+        report_cwd(&mut app, first, &dir);
+        assert_eq!(app.inheritable_cwd(), Some(dir.clone()));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(app.inheritable_cwd().is_none());
+
+        // A file is not a directory either.
+        let file = std::env::temp_dir().join(format!("kegon test file {}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        report_cwd(&mut app, first, &file);
+        assert!(app.inheritable_cwd().is_none());
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn each_tab_keeps_its_own_cwd_and_background_reports_are_kept() {
+        let (dir_a, dir_b) = (temp_dir("a"), temp_dir("b"));
+        let mut app = new_test_app(Locale::EnUs);
+        let first = active_tab(&app);
+        let second = add_terminal_tab(&mut app);
+
+        report_cwd(&mut app, second, &dir_b); // background tab
+        assert!(app.inheritable_cwd().is_none()); // the active tab has reported nothing
+        report_cwd(&mut app, first, &dir_a);
+        assert_eq!(app.inheritable_cwd(), Some(dir_a.clone()));
+
+        app.update(Message::TabSelected(second));
+        assert_eq!(app.inheritable_cwd(), Some(dir_b.clone()));
+        assert_eq!(
+            app.terminals.get(first).unwrap().reported_cwd(),
+            Some(dir_a.as_path())
+        );
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    #[test]
+    fn cwd_reports_from_closed_tabs_are_ignored() {
+        let dir = temp_dir("late");
+        let mut app = new_test_app(Locale::EnUs);
+        let second = add_terminal_tab(&mut app);
+        app.update(Message::TabClosed(second));
+
+        report_cwd(&mut app, second, &dir);
+
+        assert_eq!(app.terminals.len(), 1);
+        assert!(app.inheritable_cwd().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_spawn_failure_after_cwd_inheritance_leaves_no_tab() {
+        let dir = temp_dir("fail");
+        let mut app = new_test_app(Locale::EnUs);
+        let first = active_tab(&app);
+        report_cwd(&mut app, first, &dir);
+
+        assert!(
+            app.open_terminal_tab_with(|_, _| Err(String::from("nope")))
+                .is_none()
+        );
+        assert_eq!(tab_order(&app), vec![first]);
+        assert_tabs_and_terminals_agree(&app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn new_terminal_tab_is_appended_activated_and_focused() {
         let mut app = new_test_app(Locale::EnUs);
@@ -2122,7 +2269,7 @@ mod tests {
         let mut app = new_test_app(Locale::EnUs);
         let first = active_tab(&app);
 
-        let opened = app.open_terminal_tab_with(|_| Err(String::from("spawn failed")));
+        let opened = app.open_terminal_tab_with(|_, _| Err(String::from("spawn failed")));
 
         assert!(opened.is_none());
         assert_eq!(tab_order(&app), vec![first]);

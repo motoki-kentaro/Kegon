@@ -146,6 +146,25 @@ Logical key events are mapped to terminal escape sequences and characters:
 - Reflow, cursor clamping, and selection invalidation follow `alacritty_terminal`'s own `Term::resize` semantics.
 - Mouse wheel scrolling shifts the display offset into the scrollback history buffer.
 
+## Shell Integration and Working Directory (Issue #49)
+
+`alacritty_terminal` (through `vte`) ignores OSC 7 and exposes no working-directory API, so Kegon reads the reports itself without a second terminal parser:
+
+- `TappedPty` wraps the real PTY handed to `EventLoop`. Every read is passed through unchanged and also fed to `cwd::CwdScanner`, a bare `vte::Parser` that only acts on `OSC 7` and `OSC 9;9`. Complete reports become `TerminalEvent::WorkingDirectory`, tagged with the tab like any other event.
+- `OSC 7` carries `file://<host>/<percent-encoded path>`. A host that is empty, `localhost`, or this machine is local; any other host (for example a remote shell over SSH) is rejected, never read as a UNC server. UNC paths use an empty host and a `//server/share` path. Malformed URIs, queries, fragments, control characters and relative paths are rejected.
+- `OSC 9;9;<path>` is the form `cmd.exe` can print from `PROMPT` (it cannot percent-encode).
+- The shell is the only source of truth. `TerminalEntry::reported_cwd` starts as `None` and is set only by a report; the directory a session was started in is never recorded as its current directory. A new tab inherits the active tab's reported directory only if it still exists as a directory, and otherwise starts in the default directory (as it also does if the shell cannot start there).
+
+How shells are made to report (`shell::Launch`), without touching profiles, execution policy or any persistent setting:
+
+| Shell | Method |
+| --- | --- |
+| PowerShell 7 / Windows PowerShell 5.1 | `-NoExit -EncodedCommand`: after the user's profile, wraps the existing `prompt` function and prepends an invisible OSC 7. Runs inside `try`/`catch`, so a failure leaves the shell as the profile made it. |
+| `cmd.exe` | Child-only `PROMPT` environment variable prefixed with an `OSC 9;9` sequence; an existing `PROMPT` is kept after it. |
+| Anything else, or a shell started with custom arguments | Started exactly as before; no directory reports, so new tabs use the default directory. |
+
+Set `KEGON_SHELL_INTEGRATION=0` to disable it. Known limits: a `prompt` function redefined interactively after startup replaces the wrapper, and a nested shell without integration leaves the last reported directory in place.
+
 ## Non-Goals (Out of Scope for Issue #27)
 
 - Right-click paste and terminal context menus.

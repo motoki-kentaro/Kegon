@@ -7,6 +7,7 @@
 
 pub mod arbitration;
 pub mod clipboard;
+pub mod cwd;
 pub mod input;
 pub mod input_event;
 pub mod key_encoder;

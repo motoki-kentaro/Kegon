@@ -19,6 +19,10 @@ sys-locale = "0.3"
 # Terminal core emulation and system clipboard
 alacritty_terminal = "0.26.0"
 arboard = "3.6.1"
+# Second, OSC-only parse of PTY output to read working-directory reports (see terminal/cwd.rs).
+vte = "0.15"
+# Event types in the PTY wrapper that taps shell output (must match alacritty_terminal's version).
+polling = "3"
 # Application settings serialization, TOML parsing, and cross-platform config paths
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"

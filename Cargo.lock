@@ -1734,11 +1734,13 @@ dependencies = [
  "fontdb",
  "iced",
  "ico",
+ "polling",
  "serde",
  "sys-locale",
  "toml 0.8.23",
  "ttf-parser",
  "unic-langid",
+ "vte",
  "winresource",
 ]
 
