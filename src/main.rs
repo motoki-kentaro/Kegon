@@ -48,7 +48,7 @@ fn main() -> iced::Result {
                 options.smoke_font_picker,
             )
         },
-        Kegon::update,
+        Kegon::run_update,
         Kegon::view,
     )
     .title(Kegon::title)

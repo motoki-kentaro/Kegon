@@ -39,7 +39,8 @@ side-bar-settings-terminal-font-not-installed = { $family } (未インストー�
 ## Terminal tab strip
 
 terminal-tab-default-title = ターミナル
-terminal-new-tab-tooltip = 新しいターミナル(未実装)
+terminal-new-tab-tooltip = 新しいターミナル
+terminal-close-tab-tooltip = ターミナルを閉じる
 terminal-process-exited = プロセスがコード { $code } で終了しました。
 
 ## Main area

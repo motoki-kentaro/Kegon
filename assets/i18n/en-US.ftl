@@ -40,7 +40,8 @@ side-bar-settings-terminal-font-not-installed = { $family } (not installed)
 ## Terminal tab strip
 
 terminal-tab-default-title = Terminal
-terminal-new-tab-tooltip = New Terminal (not implemented yet)
+terminal-new-tab-tooltip = New Terminal
+terminal-close-tab-tooltip = Close Terminal
 terminal-process-exited = Process exited with code { $code }.
 
 ## Main area

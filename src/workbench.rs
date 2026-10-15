@@ -84,10 +84,15 @@ impl Workbench {
         &self.tabs
     }
 
-    /// Direct tab mutation for tests that stand in for the tab UI.
-    #[cfg(test)]
-    pub fn tabs_mut_for_test(&mut self) -> &mut WorkbenchTabs {
-        &mut self.tabs
+    /// Appends a tab without changing which one is active (the first tab of an empty strip
+    /// becomes active).
+    pub fn add_tab(&mut self, kind: TabKind) -> TabId {
+        self.tabs.add(kind)
+    }
+
+    /// Removes a tab; the active tab follows the rules of [`WorkbenchTabs::remove`].
+    pub fn remove_tab(&mut self, id: TabId) -> bool {
+        self.tabs.remove(id).is_some()
     }
 
     pub fn select_tab(&mut self, id: TabId) {

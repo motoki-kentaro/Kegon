@@ -765,4 +765,49 @@ mod tests {
         let (col, line) = session.cursor_position();
         assert_eq!((col, line), (0, 0));
     }
+
+    /// Number of live processes whose command line contains `marker`, excluding the query itself.
+    #[cfg(windows)]
+    fn processes_with_marker(marker: &str) -> usize {
+        let script = format!(
+            "(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{marker}*' -and $_.ProcessId -ne $PID }} | Measure-Object).Count"
+        );
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// Dropping a session must end its child processes, not merely stop the event loop. Spawns a
+    /// real long-running child, so it is opt-in: `cargo test -- --ignored`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawns real processes and inspects the OS process table"]
+    fn dropping_a_session_terminates_its_child_processes() {
+        let marker = format!("KegonDropMarker{}", std::process::id());
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
+        session.write_input(
+            format!("powershell -NoProfile -Command 'Start-Sleep 300; Write-Output {marker}'\r\n")
+                .into_bytes(),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while processes_with_marker(&marker) == 0 {
+            assert!(std::time::Instant::now() < deadline, "child never started");
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+
+        drop(session);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while processes_with_marker(&marker) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child survived the session"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
 }

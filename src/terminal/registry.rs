@@ -272,17 +272,17 @@ mod tests {
 
         // Wait for the shell to exit on its own; the entry stays registered.
         let entry = registry.get(ids[0]).unwrap();
-        for _ in 0..100 {
-            if entry.session().is_exited() {
-                break;
-            }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !entry.session().is_exited() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell did not exit on `exit`"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        if entry.session().is_exited() {
-            entry.session().resize(120, 40, 10, 20);
-            use alacritty_terminal::grid::Dimensions;
-            assert_eq!(entry.session().term().lock().columns(), 80);
-        }
+        entry.session().resize(120, 40, 10, 20);
+        use alacritty_terminal::grid::Dimensions;
+        assert_eq!(entry.session().term().lock().columns(), 80);
         assert!(registry.contains(ids[0]));
     }
 }
