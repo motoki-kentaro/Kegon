@@ -294,6 +294,9 @@ impl TerminalSession {
         event_tx: impl Into<EventSink>,
         working_directory: Option<PathBuf>,
     ) -> Result<Self, String> {
+        #[cfg(all(test, windows))]
+        wait_for_shells_at_test_exit();
+
         let event_tx = event_tx.into();
         let options = Options {
             drain_on_exit: true,
@@ -526,6 +529,105 @@ impl TerminalSession {
         use alacritty_terminal::grid::Scroll;
         let mut term = self.term.lock();
         term.scroll_display(Scroll::Delta(delta));
+    }
+}
+
+/// The test binary has no `main` of ours, so the shells that its tests spawned and dropped would
+/// be orphaned by the process exit just like in the app. Register the same wait with the C
+/// runtime once, when the first session is spawned.
+#[cfg(all(test, windows))]
+fn wait_for_shells_at_test_exit() {
+    unsafe extern "C" {
+        fn atexit(callback: extern "C" fn()) -> i32;
+    }
+    extern "C" fn wait() {
+        let cleanup = wait_for_shell_cleanup(SHUTDOWN_WAIT);
+        if let Some(warning) = cleanup.exit_warning(SHUTDOWN_WAIT) {
+            eprintln!("kegon tests: {warning}");
+        }
+    }
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        // SAFETY: `wait` is a plain `extern "C"` function with no captured state.
+        unsafe { atexit(wait) };
+    });
+}
+
+/// Longest time [`wait_for_shell_cleanup`] is given at exit. A reaped shell takes about 0.5 s at
+/// most (grace period) plus the termination check, and a healthy one is gone in milliseconds.
+pub const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How waiting for the shells of closed sessions ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellCleanup {
+    /// Every shell is gone.
+    Complete,
+    /// The wait ran out while `pending` shells were still being closed or reaped (`unresolved`
+    /// others could not be confirmed gone before).
+    TimedOut { pending: usize, unresolved: usize },
+    /// Nothing is pending, but `unresolved` shells could not be confirmed gone.
+    Unconfirmed { unresolved: usize },
+}
+
+impl ShellCleanup {
+    #[cfg(test)]
+    pub fn is_complete(self) -> bool {
+        self == ShellCleanup::Complete
+    }
+
+    /// The warning to print at exit, if shells may have been left behind. A timeout (shells still
+    /// being closed when the process exits) and a shell that could not be confirmed gone are
+    /// worded differently.
+    pub fn exit_warning(self, timeout: std::time::Duration) -> Option<String> {
+        match self {
+            ShellCleanup::Complete => None,
+            ShellCleanup::TimedOut {
+                pending,
+                unresolved,
+            } => Some(format!(
+                "{pending} shell(s) were still being closed after {timeout:?} and may be left                  running ({unresolved} more could not be confirmed gone)"
+            )),
+            ShellCleanup::Unconfirmed { unresolved } => Some(format!(
+                "{unresolved} shell(s) could not be confirmed gone and may be left running"
+            )),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl From<alacritty_terminal::tty::ShellCleanup> for ShellCleanup {
+    fn from(cleanup: alacritty_terminal::tty::ShellCleanup) -> Self {
+        use alacritty_terminal::tty::ShellCleanup as Fork;
+        match cleanup {
+            Fork::Complete => ShellCleanup::Complete,
+            Fork::TimedOut {
+                pending,
+                unresolved,
+            } => ShellCleanup::TimedOut {
+                pending,
+                unresolved,
+            },
+            Fork::Unconfirmed { unresolved } => ShellCleanup::Unconfirmed { unresolved },
+        }
+    }
+}
+
+/// Waits until the shells of all dropped sessions are gone, terminating the ones that do not
+/// leave by themselves (Windows). Dropping a [`TerminalSession`] only asks its PTY thread to stop;
+/// that thread closes the pseudoconsole and a helper thread reaps the shell, and a process that
+/// exits first ends both. Call this once at the end of `main`, after the UI (and with it every
+/// session) is gone. It returns at once when nothing is pending and does not sleep for a fixed
+/// time. A timeout and an unconfirmed shell are reported as different results (and are logged by
+/// the fork).
+pub fn wait_for_shell_cleanup(timeout: std::time::Duration) -> ShellCleanup {
+    #[cfg(windows)]
+    {
+        alacritty_terminal::tty::wait_for_pending_shells(timeout).into()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = timeout;
+        ShellCleanup::Complete
     }
 }
 
@@ -922,6 +1024,211 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
+    }
+
+    #[test]
+    fn exit_warnings_tell_a_timeout_from_an_unconfirmed_shell() {
+        use std::time::Duration;
+
+        let wait = Duration::from_secs(3);
+        assert_eq!(ShellCleanup::Complete.exit_warning(wait), None);
+        assert!(ShellCleanup::Complete.is_complete());
+
+        let timed_out = ShellCleanup::TimedOut {
+            pending: 2,
+            unresolved: 1,
+        };
+        let unconfirmed = ShellCleanup::Unconfirmed { unresolved: 1 };
+        assert!(!timed_out.is_complete() && !unconfirmed.is_complete());
+
+        let timed_out = timed_out.exit_warning(wait).unwrap();
+        assert!(timed_out.contains("2 shell(s) were still being closed after 3s"));
+        assert!(timed_out.contains("1 more could not be confirmed gone"));
+        let unconfirmed = unconfirmed.exit_warning(wait).unwrap();
+        assert!(unconfirmed.contains("1 shell(s) could not be confirmed gone"));
+        assert!(!unconfirmed.contains("still being closed"));
+    }
+
+    /// Shells and console hosts that are direct children of this test process.
+    #[cfg(windows)]
+    fn own_shell_children() -> usize {
+        let script = format!(
+            "(Get-CimInstance Win32_Process | Where-Object {{ $_.ParentProcessId -eq {} -and $_.Name -in 'cmd.exe','pwsh.exe','conhost.exe' }} | Measure-Object).Count",
+            std::process::id()
+        );
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// Adds the flags that suppress error dialogs to this process's error mode. Shells closed
+    /// right after spawning may fail with `0xC0000142`, which would otherwise show a dialog.
+    #[cfg(windows)]
+    fn suppress_error_dialogs() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SetErrorMode(mode: u32) -> u32;
+        }
+        // SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX, added to the current mode.
+        let previous = unsafe { SetErrorMode(3) };
+        unsafe { SetErrorMode(previous | 3) };
+    }
+
+    /// A session running `program` (with Shell Integration, like a real tab).
+    #[cfg(windows)]
+    fn spawn_tab(
+        program: &str,
+    ) -> (
+        TerminalSession,
+        iced::futures::channel::mpsc::UnboundedReceiver<TerminalEvent>,
+    ) {
+        let launch = Launch::new(
+            crate::terminal::shell::ShellConfig {
+                program: program.to_string(),
+                args: vec![],
+            },
+            true,
+            &local_host_name(),
+            None,
+        );
+        let (tx, rx) = unbounded();
+        (
+            TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx, None).unwrap(),
+            rx,
+        )
+    }
+
+    /// Closes tabs right after spawning them, one at a time and six at once, and checks that no
+    /// shell or console host is left and that closing does not block the caller. Shells closed
+    /// this early may fail with `0xC0000142`, so error dialogs are suppressed for the test
+    /// process.
+    #[cfg(windows)]
+    fn assert_no_shell_survives_immediate_close(program: String) {
+        use std::time::{Duration, Instant};
+
+        suppress_error_dialogs();
+
+        let baseline = own_shell_children();
+        let mut slowest = Duration::ZERO;
+        for _ in 0..10 {
+            let (session, _rx) = spawn_tab(&program);
+            let start = Instant::now();
+            drop(session);
+            slowest = slowest.max(start.elapsed());
+        }
+        let tabs: Vec<_> = (0..6).map(|_| spawn_tab(&program)).collect();
+        let start = Instant::now();
+        drop(tabs);
+        slowest = slowest.max(start.elapsed());
+        assert!(
+            slowest < Duration::from_millis(100),
+            "closing blocked the caller for {slowest:?}"
+        );
+
+        // The reaper gives a shell 500 ms and then confirms the termination; allow far more.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let now = own_shell_children();
+            if now <= baseline {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} shell or console host processes left after the tabs closed (baseline {baseline})",
+                now - baseline
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Run with `cargo test -- --ignored --test-threads=1`: other tests would add child processes.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawns and closes many real shells and inspects the OS process table"]
+    fn cmd_tabs_closed_right_after_spawn_leave_no_process() {
+        assert_no_shell_survives_immediate_close(
+            crate::terminal::shell::installed::cmd().expect("cmd is not installed"),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawns and closes many real shells and inspects the OS process table"]
+    fn pwsh_tabs_closed_right_after_spawn_leave_no_process() {
+        assert_no_shell_survives_immediate_close(
+            crate::terminal::shell::installed::pwsh().expect("pwsh is not installed"),
+        );
+    }
+
+    /// What the app exit relies on: after the tabs were closed, waiting for the cleanup returns
+    /// `true` without a fixed delay, and no shell or console host is left right afterwards. (A
+    /// process that exits without waiting can leave shells behind; that race is measured with
+    /// the real process exit outside of the test harness.)
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "spawns and closes real shells and inspects the OS process table"]
+    fn waiting_for_cleanup_after_closing_tabs_leaves_no_process() {
+        use std::time::{Duration, Instant};
+
+        suppress_error_dialogs();
+        let program = crate::terminal::shell::installed::pwsh().expect("pwsh is not installed");
+        assert!(
+            wait_for_shell_cleanup(SHUTDOWN_WAIT).is_complete(),
+            "shells left over from an earlier test"
+        );
+        let baseline = own_shell_children();
+
+        let tabs: Vec<_> = (0..6).map(|_| spawn_tab(&program)).collect();
+        drop(tabs);
+        let start = Instant::now();
+        assert!(
+            wait_for_shell_cleanup(SHUTDOWN_WAIT).is_complete(),
+            "shells were still pending after {SHUTDOWN_WAIT:?}"
+        );
+        assert!(start.elapsed() < SHUTDOWN_WAIT);
+
+        // Console hosts leave a few milliseconds after their shell.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while own_shell_children() > baseline {
+            assert!(
+                Instant::now() < deadline,
+                "shell or console host processes left after waiting for the cleanup"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// A shell that ends by itself still reports its own exit code; the reaper only acts after
+    /// the session is dropped.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs cmd.exe and ConPTY"]
+    fn natural_exit_reports_the_shell_exit_code() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        let sink = EventSink::from_fn(move |event| {
+            if let TerminalEvent::ChildExit(code) = event {
+                let _ = tx.send(code);
+            }
+        });
+        let launch = Launch::new(
+            crate::terminal::shell::ShellConfig {
+                program: crate::terminal::shell::installed::cmd().expect("cmd is not installed"),
+                args: vec![],
+            },
+            true,
+            &local_host_name(),
+            None,
+        );
+        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, sink, None).unwrap();
+        session.write_input(b"exit 7\r\n".to_vec());
+
+        assert_eq!(rx.recv_timeout(Duration::from_secs(30)).unwrap(), Some(7));
+        assert_eq!(session.exit_code(), Some(7));
     }
 
     /// A scratch directory whose name has spaces and non-ASCII text.

@@ -38,7 +38,7 @@ fn main() -> iced::Result {
 
     let cli_locale_override = options.locale.clone();
 
-    iced::application(
+    let result = iced::application(
         move || {
             Kegon::new(
                 locale,
@@ -60,5 +60,13 @@ fn main() -> iced::Result {
         icon: app_icon::window_icon(),
         ..iced::window::Settings::default()
     })
-    .run()
+    .run();
+
+    // Closing a tab only asks its PTY thread to stop. Without this the process can exit before
+    // the thread closed the pseudoconsole and before a surviving shell was terminated.
+    let cleanup = terminal::wait_for_shell_cleanup(terminal::SHUTDOWN_WAIT);
+    if let Some(warning) = cleanup.exit_warning(terminal::SHUTDOWN_WAIT) {
+        eprintln!("kegon: {warning}");
+    }
+    result
 }

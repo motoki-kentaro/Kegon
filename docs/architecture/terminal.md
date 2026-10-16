@@ -58,7 +58,9 @@ Verified failure path: `CreateProcessW` failing after the pseudoconsole was crea
 
 **Observation, cause unconfirmed**: the occasional +6 handles seen with the reproduction program consist of IRTimer x2, IoCompletion x1, TpWorkerFactory x1 and WaitCompletionPacket x2 (per-object-type census from `--dump-handles`). These are Windows thread-pool objects, which suggests that the OS thread pool used by the exit-wait callbacks grows once and then stays, but this has not been confirmed. When measuring, count these separately from process, file and thread handles.
 
-### Shells outliving a closed tab (open, not fixed in Slice 3)
+### Shells outliving a closed tab (Issue #52)
+
+The observations below were made before the fix; the fix and its measurements follow them.
 
 Dropping the PTY does not always end the shell. Observations on this machine:
 
@@ -67,6 +69,45 @@ Dropping the PTY does not always end the shell. Observations on this machine:
 - GUI dogfood (shells that had been alive for seconds): closing tabs left no shell behind, and no shell remained after closing the last tab.
 - Lifecycle difference: the reproduction program drops the `Pty` synchronously on its main thread; Kegon sends `Msg::Shutdown` and the event-loop thread drops the `Pty` (`ClosePseudoConsole`) asynchronously. In both cases the shell is not terminated explicitly; it relies on the pseudoconsole closing.
 - Hypothesis (not confirmed): a pseudoconsole closed before the shell has attached to the console does not terminate it. A user who opens and instantly closes a tab might be able to trigger this in Kegon. This should be tracked as a separate issue.
+
+**Fix (Issue #52, Slice 3)**: `alacritty_terminal::tty::windows` now keeps a second handle to the directly spawned shell (`ShellReaper`, the last field of `Pty`, so it acts only after `ClosePseudoConsole` and after the pipes are gone). If the shell is already gone when the `Pty` is dropped nothing happens. If it is still alive, the handle moves to a short-lived "ConPTY shell reaper" thread that waits up to 500 ms for the shell to leave on its own and then calls `TerminateProcess` on it (exit code 1) and confirms the exit (at most 2 s more). Kegon itself is unchanged.
+
+- Ownership: the handle is a duplicate of the one `ChildExitWatcher` owns, so the PID cannot be recycled while the reaper lives. If the handle cannot be duplicated, `tty::new` terminates the shell and fails. If the reaper thread cannot be created, the drop reaps synchronously, so the responsibility is never lost.
+- Scope: only the shell Kegon started is terminated. Processes the shell started are not touched; console-attached children end with the pseudoconsole as before, and children detached on purpose (own console) keep running. No Job Object is used.
+- Blocking: `Pty::drop` returns immediately; the wait happens on the reaper thread. In Kegon the drop already runs on the detached PTY thread, never on the UI thread. The 500 ms grace is an initial value measured on one machine, not a universal optimum.
+- Logging: natural exits are logged at debug level (`ConPTY shell pid=N exited Nms after the pseudoconsole closed`), forced terminations at warn level (`... still alive Nms after the pseudoconsole closed; terminated it`). Failures of the wait or of `TerminateProcess` are logged at warn level. Command lines are never logged. Natural exit codes are not altered; `Event::ChildExit` is not emitted by the reaper.
+
+Measurements (Windows 11 25H2, inbox ConPTY, release build, `cmd` and `pwsh` with Kegon's shell integration, hold = time between `tty::new` and closing, error dialogs suppressed with `SetErrorMode`):
+
+| Hold | Trials per shell | Shells left | Console hosts left | Forced terminations (exit code 1) | `0xC0000142` |
+|---|---|---|---|---|---|
+| 300 ms, 50 ms | 20 each | 0 | 0 | 0 | 0 |
+| 10 ms | 20 each | 0 | 0 | 3 | 0 |
+| 0 ms | 20 each | 0 | 0 | 22 | 18 |
+
+- Before the fix, with the same program, 2 of 5 `pwsh` shells closed at 0 ms stayed alive (with their console hosts).
+- `0xC0000142` is a shell that fails to initialize when its console disappears at once. The fix does not prevent it; it makes sure nothing is left behind.
+- The process handle count stayed at +12 to +13 over the baseline for 5, 10 and 20 trials per condition, so it does not grow with the number of tabs.
+- Detached grandchildren: 6 of 6 survived the tab close (as before the fix); console-attached grandchildren all ended.
+
+**Application exit (Issue #52, follow-up)**: closing the last tab (or the window) only sends `Msg::Shutdown`; the detached PTY thread closes the pseudoconsole and the reaper thread terminates a surviving shell. `main` returns right after `iced`'s `run()` (which drops every `TerminalSession` before it returns), so without a wait the process could exit before either thread ran. `main` therefore calls `terminal::wait_for_shell_cleanup(SHUTDOWN_WAIT)` (3 s at most), backed by `alacritty_terminal::tty::wait_for_pending_shells`.
+
+- Every `Pty` counts as pending from before its process is created (the count is reserved ahead of `CreateProcessW`, so a spawn racing with the wait is never overlooked, and released again if creation fails) until its shell is gone (a shell that exited by itself is released at once; a surviving one is released by the reaper thread after the terminate/confirm step). The wait returns as soon as the count is zero. It never sleeps for a fixed time: closing the last tab costs a few milliseconds when nothing has to be reaped and about the 500 ms grace period when a shell has to be terminated. The window is already gone by then.
+- The wait returns `Complete`, `TimedOut { pending, unresolved }` (some `Pty` was not dropped or not reaped yet when the 3 s ran out) or `Unconfirmed { unresolved }` (nothing is pending, but a shell could not be confirmed gone). The fork logs both failures at warn level with the counts; `main` prints a differently worded warning for each (`kegon: N shell(s) were still being closed after 3s ...` / `... could not be confirmed gone ...`). Release builds use the Windows GUI subsystem, so the message is only visible when Kegon is started from a console.
+- Checked on the real `kegon.exe` (instrumented copy, 3 launches and window closes): the `TerminalSession` is dropped on the main thread about 24 ms before `run()` returns, and the wait that follows returns `Complete` at once.
+- The test binary has no `main`, so a `cfg(test)` hook registers the same wait with `atexit` on the first spawned session. Without it, 2 of 4 plain `cargo test` runs left 2-3 `pwsh` + console host pairs behind (the same race as in the app); with it, 3 of 20 runs left one pair (see the last risk below).
+- Synchronous fallback: if the OS refuses to create the reaper thread, the thread that drops the `Pty` reaps the shell itself, with a shortened grace (100 ms) and confirmation (500 ms), so it blocks for 600 ms at most. In Kegon the drop runs on the detached PTY thread, except when `EventLoop::new` fails right after `tty::new` (it then runs on the calling, possibly UI, thread). Dropping a `Pty` is therefore not unconditionally non-blocking; it is non-blocking except in that out-of-resources case.
+
+Measurements of the exit race (Windows 11 25H2, `pwsh` with Kegon's shell integration, 6 tabs spawned and closed at 0 ms, then the process exits at once; 5 runs, survivors counted 3 s later by recorded PID + creation time):
+
+| | Shells left | Console hosts left | Process exit time after the close |
+|---|---|---|---|
+| Without the wait | 4 of 30 (cmd, 5 tabs: 0 of 25; pwsh, 5 tabs: 3 of 25) | same count | ~0.1 ms |
+| With the wait | 0 of 60 (cmd and pwsh) | 0 | ~5-10 ms, or ~510-525 ms when a shell had to be terminated |
+
+The real `kegon.exe` closed through its window (5 runs each, with and without the wait) left nothing behind and exited ~170-200 ms after the close request in both builds; by the time the window exists the startup shell is far past the critical first milliseconds, so this path cannot reproduce the race.
+
+Remaining risks: the 500 ms grace may be too short for a heavily loaded machine (a slow-but-healthy shell would then be terminated instead of closing itself); the headless console host is not tracked per tab, only observed to disappear with the shell; Windows PowerShell 5.1 was not part of the measurements. **A `pwsh` whose termination never completes**: under heavy parallel load (about 90 shells spawned and closed by 8 test threads within 5 s) roughly 1 of 33 forced terminations (the log says `did not exit within 2000ms after TerminateProcess`) left a `pwsh` process with one remaining thread and about 450 open handles (about 70 MB working set each) that cannot be opened or terminated from user mode afterwards and only disappears on reboot; the exit wait then returns `false`. It was seen with `pwsh` only (never `cmd`), never in the low-load measurements above (0 of about 60 forced terminations), and the same state also appeared after a plain `Stop-Process` on an initializing `pwsh` during this investigation, so it is not specific to this code, which cannot influence it. Expect it only when many tabs are closed within milliseconds of opening them.
 
 ### Updating
 
