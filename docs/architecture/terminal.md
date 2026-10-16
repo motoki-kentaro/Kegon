@@ -24,11 +24,11 @@ Kegon depends on a patched fork of `alacritty_terminal` instead of the crates.io
 
 - **Dependency**: Git dependency on `https://github.com/motoki-kentaro/alacritty`, pinned by full commit SHA in `Cargo.toml` (`rev`) and recorded in `Cargo.lock`.
 - **Branch**: `kegon/0.26.0-conpty-fixes`, based on the upstream tag `alacritty_terminal_v0.26.0` (commit `68ca510074ed4000ae5d1b0cba82f5154752e8cf`). The crate version stays `0.26.0` and the only changes are the ConPTY fixes, so the public API and behavior (for example the DA2 reply `2600`) match upstream 0.26.0.
-- **Current pin**: `c3a4ffc2b67d8daeb4b700215f528e9c3865ca94`.
+- **Current pin**: `af8509f9858ab4cd54434b7fbcf293fec7532ca8` (Slice 3: adds initialization-failure cleanup on top of `c3a4ffc2`).
 - **Upstream reference**: the fix was developed against upstream master `29dc55375da817d53540f4caefbe708703c57b07` (kept as `fix/windows-conpty-handle-leaks` in the fork) and then cherry-picked onto 0.26.0 to avoid pulling unreleased upstream changes.
 - **License**: the fork remains Apache-2.0 with the upstream `LICENSE-APACHE` and copyright notices unchanged. Kegon stays MIT. The patch is not submitted upstream.
 
-### Handle leaks found (4 per PTY, all fixed)
+### Handle leaks found (4 per PTY on the normal path, all fixed)
 
 Measured with a standalone reproduction (`GetProcessHandleCount` over repeated create/drop cycles): about +4 handles per PTY on upstream 0.26.0.
 
@@ -41,7 +41,32 @@ Measured with a standalone reproduction (`GetProcessHandleCount` over repeated c
 
 With Slice 1, 10 and 50 iterations (3 runs each) measured +1.00 handle per PTY (only `hProcess` remained). With Slice 2, 10, 50 and 100 iterations measure +0 handles. The `repeated_tab_open_close_does_not_accumulate_resources` test (ignored by default, real shells) fails on growth beyond a fixed slack. If the wait cannot be unregistered, the watcher deliberately leaks its context and handle rather than risk a use-after-free (a warning is logged).
 
-Known remaining issues, tracked separately: the pseudoconsole is not closed on some early error paths of `conpty::new`, and shells can outlive the PTY drop for a while in the reproduction program.
+### Initialization failure cleanup (Slice 3)
+
+`conpty::new` now owns the pseudoconsole (`Conpty`) and the pipe reader/writer threads as soon as they exist, so every early return releases the HPCON, both pipes and their drain threads (locals drop in reverse order: the pseudoconsole closes while the output pipe is still drained, which avoids a deadlock in `ClosePseudoConsole`). An `AttributeListGuard` calls `DeleteProcThreadAttributeList` once `InitializeProcThreadAttributeList` succeeded, including on the success path, where the list was previously never deleted.
+
+Verified failure path: `CreateProcessW` failing after the pseudoconsole was created (a shell program that does not exist).
+
+| Measurement (patched pin, release build, `cmd.exe` unless noted) | Result |
+|---|---|
+| Fork unit tests `failed_process_creation_releases_pseudoconsole` (100 failures) and `successful_creation_and_drop_does_not_leak` (30 cycles) | pass |
+| Reproduction program, nonexistent shell, 100 failures x 3 runs | +0 handles each. Upstream 0.26.0 with the same program: +500 (5 per failure) |
+| Reproduction program, normal path, 10 / 50 / 100 / 200 iterations x 3 runs | +0 in 9 of 12 runs; +6 in 3 of 12 (two of the 100-iteration runs and one of the 200-iteration runs; none at 10 or 50). The +6 is not proportional to the iteration count (100 and 200 iterations give the same +6) |
+| Kegon `repeated_tab_open_close_does_not_accumulate_resources` (real pwsh, 3 + 10 + 50 cycles, then 6 tabs held at once) | handles 153 at baseline, after 10 cycles and after 50 cycles; 201 while 6 extra tabs are open (live resources); 153 after closing them all |
+
+**Unverified failure paths**: failures of `CreatePseudoConsole`, `InitializeProcThreadAttributeList`, `UpdateProcThreadAttribute` and of the exit-wait registration in `ChildExitWatcher::new` could not be induced without fault injection and are covered by code reading only.
+
+**Observation, cause unconfirmed**: the occasional +6 handles seen with the reproduction program consist of IRTimer x2, IoCompletion x1, TpWorkerFactory x1 and WaitCompletionPacket x2 (per-object-type census from `--dump-handles`). These are Windows thread-pool objects, which suggests that the OS thread pool used by the exit-wait callbacks grows once and then stays, but this has not been confirmed. When measuring, count these separately from process, file and thread handles.
+
+### Shells outliving a closed tab (open, not fixed in Slice 3)
+
+Dropping the PTY does not always end the shell. Observations on this machine:
+
+- The reproduction program drops the `Pty` immediately after `tty::new`: about 22-26% of the `cmd.exe` shells were still alive 10 s later (the reproduction program's README records similar residue on upstream 0.26.0; not re-measured in Slice 3). Holding the PTY for 300 ms or 1500 ms before dropping left 0 of 50 alive in both of 2 runs each.
+- Kegon's own repeated-tab test shows the same split: with a 150 ms delay before closing, the child count returns to baseline; with the delay set to 0 ms (temporary experiment, not committed) 18 extra processes remained after 50 cycles, while the handle count stayed flat. Handles and surviving shells are independent problems.
+- GUI dogfood (shells that had been alive for seconds): closing tabs left no shell behind, and no shell remained after closing the last tab.
+- Lifecycle difference: the reproduction program drops the `Pty` synchronously on its main thread; Kegon sends `Msg::Shutdown` and the event-loop thread drops the `Pty` (`ClosePseudoConsole`) asynchronously. In both cases the shell is not terminated explicitly; it relies on the pseudoconsole closing.
+- Hypothesis (not confirmed): a pseudoconsole closed before the shell has attached to the console does not terminate it. A user who opens and instantly closes a tab might be able to trigger this in Kegon. This should be tracked as a separate issue.
 
 ### Updating
 
