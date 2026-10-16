@@ -2502,16 +2502,16 @@ mod tests {
     /// handle count and child processes before and after. Prints every measurement.
     ///
     /// Run with `cargo test repeated_tab_open_close -- --ignored --nocapture`. Child processes
-    /// must return to the baseline exactly. Handles do not: `alacritty_terminal` 0.26 leaks four
-    /// per pseudoconsole on Windows (the child's process and thread handles, and the two pipe
-    /// ends given to `CreatePseudoConsole`; none is closed by its `conpty::new` or
-    /// `ChildExitWatcher`). The handle assertion allows that known rate and catches anything
-    /// faster; the printed numbers show the actual trend.
+    /// must return to the baseline exactly. Handles must too, up to a small fixed slack for OS
+    /// noise (the measuring PowerShell, lazily created runtime handles); the patched
+    /// `alacritty_terminal` closes every handle it opens per pseudoconsole, so any growth that
+    /// scales with the number of tabs fails: 40 more cycles must not add more than the slack.
     #[cfg(windows)]
     #[test]
     #[ignore = "spawns many real shells; measures OS process and handle counts"]
     fn repeated_tab_open_close_does_not_accumulate_resources() {
-        const HANDLES_LEAKED_PER_PTY: usize = 6; // 4 known upstream, plus margin
+        // Fixed allowance for OS noise; deliberately not multiplied by the number of cycles.
+        const HANDLE_SLACK: usize = 8;
         let settle = || std::thread::sleep(std::time::Duration::from_secs(3));
         let mut app = new_test_app(Locale::EnUs);
         let first = active_tab(&app);
@@ -2595,17 +2595,22 @@ mod tests {
             slowest_close < std::time::Duration::from_millis(250),
             "closing a tab blocked the UI thread for {slowest_close:?}"
         );
-        let mut cycles = 0;
-        for ((handles, children), batch) in trend.into_iter().zip([10, 50]) {
-            cycles += batch;
-            assert_eq!(children, base_children, "child processes were left behind");
+        for (handles, children) in &trend {
+            assert_eq!(*children, base_children, "child processes were left behind");
             assert!(
-                handles <= base_handles + HANDLES_LEAKED_PER_PTY * cycles + 30,
-                "handles grew faster than the known upstream leak: {base_handles} -> {handles}                  after {cycles} cycles"
+                *handles <= base_handles + HANDLE_SLACK,
+                "handles grew: {base_handles} -> {handles}"
             );
         }
+        // The slope check: 40 further open/close cycles between the two readings.
         assert!(
-            end_handles <= base_handles + HANDLES_LEAKED_PER_PTY * (cycles + 6) + 30,
+            trend[1].0 <= trend[0].0 + HANDLE_SLACK,
+            "handles grow with the number of tabs: {} after 10 cycles, {} after 50",
+            trend[0].0,
+            trend[1].0
+        );
+        assert!(
+            end_handles <= base_handles + HANDLE_SLACK,
             "handles grew: {base_handles} -> {end_handles}"
         );
     }

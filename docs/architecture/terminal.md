@@ -24,11 +24,11 @@ Kegon depends on a patched fork of `alacritty_terminal` instead of the crates.io
 
 - **Dependency**: Git dependency on `https://github.com/motoki-kentaro/alacritty`, pinned by full commit SHA in `Cargo.toml` (`rev`) and recorded in `Cargo.lock`.
 - **Branch**: `kegon/0.26.0-conpty-fixes`, based on the upstream tag `alacritty_terminal_v0.26.0` (commit `68ca510074ed4000ae5d1b0cba82f5154752e8cf`). The crate version stays `0.26.0` and the only changes are the ConPTY fixes, so the public API and behavior (for example the DA2 reply `2600`) match upstream 0.26.0.
-- **Current pin**: `9825ed254f94c41c3bcd3e1e149a2c40865c25a0`.
+- **Current pin**: `c3a4ffc2b67d8daeb4b700215f528e9c3865ca94`.
 - **Upstream reference**: the fix was developed against upstream master `29dc55375da817d53540f4caefbe708703c57b07` (kept as `fix/windows-conpty-handle-leaks` in the fork) and then cherry-picked onto 0.26.0 to avoid pulling unreleased upstream changes.
 - **License**: the fork remains Apache-2.0 with the upstream `LICENSE-APACHE` and copyright notices unchanged. Kegon stays MIT. The patch is not submitted upstream.
 
-### Handle leaks found (4 per PTY)
+### Handle leaks found (4 per PTY, all fixed)
 
 Measured with a standalone reproduction (`GetProcessHandleCount` over repeated create/drop cycles): about +4 handles per PTY on upstream 0.26.0.
 
@@ -37,9 +37,11 @@ Measured with a standalone reproduction (`GetProcessHandleCount` over repeated c
 | ConPTY input pipe, PTY-side end | Fixed (Slice 1) |
 | ConPTY output pipe, PTY-side end | Fixed (Slice 1) |
 | `hThread` from `CreateProcessW` | Fixed (Slice 1) |
-| `hProcess` held by `ChildExitWatcher` | Open, planned for Slice 2 |
+| `hProcess` held by `ChildExitWatcher` | Fixed (Slice 2): the watcher owns it (`OwnedHandle`), unregisters the wait with `UnregisterWaitEx` (blocking until a running callback returns), then frees the callback context and closes the handle |
 
-With Slice 1, 10 and 50 iterations (3 runs each) measure +1.00 handle per PTY (only `hProcess` remains).
+With Slice 1, 10 and 50 iterations (3 runs each) measured +1.00 handle per PTY (only `hProcess` remained). With Slice 2, 10, 50 and 100 iterations measure +0 handles. The `repeated_tab_open_close_does_not_accumulate_resources` test (ignored by default, real shells) fails on growth beyond a fixed slack. If the wait cannot be unregistered, the watcher deliberately leaks its context and handle rather than risk a use-after-free (a warning is logged).
+
+Known remaining issues, tracked separately: the pseudoconsole is not closed on some early error paths of `conpty::new`, and shells can outlive the PTY drop for a while in the reproduction program.
 
 ### Updating
 
@@ -196,7 +198,7 @@ Responsibilities are split so that other tab kinds can be added without touching
 - **Resize.** All sessions share one viewport, so every running session is resized together; switching tabs needs no resize. Exited sessions are never written to or resized.
 - **Lifecycle.** A shell that exits on its own keeps its tab and shows the exit banner until the tab is closed. `TerminalSession::drop` sends `Msg::Shutdown`; the event loop thread then drops the PTY, which closes the pseudoconsole and ends the child. The UI thread never waits for this.
 
-Known cost: `alacritty_terminal` 0.26 on Windows leaks four handles per pseudoconsole (the child's process and thread handles and the two pipe ends given to `CreatePseudoConsole` are never closed). Child processes do end; only the handles accumulate, about 4 per tab ever opened. Fixing it needs a patched or newer `alacritty_terminal`.
+Upstream `alacritty_terminal` 0.26 leaks four handles per pseudoconsole on Windows; the patched fork pinned by Kegon closes all of them (see "Patched alacritty_terminal"), so handle counts return to baseline after tabs are closed.
 
 ## Shell Integration and Working Directory (Issue #49)
 
