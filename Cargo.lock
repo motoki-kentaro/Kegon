@@ -49,7 +49,7 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.26.0"
-source = "git+https://github.com/motoki-kentaro/alacritty?rev=af8509f9858ab4cd54434b7fbcf293fec7532ca8#af8509f9858ab4cd54434b7fbcf293fec7532ca8"
+source = "git+https://github.com/motoki-kentaro/alacritty?rev=758174acb2bf184cc55f177a56b8cf3292967f9f#758174acb2bf184cc55f177a56b8cf3292967f9f"
 dependencies = [
  "base64",
  "bitflags 2.13.2",

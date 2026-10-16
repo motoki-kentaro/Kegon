@@ -26,9 +26,9 @@ Every direct dependency uses a permissive license. Crates offered under a choice
 
 - **Version**: 0.26.0 (patched fork)
 - **License**: Apache-2.0
-- **Source**: <https://github.com/motoki-kentaro/alacritty> (branch `kegon/0.26.0-conpty-fixes`, commit `af8509f9858ab4cd54434b7fbcf293fec7532ca8`)
+- **Source**: <https://github.com/motoki-kentaro/alacritty> (branch `kegon/0.26.0-conpty-fixes`, commit `758174acb2bf184cc55f177a56b8cf3292967f9f`)
 - **Upstream**: <https://github.com/alacritty/alacritty> (tag `alacritty_terminal_v0.26.0`)
-- **Changes**: fixes Windows ConPTY handle leaks (pipe, thread and process handles), the child-exit wait lifecycle, and the release of the pseudoconsole, pipes and process-thread attribute list when initialization fails, in `tty/windows/conpty.rs` and `tty/windows/child.rs`. The fork keeps the upstream `LICENSE-APACHE` and copyright notices unchanged. See [terminal architecture](docs/architecture/terminal.md#patched-alacritty_terminal-issue-50).
+- **Changes**: fixes Windows ConPTY handle leaks (pipe, thread and process handles), the child-exit wait lifecycle, and the release of the pseudoconsole, pipes and process-thread attribute list when initialization fails, in `tty/windows/conpty.rs` and `tty/windows/child.rs`. It also keeps a handle to the directly spawned shell and terminates only that shell if it is still alive 500 ms after its pseudoconsole was closed, so tabs closed right after opening no longer leave orphaned shells (new file `tty/windows/reaper.rs`, under the same Apache-2.0 license), and adds `tty::wait_for_pending_shells`, which Kegon calls at exit to wait for that cleanup for at most 3 seconds. Processes the shell started, in particular ones detached on purpose, are not terminated. The fork keeps the upstream `LICENSE-APACHE` and copyright notices unchanged. See [terminal architecture](docs/architecture/terminal.md#patched-alacritty_terminal-issue-50).
 
 ### arboard
 
