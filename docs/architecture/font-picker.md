@@ -11,7 +11,7 @@ It is designed to serve both UI font selection and Terminal font selection throu
 
 The Font Picker does **not** persist selections to `settings.toml` directly. It returns a `FontPickerResult` (`Select(FontCandidate)` or `Cancel`) to the caller (`Kegon`), which handles settings persistence and runtime UI font application.
 
-When opened from the Settings Side Bar (`Choose...`), if `ui_font_family` (in UI mode) or `terminal_font_family` (in Terminal mode) is configured in `ApplicationSettings`, the corresponding family candidate is automatically pre-selected and highlighted in the candidate list. If unset or uninstalled, the first candidate is selected by default.
+When opened from the Settings tab (`Choose...`), if `ui_font_family` (in UI mode) or `terminal_font_family` (in Terminal mode) is configured in `ApplicationSettings`, the corresponding family candidate is automatically pre-selected and highlighted in the candidate list. If unset or uninstalled, the first candidate is selected by default.
 
 ---
 

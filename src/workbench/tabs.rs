@@ -15,6 +15,18 @@ pub struct TabId(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TabKind {
     Terminal,
+    Settings,
+}
+
+impl TabKind {
+    /// Whether at most one tab of this kind may exist. Opening a singleton that is already open
+    /// activates the existing tab instead of adding another.
+    pub fn is_singleton(self) -> bool {
+        match self {
+            Self::Terminal => false,
+            Self::Settings => true,
+        }
+    }
 }
 
 /// Metadata common to every tab.
@@ -80,6 +92,14 @@ impl WorkbenchTabs {
 
     pub fn get(&self, id: TabId) -> Option<&WorkbenchTab> {
         self.tabs.iter().find(|tab| tab.id == id)
+    }
+
+    /// The first tab of the given kind, in display order.
+    pub fn find_by_kind(&self, kind: TabKind) -> Option<TabId> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.kind == kind)
+            .map(|tab| tab.id)
     }
 
     pub fn active(&self) -> Option<&WorkbenchTab> {

@@ -154,7 +154,7 @@ Activity Bar
 - **Asset**: Uses `assets/icons/codicons/activity-bar/settings-gear.svg`.
 - **Command**: Activity Bar gear click dispatches stable `CommandId::WorkbenchSettingsOpen` (`workbench.settings.open`).
 - **Minimum Window Layout**: At the minimum logical client size of 640x400, top activity icons and bottom gear remain separated by flexible space without overlap.
-- **Settings Surface**: Clicking Settings displays the Settings panel in the Side Bar area while preserving the main Terminal view. Clicking primary activities (Explorer, Search, Source Control) returns to standard Side Bar views.
+- **Settings Surface**: The Settings gear at the bottom of the Activity Bar opens the Settings tab (a single-instance Special Tab, see `TabKind::Settings`) in the main tab strip, or activates it when it is already open. The Side Bar is not touched. The tab lists the settings by category (General, Appearance, Terminal) in a scrollable page; every control saves immediately through the messages described above.
 
 ## Runtime Theme Switching
 

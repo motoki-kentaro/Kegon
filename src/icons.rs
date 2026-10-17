@@ -84,8 +84,12 @@ pub fn activity_icon(item: ActivityItem) -> svg::Handle {
         ActivityItem::Explorer => EXPLORER.clone(),
         ActivityItem::Search => SEARCH.clone(),
         ActivityItem::Git => GIT.clone(),
-        ActivityItem::Settings => SETTINGS_GEAR.clone(),
     }
+}
+
+/// Returns the icon for the Settings action at the bottom of the Activity Bar.
+pub fn settings_icon() -> svg::Handle {
+    SETTINGS_GEAR.clone()
 }
 
 /// Returns the icon for a dialog kind.

@@ -19,22 +19,20 @@ side-bar-search-title = SEARCH
 side-bar-search-placeholder = Project-wide search is not implemented yet.
 side-bar-git-title = SOURCE CONTROL
 side-bar-git-placeholder = Git integration is not implemented yet.
-side-bar-settings-title = SETTINGS
-side-bar-settings-language-label = Application Language
-side-bar-settings-language-system = System default
-side-bar-settings-cli-override-note = Application language is overridden by --locale for this session.
-side-bar-settings-appearance-title = APPEARANCE
-side-bar-settings-theme-label = Theme
-side-bar-settings-ui-font-label = UI Font
-side-bar-settings-ui-font-system = System default
-side-bar-settings-ui-font-choose = Choose...
-side-bar-settings-ui-font-reset = Reset
-side-bar-settings-ui-font-not-installed = { $family } (not installed)
-side-bar-settings-terminal-font-label = Terminal Font
-side-bar-settings-terminal-font-default = Default
-side-bar-settings-terminal-font-choose = Choose...
-side-bar-settings-terminal-font-reset = Reset
-side-bar-settings-terminal-font-not-installed = { $family } (not installed)
+settings-language-label = Application Language
+settings-language-system = System default
+settings-cli-override-note = Application language is overridden by --locale for this session.
+settings-theme-label = Theme
+settings-ui-font-label = UI Font
+settings-ui-font-system = System default
+settings-ui-font-choose = Choose...
+settings-ui-font-reset = Reset
+settings-ui-font-not-installed = { $family } (not installed)
+settings-terminal-font-label = Terminal Font
+settings-terminal-font-default = Default
+settings-terminal-font-choose = Choose...
+settings-terminal-font-reset = Reset
+settings-terminal-font-not-installed = { $family } (not installed)
 
 
 ## Terminal tab strip
@@ -43,6 +41,18 @@ terminal-tab-default-title = Terminal
 terminal-new-tab-tooltip = New Terminal
 terminal-close-tab-tooltip = Close Terminal
 terminal-process-exited = Process exited with code { $code }.
+
+## Settings tab
+
+settings-tab-title = Settings
+settings-tab-description = Changes are applied immediately and saved automatically.
+settings-category-general-title = General
+settings-category-general-description = Settings that apply to the whole application.
+settings-category-appearance-title = Appearance
+settings-category-appearance-description = Theme and the font used by the interface.
+settings-category-terminal-title = Terminal
+settings-category-terminal-description = How terminal sessions are displayed.
+settings-tab-close-tooltip = Close Settings
 
 ## Main area
 

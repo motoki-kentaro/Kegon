@@ -18,22 +18,20 @@ side-bar-search-title = 検索
 side-bar-search-placeholder = プロジェクト全体の検索はまだ実装されていません。
 side-bar-git-title = ソース管理
 side-bar-git-placeholder = Git 連携はまだ実装されていません。
-side-bar-settings-title = 設定
-side-bar-settings-language-label = 表示言語
-side-bar-settings-language-system = システム設定に従う
-side-bar-settings-cli-override-note = このセッションでは --locale により言語が上書きされています。
-side-bar-settings-appearance-title = 外観
-side-bar-settings-theme-label = テーマ
-side-bar-settings-ui-font-label = UI フォント
-side-bar-settings-ui-font-system = システム標準
-side-bar-settings-ui-font-choose = 選択...
-side-bar-settings-ui-font-reset = リセット
-side-bar-settings-ui-font-not-installed = { $family } (未インストール)
-side-bar-settings-terminal-font-label = ターミナル フォント
-side-bar-settings-terminal-font-default = 標準
-side-bar-settings-terminal-font-choose = 選択...
-side-bar-settings-terminal-font-reset = リセット
-side-bar-settings-terminal-font-not-installed = { $family } (未インストール)
+settings-language-label = 表示言語
+settings-language-system = システム設定に従う
+settings-cli-override-note = このセッションでは --locale により言語が上書きされています。
+settings-theme-label = テーマ
+settings-ui-font-label = UI フォント
+settings-ui-font-system = システム標準
+settings-ui-font-choose = 選択...
+settings-ui-font-reset = リセット
+settings-ui-font-not-installed = { $family } (未インストール)
+settings-terminal-font-label = ターミナル フォント
+settings-terminal-font-default = 標準
+settings-terminal-font-choose = 選択...
+settings-terminal-font-reset = リセット
+settings-terminal-font-not-installed = { $family } (未インストール)
 
 
 ## Terminal tab strip
@@ -42,6 +40,18 @@ terminal-tab-default-title = ターミナル
 terminal-new-tab-tooltip = 新しいターミナル
 terminal-close-tab-tooltip = ターミナルを閉じる
 terminal-process-exited = プロセスがコード { $code } で終了しました。
+
+## Settings tab
+
+settings-tab-title = 設定
+settings-tab-description = 変更はすぐに反映され、自動的に保存されます。
+settings-category-general-title = 一般
+settings-category-general-description = アプリケーション全体に関わる設定です。
+settings-category-appearance-title = 外観
+settings-category-appearance-description = テーマと、インターフェースで使うフォントです。
+settings-category-terminal-title = ターミナル
+settings-category-terminal-description = ターミナルセッションの表示方法です。
+settings-tab-close-tooltip = 設定を閉じる
 
 ## Main area
 

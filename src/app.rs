@@ -20,7 +20,7 @@ use iced::{
 };
 
 use crate::cli::{SmokeConfirmationDialog, SmokeFontPicker};
-use crate::command::{CommandContext, CommandDispatcher, KeybindingResolver, Platform};
+use crate::command::{CommandContext, CommandDispatcher, CommandId, KeybindingResolver, Platform};
 use crate::dialog::{
     ActionTone, ConfirmationDialog, ConfirmationResult, DialogKind, FocusTarget, FocusedAction,
     FontPicker, FontPickerFocus, FontPickerMode, FontPickerResult, render_font_picker_overlay,
@@ -33,7 +33,7 @@ use crate::font::{
 use crate::i18n::{self, FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{
     ICON_SIZE, TAB_ADD_ICON_SIZE, TAB_CLOSE_ICON_SIZE, TAB_SCROLL_ICON_SIZE, activity_icon,
-    tab_add_icon, tab_close_icon, tab_scroll_left_icon, tab_scroll_right_icon,
+    settings_icon, tab_add_icon, tab_close_icon, tab_scroll_left_icon, tab_scroll_right_icon,
 };
 use crate::settings::{
     ApplicationSettings, LocalePreference, ThemePreference, resolve_application_locale,
@@ -57,6 +57,19 @@ const TAB_SCROLL_BUTTON_WIDTH: f32 = 24.0;
 const TAB_SCROLLABLE_ID: &str = "workbench_tab_scrollable";
 const SCROLL_EPSILON: f32 = 1.0;
 const UI_TEXT_SIZE: f32 = 13.0;
+/// Widest the Settings page grows, so lines stay readable on wide windows.
+const SETTINGS_PAGE_MAX_WIDTH: f32 = 560.0;
+
+/// Everything one Activity Bar button needs.
+struct ActivityButton {
+    icon: iced::widget::svg::Handle,
+    label: String,
+    is_active: bool,
+    is_hovered: bool,
+    press: Message,
+    enter: Message,
+    exit: Message,
+}
 
 /// A terminal event tagged with the tab whose session produced it.
 type TabTerminalEvent = (TabId, TerminalEvent);
@@ -139,6 +152,10 @@ pub enum Message {
     ActivitySelected(ActivityItem),
     ActivityHovered(ActivityItem),
     ActivityUnhovered(ActivityItem),
+    /// The Settings gear at the bottom of the Activity Bar: opens (or re-selects) the Settings
+    /// tab. It does not touch the Side Bar.
+    OpenSettingsTab,
+    SettingsGearHovered(bool),
     TabSelected(TabId),
     /// The tab strip's `+` button.
     NewTerminalTab,
@@ -179,6 +196,8 @@ pub struct Kegon {
     resizing_side_bar: bool,
     /// The Activity Bar entry under the pointer, if any.
     hovered_activity: Option<ActivityItem>,
+    /// Whether the pointer is over the Settings gear.
+    settings_gear_hovered: bool,
     /// Terminal sessions (and their titles) by tab. Only the active tab's session receives
     /// input and is drawn; the others keep running in the background.
     terminals: TerminalRegistry,
@@ -305,6 +324,7 @@ impl Kegon {
             workbench,
             resizing_side_bar: false,
             hovered_activity: None,
+            settings_gear_hovered: false,
             terminals,
             terminal_event_tx: tx,
             exit_requested: false,
@@ -461,11 +481,38 @@ impl Kegon {
     }
 
     /// Drops state that belongs to the terminal that was just left or closed, and puts input
-    /// focus on the terminal now shown.
+    /// focus on the terminal now shown. A tab without a terminal (Settings) takes no terminal
+    /// input, so nothing is focused then.
     fn focus_active_terminal(&mut self) {
         self.preedit_text = None;
         self.mouse_dragging_selection = false;
-        self.terminal_focused = true;
+        self.terminal_focused = self.active_terminal().is_some();
+    }
+
+    /// Scrolls the strip to a tab that was just appended and activated.
+    fn follow_new_last_tab(&mut self) {
+        self.pending_tab_scroll_task = Some(TabScrollTask::SnapToEnd);
+        let total_tabs = self.workbench.tabs().len();
+        let base_width = self.tab_strip_base_width();
+        let geometry =
+            calculate_tab_strip_geometry(total_tabs, base_width, self.tab_scroll_offset_x);
+        self.tab_scroll_offset_x = geometry.max_scroll;
+    }
+
+    /// Opens a tab that hosts no terminal (no PTY or session is created) and activates it. A
+    /// singleton kind that is already open is only brought to the front.
+    fn open_special_tab(&mut self, kind: TabKind) -> TabId {
+        let (tab, is_new) = self.workbench.open_special_tab(kind);
+        self.focus_active_terminal();
+        if is_new {
+            self.follow_new_last_tab();
+        } else {
+            let index = self.workbench.tabs().iter().position(|t| t.id == tab);
+            if let Some(index) = index {
+                self.ensure_tab_visible(index);
+            }
+        }
+        tab
     }
 
     /// Opens a terminal in a new last tab and activates it. On failure nothing is left behind:
@@ -520,12 +567,7 @@ impl Kegon {
         }
         self.workbench.select_tab(tab);
         self.focus_active_terminal();
-        self.pending_tab_scroll_task = Some(TabScrollTask::SnapToEnd);
-        let total_tabs = self.workbench.tabs().len();
-        let base_width = self.tab_strip_base_width();
-        let geometry =
-            calculate_tab_strip_geometry(total_tabs, base_width, self.tab_scroll_offset_x);
-        self.tab_scroll_offset_x = geometry.max_scroll;
+        self.follow_new_last_tab();
         Some(tab)
     }
 
@@ -724,6 +766,10 @@ impl Kegon {
     pub fn update(&mut self, message: Message) {
         match message {
             Message::ActivitySelected(item) => self.workbench.select_activity(item),
+            Message::OpenSettingsTab => {
+                self.open_special_tab(TabKind::Settings);
+            }
+            Message::SettingsGearHovered(hovered) => self.settings_gear_hovered = hovered,
             Message::ActivityHovered(item) => self.hovered_activity = Some(item),
             Message::ActivityUnhovered(item) => {
                 if self.hovered_activity == Some(item) {
@@ -984,6 +1030,11 @@ impl Kegon {
                         }
                     }
                     InputRoute::Ime => {}
+                    // Opening a tab also moves focus and the tab strip, which only the
+                    // application can do; the gear takes the same path.
+                    InputRoute::Command(CommandId::WorkbenchSettingsOpen) => {
+                        self.open_special_tab(TabKind::Settings);
+                    }
                     InputRoute::Command(command_id) => {
                         let active_tab = self.workbench.tabs().active().map(|tab| tab.id);
                         CommandDispatcher::dispatch(
@@ -1228,7 +1279,19 @@ impl Kegon {
             .into_iter()
             .map(|item| self.activity_bar_item(item, active));
 
-        let settings_item = self.activity_bar_item(ActivityItem::Settings, active);
+        // The gear is an action, not an activity: it opens the Settings tab and leaves the
+        // Side Bar as it is.
+        let settings_active =
+            self.workbench.tabs().active().map(|tab| tab.kind) == Some(TabKind::Settings);
+        let settings_item = self.activity_button(ActivityButton {
+            icon: settings_icon(),
+            label: self.localizer.text(MessageKey::ActivitySettings),
+            is_active: settings_active,
+            is_hovered: self.settings_gear_hovered,
+            press: Message::OpenSettingsTab,
+            enter: Message::SettingsGearHovered(true),
+            exit: Message::SettingsGearHovered(false),
+        });
 
         let content = column![column(top_items), Space::new().height(Fill), settings_item,];
 
@@ -1241,11 +1304,31 @@ impl Kegon {
     }
 
     fn activity_bar_item(&self, item: ActivityItem, active: ActivityItem) -> Element<'_, Message> {
-        let theme = self.active_theme;
-        let is_active = item == active;
-        let color = activity_icon_color(theme, is_active, self.hovered_activity == Some(item));
+        self.activity_button(ActivityButton {
+            icon: activity_icon(item),
+            label: self.localizer.text(activity_label(item)),
+            is_active: item == active,
+            is_hovered: self.hovered_activity == Some(item),
+            press: Message::ActivitySelected(item),
+            enter: Message::ActivityHovered(item),
+            exit: Message::ActivityUnhovered(item),
+        })
+    }
 
-        let icon = svg(activity_icon(item))
+    fn activity_button(&self, spec: ActivityButton) -> Element<'_, Message> {
+        let ActivityButton {
+            icon,
+            label,
+            is_active,
+            is_hovered,
+            press,
+            enter,
+            exit,
+        } = spec;
+        let theme = self.active_theme;
+        let color = activity_icon_color(theme, is_active, is_hovered);
+
+        let icon = svg(icon)
             .width(ICON_SIZE)
             .height(ICON_SIZE)
             .style(move |_, _| svg::Style { color: Some(color) });
@@ -1265,14 +1348,13 @@ impl Kegon {
             .width(ACTIVITY_BAR_WIDTH - 2.0)
             .height(ACTIVITY_BAR_WIDTH)
             .padding(0)
-            .on_press(Message::ActivitySelected(item))
+            .on_press(press)
             .style(|_, _| button::Style::default());
 
         let entry = mouse_area(row![indicator, entry])
-            .on_enter(Message::ActivityHovered(item))
-            .on_exit(Message::ActivityUnhovered(item));
+            .on_enter(enter)
+            .on_exit(exit);
 
-        let label = self.localizer.text(activity_label(item));
         tooltip(
             entry,
             tooltip_label(label, self.active_ui_font, theme),
@@ -1299,186 +1381,17 @@ impl Kegon {
         .padding([0, 20])
         .align_y(Center);
 
-        let content: Element<'_, Message> = if active_item == ActivityItem::Settings {
-            let label_text = self.settings_label(MessageKey::SideBarSettingsLanguageLabel);
-
-            let options = vec![
-                LocaleOption {
-                    pref: LocalePreference::System,
-                    label: self
-                        .localizer
-                        .text(MessageKey::SideBarSettingsLanguageSystem),
-                },
-                LocaleOption {
-                    pref: LocalePreference::EnUs,
-                    label: String::from("English (United States)"),
-                },
-                LocaleOption {
-                    pref: LocalePreference::JaJp,
-                    label: String::from("日本語"),
-                },
-            ];
-
-            let selected = options
-                .iter()
-                .find(|opt| opt.pref == self.settings.locale)
-                .cloned();
-
-            let picker = self.settings_pick_list(options, selected, |opt| {
-                Message::SettingsLocaleChanged(opt.pref)
-            });
-
-            let mut language_col = column![label_text, picker].spacing(8);
-
-            if self.cli_locale_override.is_some() {
-                let note = text(
-                    self.localizer
-                        .text(MessageKey::SideBarSettingsCliOverrideNote),
-                )
-                .size(11.0)
-                .font(self.active_ui_font)
-                .color(theme.text.muted);
-                language_col = language_col.push(note);
-            }
-
-            let appearance_header = text(
-                self.localizer
-                    .text(MessageKey::SideBarSettingsAppearanceTitle),
-            )
-            .size(11)
-            .font(Font {
-                weight: font::Weight::Bold,
-                ..self.active_ui_font
-            })
-            .color(theme.text.primary);
-
-            let theme_label = self.settings_label(MessageKey::SideBarSettingsThemeLabel);
-            let theme_options: Vec<ThemeOption> =
-                ThemeId::ALL.into_iter().map(ThemeOption).collect();
-            let theme_picker =
-                self.settings_pick_list(theme_options, Some(ThemeOption(theme.id)), |opt| {
-                    Message::SettingsThemeChanged(opt.0)
-                });
-
-            let ui_font_label = self.settings_label(MessageKey::SideBarSettingsUiFontLabel);
-
-            let font_status_text = match &self.ui_font_status {
-                UiFontStatus::SystemDefault => {
-                    self.localizer.text(MessageKey::SideBarSettingsUiFontSystem)
-                }
-                UiFontStatus::Active(family) => family.clone(),
-                UiFontStatus::NotInstalled(family) | UiFontStatus::LoadFailed(family) => {
-                    let mut args = FluentArgs::new();
-                    args.set("family", family.clone());
-                    self.localizer
-                        .text_with(MessageKey::SideBarSettingsUiFontNotInstalled, &args)
-                }
-            };
-
-            let font_status_val = text(font_status_text)
-                .size(UI_TEXT_SIZE)
-                .font(self.active_ui_font)
-                .color(theme.text.muted);
-
-            let choose_btn = button(
-                text(self.localizer.text(MessageKey::SideBarSettingsUiFontChoose))
+        let content: Element<'_, Message> = column![
+            header,
+            container(
+                text(self.localizer.text(placeholder_key))
                     .size(UI_TEXT_SIZE)
-                    .font(self.active_ui_font),
+                    .font(self.active_ui_font)
+                    .color(theme.text.muted)
             )
-            .style(move |_, status| style::secondary_button(theme, status, false))
-            .on_press(Message::SettingsChooseUiFontClicked);
-
-            let mut reset_btn = button(
-                text(self.localizer.text(MessageKey::SideBarSettingsUiFontReset))
-                    .size(UI_TEXT_SIZE)
-                    .font(self.active_ui_font),
-            )
-            .style(move |_, status| style::secondary_button(theme, status, false));
-            if self.settings.appearance.ui_font_family.is_some() {
-                reset_btn = reset_btn.on_press(Message::SettingsResetUiFontClicked);
-            }
-
-            let btn_row = row![choose_btn, reset_btn].spacing(8);
-
-            let theme_col = column![theme_label, theme_picker].spacing(8);
-            let ui_font_col = column![ui_font_label, font_status_val, btn_row].spacing(8);
-
-            let terminal_font_label =
-                self.settings_label(MessageKey::SideBarSettingsTerminalFontLabel);
-
-            let terminal_font_status_text = match &self.terminal_font_config.status {
-                TerminalFontStatus::Default => self
-                    .localizer
-                    .text(MessageKey::SideBarSettingsTerminalFontDefault),
-                TerminalFontStatus::Active(family) => family.clone(),
-                TerminalFontStatus::NotInstalled(family)
-                | TerminalFontStatus::LoadFailed(family) => {
-                    let mut args = FluentArgs::new();
-                    args.set("family", family.clone());
-                    self.localizer
-                        .text_with(MessageKey::SideBarSettingsTerminalFontNotInstalled, &args)
-                }
-            };
-
-            let terminal_font_status_val = text(terminal_font_status_text)
-                .size(UI_TEXT_SIZE)
-                .font(self.active_ui_font)
-                .color(theme.text.muted);
-
-            let choose_terminal_font_btn = button(
-                text(
-                    self.localizer
-                        .text(MessageKey::SideBarSettingsTerminalFontChoose),
-                )
-                .size(UI_TEXT_SIZE)
-                .font(self.active_ui_font),
-            )
-            .style(move |_, status| style::secondary_button(theme, status, false))
-            .on_press(Message::SettingsChooseTerminalFontClicked);
-
-            let mut reset_terminal_font_btn = button(
-                text(
-                    self.localizer
-                        .text(MessageKey::SideBarSettingsTerminalFontReset),
-                )
-                .size(UI_TEXT_SIZE)
-                .font(self.active_ui_font),
-            )
-            .style(move |_, status| style::secondary_button(theme, status, false));
-            if self.settings.appearance.terminal_font_family.is_some() {
-                reset_terminal_font_btn =
-                    reset_terminal_font_btn.on_press(Message::SettingsResetTerminalFontClicked);
-            }
-
-            let terminal_font_btn_row =
-                row![choose_terminal_font_btn, reset_terminal_font_btn].spacing(8);
-
-            let terminal_font_col = column![
-                terminal_font_label,
-                terminal_font_status_val,
-                terminal_font_btn_row
-            ]
-            .spacing(8);
-
-            let appearance_col =
-                column![appearance_header, theme_col, ui_font_col, terminal_font_col].spacing(12);
-
-            let settings_col = column![language_col, Space::new().height(16), appearance_col];
-
-            column![header, container(settings_col).padding([8, 20])].into()
-        } else {
-            column![
-                header,
-                container(
-                    text(self.localizer.text(placeholder_key))
-                        .size(UI_TEXT_SIZE)
-                        .font(self.active_ui_font)
-                        .color(theme.text.muted)
-                )
-                .padding([8, 20]),
-            ]
-            .into()
-        };
+            .padding([8, 20]),
+        ]
+        .into();
 
         container(content)
             .width(self.workbench.side_bar_width())
@@ -1596,6 +1509,8 @@ impl Kegon {
             } else {
                 main_content
             }
+        } else if self.workbench.tabs().active().map(|tab| tab.kind) == Some(TabKind::Settings) {
+            self.settings_tab_view()
         } else {
             let placeholder = column![
                 text(self.localizer.text(MessageKey::MainPlaceholderTitle))
@@ -1619,6 +1534,222 @@ impl Kegon {
         column![tab_strip, terminal_view].width(Fill).into()
     }
 
+    /// Content of the Settings tab: a scrollable page of categories. Every control edits the
+    /// application settings through the existing `Settings*` messages, which save immediately.
+    fn settings_tab_view(&self) -> Element<'_, Message> {
+        let theme = self.active_theme;
+        let label_text = self.settings_label(MessageKey::SettingsLanguageLabel);
+
+        let options = vec![
+            LocaleOption {
+                pref: LocalePreference::System,
+                label: self.localizer.text(MessageKey::SettingsLanguageSystem),
+            },
+            LocaleOption {
+                pref: LocalePreference::EnUs,
+                label: String::from("English (United States)"),
+            },
+            LocaleOption {
+                pref: LocalePreference::JaJp,
+                label: String::from("日本語"),
+            },
+        ];
+
+        let selected = options
+            .iter()
+            .find(|opt| opt.pref == self.settings.locale)
+            .cloned();
+
+        let picker = self.settings_pick_list(options, selected, |opt| {
+            Message::SettingsLocaleChanged(opt.pref)
+        });
+
+        let mut language_col = column![label_text, picker].spacing(8);
+
+        if self.cli_locale_override.is_some() {
+            let note = text(self.localizer.text(MessageKey::SettingsCliOverrideNote))
+                .size(11.0)
+                .font(self.active_ui_font)
+                .color(theme.text.muted);
+            language_col = language_col.push(note);
+        }
+
+        let theme_label = self.settings_label(MessageKey::SettingsThemeLabel);
+        let theme_options: Vec<ThemeOption> = ThemeId::ALL.into_iter().map(ThemeOption).collect();
+        let theme_picker =
+            self.settings_pick_list(theme_options, Some(ThemeOption(theme.id)), |opt| {
+                Message::SettingsThemeChanged(opt.0)
+            });
+
+        let ui_font_label = self.settings_label(MessageKey::SettingsUiFontLabel);
+
+        let font_status_text = match &self.ui_font_status {
+            UiFontStatus::SystemDefault => self.localizer.text(MessageKey::SettingsUiFontSystem),
+            UiFontStatus::Active(family) => family.clone(),
+            UiFontStatus::NotInstalled(family) | UiFontStatus::LoadFailed(family) => {
+                let mut args = FluentArgs::new();
+                args.set("family", family.clone());
+                self.localizer
+                    .text_with(MessageKey::SettingsUiFontNotInstalled, &args)
+            }
+        };
+
+        let font_status_val = text(font_status_text)
+            .size(UI_TEXT_SIZE)
+            .font(self.active_ui_font)
+            .color(theme.text.muted);
+
+        let choose_btn = button(
+            text(self.localizer.text(MessageKey::SettingsUiFontChoose))
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font),
+        )
+        .style(move |_, status| style::secondary_button(theme, status, false))
+        .on_press(Message::SettingsChooseUiFontClicked);
+
+        let mut reset_btn = button(
+            text(self.localizer.text(MessageKey::SettingsUiFontReset))
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font),
+        )
+        .style(move |_, status| style::secondary_button(theme, status, false));
+        if self.settings.appearance.ui_font_family.is_some() {
+            reset_btn = reset_btn.on_press(Message::SettingsResetUiFontClicked);
+        }
+
+        let btn_row = row![choose_btn, reset_btn].spacing(8);
+
+        let theme_col = column![theme_label, theme_picker].spacing(8);
+        let ui_font_col = column![ui_font_label, font_status_val, btn_row].spacing(8);
+
+        let terminal_font_label = self.settings_label(MessageKey::SettingsTerminalFontLabel);
+
+        let terminal_font_status_text = match &self.terminal_font_config.status {
+            TerminalFontStatus::Default => {
+                self.localizer.text(MessageKey::SettingsTerminalFontDefault)
+            }
+            TerminalFontStatus::Active(family) => family.clone(),
+            TerminalFontStatus::NotInstalled(family) | TerminalFontStatus::LoadFailed(family) => {
+                let mut args = FluentArgs::new();
+                args.set("family", family.clone());
+                self.localizer
+                    .text_with(MessageKey::SettingsTerminalFontNotInstalled, &args)
+            }
+        };
+
+        let terminal_font_status_val = text(terminal_font_status_text)
+            .size(UI_TEXT_SIZE)
+            .font(self.active_ui_font)
+            .color(theme.text.muted);
+
+        let choose_terminal_font_btn = button(
+            text(self.localizer.text(MessageKey::SettingsTerminalFontChoose))
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font),
+        )
+        .style(move |_, status| style::secondary_button(theme, status, false))
+        .on_press(Message::SettingsChooseTerminalFontClicked);
+
+        let mut reset_terminal_font_btn = button(
+            text(self.localizer.text(MessageKey::SettingsTerminalFontReset))
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font),
+        )
+        .style(move |_, status| style::secondary_button(theme, status, false));
+        if self.settings.appearance.terminal_font_family.is_some() {
+            reset_terminal_font_btn =
+                reset_terminal_font_btn.on_press(Message::SettingsResetTerminalFontClicked);
+        }
+
+        let terminal_font_btn_row =
+            row![choose_terminal_font_btn, reset_terminal_font_btn].spacing(8);
+
+        let terminal_font_col = column![
+            terminal_font_label,
+            terminal_font_status_val,
+            terminal_font_btn_row
+        ]
+        .spacing(8);
+
+        let heading = text(self.localizer.text(MessageKey::SettingsTabTitle))
+            .size(UI_TEXT_SIZE + 6.0)
+            .font(Font {
+                weight: font::Weight::Bold,
+                ..self.active_ui_font
+            })
+            .color(theme.text.primary);
+        let description = text(self.localizer.text(MessageKey::SettingsTabDescription))
+            .size(UI_TEXT_SIZE)
+            .font(self.active_ui_font)
+            .color(theme.text.muted);
+
+        let general = self.settings_category(
+            MessageKey::SettingsCategoryGeneralTitle,
+            MessageKey::SettingsCategoryGeneralDescription,
+            language_col.into(),
+        );
+        let appearance = self.settings_category(
+            MessageKey::SettingsCategoryAppearanceTitle,
+            MessageKey::SettingsCategoryAppearanceDescription,
+            column![theme_col, ui_font_col].spacing(16).into(),
+        );
+        let terminal = self.settings_category(
+            MessageKey::SettingsCategoryTerminalTitle,
+            MessageKey::SettingsCategoryTerminalDescription,
+            terminal_font_col.into(),
+        );
+
+        let page = column![
+            column![heading, description].spacing(6),
+            general,
+            appearance,
+            terminal
+        ]
+        .spacing(28)
+        .max_width(SETTINGS_PAGE_MAX_WIDTH);
+
+        container(
+            iced::widget::scrollable(container(page).padding(24).width(Fill))
+                .width(Fill)
+                .height(Fill),
+        )
+        .width(Fill)
+        .height(Fill)
+        .style(move |_| workbench_content_style(theme))
+        .into()
+    }
+
+    /// One settings category: a title, a short description, then its controls.
+    fn settings_category<'a>(
+        &'a self,
+        title: MessageKey,
+        description: MessageKey,
+        body: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let theme = self.active_theme;
+        let title = text(self.localizer.text(title))
+            .size(UI_TEXT_SIZE + 2.0)
+            .font(Font {
+                weight: font::Weight::Bold,
+                ..self.active_ui_font
+            })
+            .color(theme.text.primary);
+        let description = text(self.localizer.text(description))
+            .size(UI_TEXT_SIZE)
+            .font(self.active_ui_font)
+            .color(theme.text.muted);
+        let divider = container(Space::new().width(Fill).height(1))
+            .style(move |_| container::Style::default().background(theme.workbench.border));
+
+        column![
+            column![title, description].spacing(4),
+            divider,
+            container(body).padding([4, 0]),
+        ]
+        .spacing(10)
+        .into()
+    }
+
     /// Label of the active terminal tab: the child's title, or the translated default.
     #[cfg(test)]
     fn active_tab_title(&self) -> String {
@@ -1631,11 +1762,23 @@ impl Kegon {
 
     /// Label of a tab: its terminal's title, or the translated default.
     fn tab_title(&self, tab: TabId) -> String {
-        self.terminals
-            .get(tab)
-            .and_then(TerminalEntry::title)
-            .map(str::to_string)
-            .unwrap_or_else(|| self.localizer.text(MessageKey::TerminalTabDefaultTitle))
+        match self.workbench.tabs().get(tab).map(|t| t.kind) {
+            Some(TabKind::Settings) => self.localizer.text(MessageKey::SettingsTabTitle),
+            Some(TabKind::Terminal) | None => self
+                .terminals
+                .get(tab)
+                .and_then(TerminalEntry::title)
+                .map(str::to_string)
+                .unwrap_or_else(|| self.localizer.text(MessageKey::TerminalTabDefaultTitle)),
+        }
+    }
+
+    /// Tooltip of a tab's close button.
+    fn tab_close_tooltip(&self, kind: TabKind) -> String {
+        self.localizer.text(match kind {
+            TabKind::Terminal => MessageKey::TerminalCloseTabTooltip,
+            TabKind::Settings => MessageKey::SettingsTabCloseTooltip,
+        })
     }
 
     fn tab_strip(&self) -> Element<'_, Message> {
@@ -1692,11 +1835,7 @@ impl Kegon {
                 .padding(0)
                 .on_press(Message::TabClosed(tab.id))
                 .style(move |_, status| tab_style(theme, is_active, status)),
-                tooltip_label(
-                    self.localizer.text(MessageKey::TerminalCloseTabTooltip),
-                    self.active_ui_font,
-                    theme,
-                ),
+                tooltip_label(self.tab_close_tooltip(tab.kind), self.active_ui_font, theme),
                 tooltip::Position::Bottom,
             );
 
@@ -2045,7 +2184,6 @@ fn activity_label(item: ActivityItem) -> MessageKey {
         ActivityItem::Explorer => MessageKey::ActivityExplorer,
         ActivityItem::Search => MessageKey::ActivitySearch,
         ActivityItem::Git => MessageKey::ActivityGit,
-        ActivityItem::Settings => MessageKey::ActivitySettings,
     }
 }
 
@@ -2062,10 +2200,6 @@ fn side_bar_text(item: ActivityItem) -> (MessageKey, MessageKey) {
         ActivityItem::Git => (
             MessageKey::SideBarGitTitle,
             MessageKey::SideBarGitPlaceholder,
-        ),
-        ActivityItem::Settings => (
-            MessageKey::SideBarSettingsTitle,
-            MessageKey::SideBarSettingsTitle,
         ),
     }
 }
@@ -2210,7 +2344,7 @@ mod tests {
 
     #[test]
     fn each_activity_has_its_own_messages() {
-        let keys: std::collections::HashSet<_> = ActivityItem::ALL
+        let keys: std::collections::HashSet<_> = ActivityItem::TOP_ITEMS
             .into_iter()
             .flat_map(|item| {
                 let (title, placeholder) = side_bar_text(item);
@@ -2218,7 +2352,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(keys.len(), ActivityItem::ALL.len() * 3 - 1);
+        assert_eq!(keys.len(), ActivityItem::TOP_ITEMS.len() * 3);
     }
 
     #[test]
@@ -2367,9 +2501,31 @@ mod tests {
 
         app.update(Message::ActivitySelected(ActivityItem::Git));
         assert_eq!(app.workbench.active_activity(), ActivityItem::Git);
+    }
 
-        app.update(Message::ActivitySelected(ActivityItem::Settings));
-        assert_eq!(app.workbench.active_activity(), ActivityItem::Settings);
+    #[test]
+    fn settings_gear_opens_the_tab_and_leaves_the_side_bar_alone() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.update(Message::ActivitySelected(ActivityItem::Git));
+        app.update(Message::SashDragged(ACTIVITY_BAR_WIDTH + 300.0));
+        let width = app.workbench.side_bar_width();
+
+        app.update(Message::OpenSettingsTab);
+
+        assert_eq!(app.workbench.active_activity(), ActivityItem::Git);
+        assert_eq!(app.workbench.side_bar_width(), width);
+        assert!(settings_tab_of(&app).is_some());
+    }
+
+    #[test]
+    fn settings_gear_hover_is_tracked_separately_from_activities() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.update(Message::ActivityHovered(ActivityItem::Git));
+        app.update(Message::SettingsGearHovered(true));
+        assert!(app.settings_gear_hovered);
+        assert_eq!(app.hovered_activity, Some(ActivityItem::Git));
+        app.update(Message::SettingsGearHovered(false));
+        assert!(!app.settings_gear_hovered);
     }
 
     #[test]
@@ -2715,6 +2871,105 @@ mod tests {
         assert_eq!(active_tab(&app), b);
         assert!(app.terminal_focused);
         assert_tabs_and_terminals_agree(&app);
+    }
+
+    fn settings_tab_of(app: &Kegon) -> Option<TabId> {
+        app.workbench.tabs().find_by_kind(TabKind::Settings)
+    }
+
+    #[test]
+    fn settings_opens_as_a_tab_without_a_terminal_and_only_once() {
+        let mut app = new_test_app(Locale::EnUs);
+        let terminal = active_tab(&app);
+
+        app.update(Message::OpenSettingsTab);
+        let settings = settings_tab_of(&app).expect("settings tab");
+
+        assert_eq!(tab_order(&app), [terminal, settings]);
+        assert_eq!(active_tab(&app), settings);
+        assert_eq!(
+            app.terminals.len(),
+            1,
+            "settings must not create a PTY session"
+        );
+        assert!(!app.terminals.contains(settings));
+        assert!(app.active_session().is_none());
+        assert!(!app.terminal_focused);
+        assert_eq!(app.tab_title(settings), "Settings");
+
+        // Second open re-selects the existing tab, from wherever the user is.
+        app.update(Message::TabSelected(terminal));
+        assert!(app.terminal_focused);
+        app.update(Message::OpenSettingsTab);
+        assert_eq!(tab_order(&app), [terminal, settings]);
+        assert_eq!(active_tab(&app), settings);
+        assert_eq!(app.terminals.len(), 1);
+    }
+
+    #[test]
+    fn settings_title_is_localized() {
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::OpenSettingsTab);
+        let settings = settings_tab_of(&app).unwrap();
+        assert_eq!(app.tab_title(settings), "設定");
+    }
+
+    #[test]
+    fn switching_between_terminal_and_settings_follows_focus_and_closing_settings_keeps_terminals()
+    {
+        let mut app = new_test_app(Locale::EnUs);
+        let first = active_tab(&app);
+        let second = add_terminal_tab(&mut app);
+        app.update(Message::OpenSettingsTab);
+        let settings = settings_tab_of(&app).unwrap();
+
+        app.update(Message::TabSelected(second));
+        assert!(app.terminal_focused);
+        assert!(app.active_session().is_some());
+        app.update(Message::TabSelected(settings));
+        assert!(!app.terminal_focused);
+        app.update(Message::TabSelected(first));
+        assert!(app.terminal_focused);
+
+        // Closing the active Settings tab selects its left neighbour; both terminals survive.
+        app.update(Message::TabSelected(settings));
+        app.update(Message::TabClosed(settings));
+        assert!(!app.exit_requested);
+        assert_eq!(tab_order(&app), [first, second]);
+        assert_eq!(active_tab(&app), second);
+        assert!(app.terminal_focused);
+        assert_tabs_and_terminals_agree(&app);
+    }
+
+    #[test]
+    fn settings_can_remain_after_the_last_terminal_and_closing_it_exits() {
+        let mut app = new_test_app(Locale::EnUs);
+        let terminal = active_tab(&app);
+        app.update(Message::OpenSettingsTab);
+        let settings = settings_tab_of(&app).unwrap();
+
+        app.update(Message::TabClosed(terminal));
+        assert!(!app.exit_requested, "Settings alone keeps the app running");
+        assert_eq!(app.terminals.len(), 0);
+        assert_eq!(tab_order(&app), [settings]);
+        assert_eq!(active_tab(&app), settings);
+        assert!(!app.terminal_focused);
+
+        // "+" still adds a terminal while only Settings is open.
+        app.update(Message::NewTerminalTab);
+        assert_eq!(app.terminals.len(), 1);
+        let new_terminal = active_tab(&app);
+        assert_eq!(tab_order(&app), [settings, new_terminal]);
+        assert!(app.terminal_focused);
+
+        app.update(Message::TabClosed(new_terminal));
+        assert!(!app.exit_requested);
+        app.update(Message::TabClosed(settings));
+        assert!(
+            app.exit_requested,
+            "the last tab of any kind closes the app"
+        );
+        assert!(app.workbench.tabs().is_empty());
     }
 
     #[test]
@@ -3128,6 +3383,40 @@ mod tests {
         };
         assert_eq!(size(&app, active_tab(&app)), size(&app, second));
         assert_ne!(size(&app, second), (80, 24));
+    }
+
+    #[test]
+    fn settings_changes_reach_every_terminal_and_keep_all_tabs() {
+        use alacritty_terminal::grid::Dimensions;
+
+        let mut settings = ApplicationSettings::default();
+        settings.appearance.terminal_font_family = Some(String::from("Consolas"));
+        let mut app = with_test_settings_path(Kegon::new(Locale::EnUs, settings, None, None, None));
+        let first = active_tab(&app);
+        let second = add_terminal_tab(&mut app);
+        app.update(Message::OpenSettingsTab);
+        let settings_tab = settings_tab_of(&app).unwrap();
+        app.window_size = Size::new(900.0, 500.0);
+
+        app.update(Message::SettingsResetTerminalFontClicked);
+        app.update(Message::SettingsThemeChanged(ThemeId::NightDark));
+        app.update(Message::SettingsLocaleChanged(LocalePreference::JaJp));
+
+        // No session was created, closed, or restarted by changing settings.
+        assert_eq!(tab_order(&app), [first, second, settings_tab]);
+        assert_eq!(app.terminals.len(), 2);
+        assert!(app.terminals.contains(first) && app.terminals.contains(second));
+        assert_eq!(active_tab(&app), settings_tab);
+        let size = |app: &Kegon, tab| {
+            let term = app.terminals.get(tab).unwrap().session().term().lock();
+            (term.columns(), term.screen_lines())
+        };
+        assert_eq!(size(&app, first), size(&app, second));
+        assert_eq!(app.tab_title(settings_tab), "設定");
+
+        // The page renders for both locales at a narrow window.
+        app.window_size = Size::new(360.0, 300.0);
+        let _ = app.view();
     }
 
     #[test]

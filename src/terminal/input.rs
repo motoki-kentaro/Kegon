@@ -18,6 +18,8 @@ pub enum InputAction {
     PasteFromClipboard,
     /// Intercepted application shortcut (e.g. Ctrl+Shift+E).
     WorkbenchShortcut(ActivityItem),
+    /// Open (or re-select) the Settings tab.
+    OpenSettingsTab,
     /// Ignore event (not handled by terminal).
     Ignore,
 }
@@ -97,9 +99,7 @@ pub fn process_key_event_with_resolver(
                 }
             }
             CommandId::TerminalPaste => InputAction::PasteFromClipboard,
-            CommandId::WorkbenchSettingsOpen => {
-                InputAction::WorkbenchShortcut(ActivityItem::Settings)
-            }
+            CommandId::WorkbenchSettingsOpen => InputAction::OpenSettingsTab,
             CommandId::DialogConfirm | CommandId::DialogCancel => InputAction::Ignore,
         },
         InputRoute::Terminal => {

@@ -2,7 +2,7 @@
 
 use super::command_id::CommandId;
 use crate::terminal::{SystemClipboard, TerminalSession, format_paste};
-use crate::workbench::{ActivityItem, Workbench};
+use crate::workbench::{ActivityItem, TabKind, Workbench};
 
 /// Outcome of attempting to dispatch a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +81,7 @@ impl CommandDispatcher {
                 }
             }
             CommandId::WorkbenchSettingsOpen => {
-                workbench.select_activity(ActivityItem::Settings);
+                workbench.open_special_tab(TabKind::Settings);
                 CommandOutcome::Executed
             }
             CommandId::DialogConfirm | CommandId::DialogCancel => CommandOutcome::Ignored,
