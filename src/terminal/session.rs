@@ -15,7 +15,9 @@ use alacritty_terminal::term::Config;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 
-use crate::terminal::cwd::{CwdScanner, local_host_name};
+use crate::terminal::cwd::local_host_name;
+use crate::terminal::integration::Osc133Marker;
+use crate::terminal::osc::{OscEvent, OscScanner};
 use crate::terminal::shell::Launch;
 
 /// State of a terminal session lifecycle.
@@ -39,24 +41,41 @@ pub enum TerminalEvent {
     ChildExit(Option<i32>),
     /// The shell reported its current local working directory (Shell Integration).
     WorkingDirectory(PathBuf),
+    /// Raw OSC 133 shell integration marker.
+    ShellIntegration(Osc133Marker),
 }
 
-/// The PTY with a tap on its output: every read is also scanned for working-directory reports.
+/// The PTY with a tap on its output: every read is scanned for working-directory reports
+/// and OSC 133 shell integration markers.
 ///
-/// `alacritty_terminal` ignores OSC 7, and the event loop owns the only read path, so the tap sits
-/// between the loop and the real PTY. Bytes are passed through unchanged.
+/// `alacritty_terminal` ignores OSC 7, 9;9, and 133, and the event loop owns the only read path,
+/// so the tap sits between the loop and the real PTY. Bytes are passed through unchanged.
 struct TappedPty<P> {
     inner: P,
-    scanner: CwdScanner,
+    scanner: OscScanner,
     sink: EventSink,
 }
 
 impl<P: EventedReadWrite> io::Read for TappedPty<P> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let read = io::Read::read(self.inner.reader(), buf)?;
-        // Only the last report of a read matters: it supersedes the others, and forwarding just
-        // one keeps a flood of reports from flooding the event channel.
-        if let Some(path) = self.scanner.scan(&buf[..read]).pop() {
+        let events = self.scanner.scan(&buf[..read]);
+        let mut last_cwd = None;
+        for event in events {
+            match event {
+                OscEvent::WorkingDirectory(path) => {
+                    last_cwd = Some(path);
+                }
+                OscEvent::ShellIntegration(marker) => {
+                    let _ = self
+                        .sink
+                        .unbounded_send(TerminalEvent::ShellIntegration(marker));
+                }
+            }
+        }
+        // Only the last working directory report of a read matters: it supersedes the others,
+        // and forwarding just one keeps a flood of reports from flooding the event channel.
+        if let Some(path) = last_cwd {
             let _ = self
                 .sink
                 .unbounded_send(TerminalEvent::WorkingDirectory(path));
@@ -261,10 +280,13 @@ pub struct TerminalSession {
     state: Arc<Mutex<SessionState>>,
     window_size: Arc<Mutex<WindowSize>>,
     selection_anchor: Mutex<Option<alacritty_terminal::index::Point>>,
+    shell_program: String,
+    integration_launch: crate::terminal::shell::ShellIntegrationLaunch,
 }
 
 impl TerminalSession {
     /// Spawns a new terminal session with the default shell, in the default directory.
+    #[allow(dead_code)]
     pub fn spawn(
         cols: u16,
         rows: u16,
@@ -277,6 +299,7 @@ impl TerminalSession {
 
     /// Spawns a new terminal session with the default shell, started in `working_directory` when
     /// given. The shell is set up to report its directory (see [`Launch`]).
+    #[allow(dead_code)]
     pub fn spawn_in(
         cols: u16,
         rows: u16,
@@ -287,6 +310,28 @@ impl TerminalSession {
     ) -> Result<Self, String> {
         Self::spawn_launch(
             Launch::resolve_default(),
+            cols,
+            rows,
+            cell_width,
+            cell_height,
+            event_tx,
+            working_directory,
+        )
+    }
+
+    /// Spawns a new terminal session configured according to [`crate::settings::TerminalSettings`].
+    pub fn spawn_with_settings(
+        settings: &crate::settings::TerminalSettings,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+        event_tx: impl Into<EventSink>,
+        working_directory: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let launch = Launch::from_settings(settings, std::env::var("PROMPT").ok().as_deref())?;
+        Self::spawn_launch(
+            launch,
             cols,
             rows,
             cell_width,
@@ -309,6 +354,8 @@ impl TerminalSession {
         #[cfg(all(test, windows))]
         wait_for_shells_at_test_exit();
 
+        let shell_program = launch.config.program.clone();
+        let integration_launch = launch.integration_launch;
         let event_tx = event_tx.into();
         let options = Options {
             drain_on_exit: true,
@@ -329,7 +376,7 @@ impl TerminalSession {
             tty::new(&options, window_size, 0).map_err(|e| format!("Failed to spawn PTY: {e}"))?;
         let pty = TappedPty {
             inner: pty,
-            scanner: CwdScanner::new(local_host_name()),
+            scanner: OscScanner::new(local_host_name()),
             sink: event_tx.clone(),
         };
 
@@ -367,7 +414,19 @@ impl TerminalSession {
             state,
             window_size: shared_window_size,
             selection_anchor: Mutex::new(None),
+            shell_program,
+            integration_launch,
         })
+    }
+
+    /// Returns the executable path or name of the shell running in this session.
+    pub fn shell_program(&self) -> &str {
+        &self.shell_program
+    }
+
+    /// Returns the Shell Integration disposition determined at session launch.
+    pub fn integration_launch(&self) -> crate::terminal::shell::ShellIntegrationLaunch {
+        self.integration_launch
     }
 
     /// Access the underlying locked terminal for rendering and state queries.
@@ -1367,6 +1426,184 @@ mod tests {
         let program = crate::terminal::shell::installed::windows_powershell()
             .expect("Windows PowerShell is not installed");
         assert_shell_reports_directories(program, powershell_cd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a real PowerShell 7 and ConPTY; spawns real shells"]
+    fn pwsh_shell_integration_emits_osc133_markers() {
+        let program = crate::terminal::shell::installed::pwsh().expect("pwsh is not installed");
+        assert_powershell_emits_osc133_markers(program, true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Windows PowerShell 5.1 and ConPTY; spawns real shells"]
+    fn windows_powershell_shell_integration_emits_osc133_markers() {
+        let program = crate::terminal::shell::installed::windows_powershell()
+            .expect("Windows PowerShell is not installed");
+        // Windows PowerShell 5.1 built-in PSReadLine does not load in ConPTY, so command tracking (C/D)
+        // is safely degraded while prompt markers (A/B) and CWD (OSC 7) are emitted.
+        assert_powershell_emits_osc133_markers(program, false);
+    }
+
+    #[cfg(windows)]
+    fn assert_powershell_emits_osc133_markers(program: String, expect_command_markers: bool) {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let start = scratch_dir("pwsh-osc133-start");
+        let (tx, rx) = mpsc::channel();
+        let sink = EventSink::from_fn(move |event| {
+            if let TerminalEvent::ShellIntegration(marker) = event {
+                let _ = tx.send(marker);
+            }
+        });
+        let launch = Launch::new(
+            crate::terminal::shell::ShellConfig {
+                program,
+                args: vec![],
+            },
+            true,
+            &local_host_name(),
+            None,
+        );
+        assert!(launch.integrated);
+        let session =
+            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
+                .unwrap();
+
+        let wait_for_marker = |predicate: Box<dyn Fn(&Osc133Marker) -> bool>, desc: &str| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if let Ok(marker) = rx.recv_timeout(Duration::from_millis(200))
+                    && predicate(&marker)
+                {
+                    return marker;
+                }
+            }
+            panic!("timed out waiting for {desc}");
+        };
+
+        // 1. Initial prompt should emit PromptStarted (A) and InputStarted (B)
+        wait_for_marker(
+            Box::new(|m| matches!(m, Osc133Marker::PromptStarted)),
+            "initial PromptStarted",
+        );
+        wait_for_marker(
+            Box::new(|m| matches!(m, Osc133Marker::InputStarted)),
+            "initial InputStarted",
+        );
+
+        if expect_command_markers {
+            // 2. Run a successful command: cmd.exe /c exit 0
+            session.write_input(b"cmd.exe /c exit 0\r".to_vec());
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::CommandStarted)),
+                "CommandStarted for exit 0",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::CommandFinished(Some(0)))),
+                "CommandFinished(Some(0))",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::PromptStarted)),
+                "PromptStarted after exit 0",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::InputStarted)),
+                "InputStarted after exit 0",
+            );
+
+            // 3. Run a failing command: cmd.exe /c exit 42
+            session.write_input(b"cmd.exe /c exit 42\r".to_vec());
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::CommandStarted)),
+                "CommandStarted for exit 42",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::CommandFinished(Some(42)))),
+                "CommandFinished(Some(42))",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::PromptStarted)),
+                "PromptStarted after exit 42",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::InputStarted)),
+                "InputStarted after exit 42",
+            );
+
+            // 4. Run a failing cmdlet: Get-Item NonExistentPath_Test123
+            // AST detects Get-Item is not an Application, so it must emit CommandFinished(None) (Unknown)
+            // and NOT inherit the stale LASTEXITCODE 42 from the previous command, nor emit false Some(0).
+            session.write_input(b"Get-Item NonExistentPath_Test123\r".to_vec());
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::CommandStarted)),
+                "CommandStarted for Get-Item",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::CommandFinished(None))),
+                "CommandFinished(None) for cmdlet failure",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::PromptStarted)),
+                "PromptStarted after cmdlet failure",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::InputStarted)),
+                "InputStarted after cmdlet failure",
+            );
+
+            // 5. Run a dynamic native invocation: & "cmd.exe" /c exit 17
+            // AST resolves CommandName to cmd.exe and detects Application, emitting CommandFinished(Some(17))
+            session.write_input(b"& \"cmd.exe\" /c exit 17\r".to_vec());
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::CommandStarted)),
+                "CommandStarted for & cmd.exe",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::CommandFinished(Some(17)))),
+                "CommandFinished(Some(17)) for dynamic native invocation",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::PromptStarted)),
+                "PromptStarted after dynamic native failure",
+            );
+            wait_for_marker(
+                Box::new(|m| matches!(m, Osc133Marker::InputStarted)),
+                "InputStarted after dynamic native failure",
+            );
+        }
+
+        // 4. Verify that OSC 133 control sequences do not leak into visible terminal grid
+        let text = {
+            let term = session.term().lock();
+            let grid = term.grid();
+            (0..grid.screen_lines() as i32)
+                .map(|l| {
+                    (0..grid.columns())
+                        .map(|c| {
+                            grid[alacritty_terminal::index::Point::new(
+                                alacritty_terminal::index::Line(l),
+                                alacritty_terminal::index::Column(c),
+                            )]
+                            .c
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            !text.contains("]133;")
+                && !text.contains("133;A")
+                && !text.contains("133;B")
+                && !text.contains("133;C")
+                && !text.contains("133;D"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&start);
     }
 
     #[cfg(windows)]

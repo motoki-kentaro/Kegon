@@ -40,6 +40,22 @@ terminal-tab-default-title = ターミナル
 terminal-new-tab-tooltip = 新しいターミナル
 terminal-close-tab-tooltip = ターミナルを閉じる
 terminal-process-exited = プロセスがコード { $code } で終了しました。
+terminal-tooltip-shell-integration = Shell Integration
+terminal-tooltip-status-active = 有効
+terminal-tooltip-status-active-prompt-only = 有効 (プロンプトのみ)
+terminal-tooltip-status-waiting = 待機中
+terminal-tooltip-status-disabled = 無効
+terminal-tooltip-status-unsupported = 非対応
+terminal-tooltip-status-unavailable = 利用不可
+terminal-tooltip-command-state = コマンド状態
+terminal-tooltip-command-state-unknown = 不明
+terminal-tooltip-command-state-prompt = プロンプト
+terminal-tooltip-command-state-editing = 編集中
+terminal-tooltip-command-state-executing = 実行中
+terminal-tooltip-command-state-finished = 完了
+terminal-tooltip-last-exit-code = 直近の終了コード
+terminal-tooltip-exit-code-unknown = 不明
+terminal-tooltip-exit-code-none = —
 
 ## Settings tab
 
@@ -70,6 +86,23 @@ settings-metric-stored-invalid = settings.toml の値({ $value })は無効なた
 settings-builtin-glyphs-label = 組み込みグリフ
 settings-builtin-glyphs-description = 有効にすると、Unicode の罫線・ブロック文字をフォントではなく専用の図形で描画し、すき間なくセルに接続します。変更はすぐに反映されます。
 settings-builtin-glyphs-stored-invalid = settings.toml の値({ $value })は true / false ではないため、有効として扱われます。設定を変更すると置き換えられます。
+settings-shell-mode-label = シェル
+settings-shell-mode-description = ターミナルセッションで起動するシェルを選択します。
+settings-shell-mode-auto = 自動検出
+settings-shell-mode-custom = 実行ファイルを指定
+settings-shell-path-label = 実行ファイルのパス
+settings-shell-path-placeholder = C:\Program Files\PowerShell\7\pwsh.exe
+settings-shell-integration-label = Shell Integration
+settings-shell-integration-description = 自動の場合、対応シェル(PowerShell)でコマンド実行状態を検出します。無効の場合、Shell Integration を行いません。
+settings-shell-integration-auto = 自動
+settings-shell-integration-disabled = 無効
+settings-shell-new-tab-note = 設定の変更は新しく開いたターミナルタブから反映されます。
+settings-shell-path-empty = パスが入力されていません。
+settings-shell-path-not-absolute = 絶対パスで指定してください (例: C:\...)。
+settings-shell-path-not-found = 指定されたファイルが存在しません。
+settings-shell-path-is-directory = 実行ファイルではなくディレクトリが指定されています。
+settings-shell-path-not-executable = 有効な実行ファイル (.exe) ではありません。
+settings-shell-path-has-arguments = 起動引数は含めず、実行ファイルのパス単体を指定してください。
 settings-tab-close-tooltip = 設定を閉じる
 
 ## Main area
