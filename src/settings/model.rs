@@ -4,7 +4,7 @@ use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Serialize};
 
-use super::numeric::{ExtraKeys, NumericSetting};
+use super::numeric::{BoolSetting, ExtraKeys, NumericSetting};
 use crate::theme::ThemeId;
 
 /// Supported user preferences for application UI language.
@@ -128,6 +128,10 @@ pub struct AppearanceSettings {
     /// Terminal cell width as a multiple of the font size in px. `None` follows the font.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_cell_width: Option<NumericSetting>,
+    /// Draw the Unicode box-drawing and block characters (U+2500..U+259F) with built-in shapes instead of
+    /// the font. `None`, and any value that is not a boolean, means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_builtin_glyphs: Option<BoolSetting>,
     /// Keys of `[appearance]` this build does not know; written back untouched.
     #[serde(flatten)]
     pub extra: ExtraKeys,
@@ -169,6 +173,38 @@ impl TerminalMetric {
 }
 
 impl AppearanceSettings {
+    /// Whether the built-in glyphs are used: on unless the file explicitly says `false`. A value of the
+    /// wrong type counts as on.
+    pub fn builtin_glyphs(&self) -> bool {
+        self.terminal_builtin_glyphs
+            .as_ref()
+            .and_then(BoolSetting::effective)
+            .unwrap_or(true)
+    }
+
+    /// Records the user's choice, replacing whatever was stored, including a value of the wrong type.
+    pub fn set_builtin_glyphs(&mut self, enabled: bool) {
+        self.terminal_builtin_glyphs = Some(BoolSetting::Value(enabled));
+    }
+
+    /// Removes the key: the built-in glyphs go back to their default (on).
+    pub fn clear_builtin_glyphs(&mut self) {
+        self.terminal_builtin_glyphs = None;
+    }
+
+    /// Whether the file has a key for the built-in glyphs at all (valid or not).
+    pub fn has_builtin_glyphs_key(&self) -> bool {
+        self.terminal_builtin_glyphs.is_some()
+    }
+
+    /// The stored value when it is not a boolean and is therefore ignored.
+    pub fn invalid_builtin_glyphs_text(&self) -> Option<String> {
+        self.terminal_builtin_glyphs
+            .as_ref()
+            .filter(|setting| setting.effective().is_none())
+            .map(BoolSetting::describe)
+    }
+
     fn metric_slot(&self, metric: TerminalMetric) -> &Option<NumericSetting> {
         match metric {
             TerminalMetric::FontSize => &self.terminal_font_size,
@@ -218,9 +254,15 @@ impl AppearanceSettings {
 
     /// Warnings for every ignored metric value (the file is left as it is).
     pub fn metric_diagnostics(&self) -> Vec<String> {
-        TerminalMetric::ALL
+        let builtin = self.invalid_builtin_glyphs_text().map(|raw| {
+            format!(
+                "invalid terminal_builtin_glyphs = {raw} in settings (expected true or false); \
+                 treating it as true (the setting is kept as is)"
+            )
+        });
+        builtin
             .into_iter()
-            .filter_map(|metric| {
+            .chain(TerminalMetric::ALL.into_iter().filter_map(|metric| {
                 let raw = self.invalid_metric_text(metric)?;
                 let range = metric.range();
                 Some(format!(
@@ -230,7 +272,7 @@ impl AppearanceSettings {
                     range.start(),
                     range.end()
                 ))
-            })
+            }))
             .collect()
     }
 }

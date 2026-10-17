@@ -83,6 +83,11 @@ impl<V: Clone> TileCache<V> {
         value
     }
 
+    /// Drops every tile (they are built again when next drawn).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
@@ -197,5 +202,23 @@ mod tests {
             1
         });
         assert!(!rebuilt);
+    }
+
+    #[test]
+    fn clear_drops_every_tile_and_they_are_built_again_on_demand() {
+        let mut cache = TileCache::default();
+        for width in 0..10 {
+            cache.get_or_insert_with(key(width), || width);
+        }
+        assert_eq!(cache.len(), 10);
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        let mut rebuilt = false;
+        cache.get_or_insert_with(key(3), || {
+            rebuilt = true;
+            3
+        });
+        assert!(rebuilt);
+        assert_eq!(cache.len(), 1);
     }
 }

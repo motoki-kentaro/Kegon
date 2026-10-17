@@ -68,6 +68,9 @@ settings-metric-apply = Apply
 settings-metric-reset = Reset
 settings-metric-range-error = Enter a number from { $min } to { $max }.
 settings-metric-stored-invalid = The value in settings.toml ({ $value }) is not valid and is ignored. Applying a new value replaces it.
+settings-builtin-glyphs-label = Built-in Glyphs
+settings-builtin-glyphs-description = When on, Unicode box-drawing and block characters are drawn as dedicated shapes instead of with the font, so they join the cell grid without gaps. Applies at once.
+settings-builtin-glyphs-stored-invalid = The value in settings.toml ({ $value }) is not true or false and is treated as on. Changing the setting replaces it.
 settings-tab-close-tooltip = Close Settings
 
 ## Main area

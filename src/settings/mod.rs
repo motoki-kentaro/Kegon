@@ -10,7 +10,7 @@ pub use model::{
     AppearanceSettings, ApplicationSettings, LocalePreference, TerminalMetric, ThemePreference,
 };
 #[allow(unused_imports)]
-pub use numeric::NumericSetting;
+pub use numeric::{BoolSetting, NumericSetting};
 #[allow(unused_imports)]
 pub use path::{default_settings_dir, default_settings_file_path};
 pub use precedence::resolve_application_locale;
@@ -603,6 +603,83 @@ mod tests {
             reloaded.appearance.metric(TerminalMetric::FontSize),
             Some(12.0)
         );
+    }
+
+    #[test]
+    fn built_in_glyphs_default_to_on_and_old_files_do_not_gain_the_key() {
+        let (settings, warning) = load_str(
+            "glyphs_legacy",
+            "locale = \"en-US\"
+
+[appearance]
+theme = \"night-dark\"
+",
+        );
+        assert!(warning.is_none());
+        assert!(settings.appearance.builtin_glyphs());
+        assert!(!settings.appearance.has_builtin_glyphs_key());
+        assert!(settings.appearance.invalid_builtin_glyphs_text().is_none());
+        let text = save_and_read(&settings, "glyphs_legacy_save");
+        assert!(!text.contains("terminal_builtin_glyphs"), "{text}");
+        assert!(ApplicationSettings::default().appearance.builtin_glyphs());
+    }
+
+    #[test]
+    fn built_in_glyphs_true_and_false_round_trip() {
+        for value in [true, false] {
+            let mut settings = ApplicationSettings::default();
+            settings.appearance.set_builtin_glyphs(value);
+            let text = save_and_read(&settings, "glyphs_round_trip");
+            assert!(
+                text.contains(&format!("terminal_builtin_glyphs = {value}")),
+                "{text}"
+            );
+            let (reloaded, warning) = load_str("glyphs_round_trip_load", &text);
+            assert!(warning.is_none(), "{text}");
+            assert_eq!(reloaded.appearance.builtin_glyphs(), value);
+            assert!(reloaded.appearance.invalid_builtin_glyphs_text().is_none());
+            assert!(reloaded.appearance.metric_diagnostics().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_built_in_glyphs_value_of_the_wrong_type_counts_as_on_and_survives_saving() {
+        for bad in ["\"false\"", "0", "1", "\"\"", "[false]", "{ a = 1 }", "2.5"] {
+            let content = format!(
+                "[appearance]
+terminal_builtin_glyphs = {bad}
+future = 1
+"
+            );
+            let (mut settings, warning) = load_str("glyphs_bad", &content);
+            assert!(warning.is_none(), "{bad}: the file still loads");
+            assert!(settings.appearance.builtin_glyphs(), "{bad}: treated as on");
+            assert!(settings.appearance.has_builtin_glyphs_key(), "{bad}");
+            assert!(
+                settings.appearance.invalid_builtin_glyphs_text().is_some(),
+                "{bad}"
+            );
+            assert_eq!(settings.appearance.metric_diagnostics().len(), 1, "{bad}");
+
+            settings.locale = LocalePreference::EnUs;
+            let text = save_and_read(&settings, "glyphs_bad_save");
+            let (reloaded, warning) = load_str("glyphs_bad_reload", &text);
+            assert!(warning.is_none(), "{bad}: {text}");
+            assert!(text.contains("future = 1"), "{text}");
+            assert_eq!(
+                reloaded.appearance.invalid_builtin_glyphs_text(),
+                settings.appearance.invalid_builtin_glyphs_text(),
+                "{bad}: kept as written"
+            );
+
+            settings.appearance.set_builtin_glyphs(false);
+            assert!(settings.appearance.invalid_builtin_glyphs_text().is_none());
+            let text = save_and_read(&settings, "glyphs_bad_replace");
+            assert!(text.contains("terminal_builtin_glyphs = false"), "{text}");
+            settings.appearance.clear_builtin_glyphs();
+            let text = save_and_read(&settings, "glyphs_bad_clear");
+            assert!(!text.contains("terminal_builtin_glyphs"), "{text}");
+        }
     }
 
     fn tempfile_dir(prefix: &str) -> std::path::PathBuf {

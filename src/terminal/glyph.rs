@@ -875,6 +875,25 @@ fn box_rects(connections: &Connections, grid: &CellGrid, cell: Rect) -> GlyphRec
 /// Room for the overlapping rectangles a glyph is built from before they are merged.
 const PARTS_CAP: usize = 16;
 
+/// A built-in drawing of one character, whichever of the three methods it uses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BuiltinGlyph {
+    /// Filled rectangles: blocks, box-drawing lines and dashes.
+    Rects(GlyphRects),
+    /// Curves and diagonals.
+    Paths(GlyphPaths),
+    /// A shade: a tiled pattern.
+    Shade(ShadeCell),
+}
+
+/// The built-in drawing of `ch` in the cell at (`col`, `line`), or `None` when the font draws it.
+pub fn builtin_glyph(ch: char, grid: &CellGrid, col: i32, line: i32) -> Option<BuiltinGlyph> {
+    glyph_rects(ch, grid, col, line)
+        .map(BuiltinGlyph::Rects)
+        .or_else(|| glyph_paths(ch, grid, col, line).map(BuiltinGlyph::Paths))
+        .or_else(|| glyph_shade(ch, grid, col, line).map(BuiltinGlyph::Shade))
+}
+
 /// Builds the dashes of a dashed line.
 ///
 /// Along the line the cell's `length` physical pixels are cut into `count` equal segments at

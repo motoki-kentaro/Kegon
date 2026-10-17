@@ -61,29 +61,6 @@ const UI_TEXT_SIZE: f32 = 13.0;
 /// Widest the Settings page grows, so lines stay readable on wide windows.
 const SETTINGS_PAGE_MAX_WIDTH: f32 = 560.0;
 
-/// Environment switches for verifying the built-in glyph drawing against the font drawing.
-/// `KEGON_BUILTIN_GLYPHS=0` draws every block element with the font; `KEGON_ALIGN_BACKGROUNDS=1`
-/// also snaps cell backgrounds to physical pixels (on by default whenever the built-in glyphs are
-/// on, so shapes and backgrounds share their edges). Both are temporary and meant to go once the
-/// setting exists.
-const BUILTIN_GLYPHS_ENV: &str = "KEGON_BUILTIN_GLYPHS";
-const ALIGN_BACKGROUNDS_ENV: &str = "KEGON_ALIGN_BACKGROUNDS";
-
-fn env_flag(name: &str, default: bool) -> bool {
-    flag_value(std::env::var(name).ok().as_deref(), default)
-}
-
-/// `0`, `false`, `off` and `no` (any case) mean off, any other value means on, no value is `default`.
-fn flag_value(value: Option<&str>, default: bool) -> bool {
-    match value {
-        Some(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        None => default,
-    }
-}
-
 /// Everything one Activity Bar button needs.
 struct ActivityButton {
     icon: iced::widget::svg::Handle,
@@ -323,6 +300,10 @@ pub enum Message {
     SettingsMetricApply(TerminalMetric),
     /// The Reset button of a terminal metric field.
     SettingsMetricReset(TerminalMetric),
+    /// The Built-in Glyphs checkbox (saved and applied at once).
+    SettingsBuiltinGlyphsToggled(bool),
+    /// The Reset button of the Built-in Glyphs setting: removes the key (default: on).
+    SettingsBuiltinGlyphsReset,
     FontPickerSearchChanged(String),
     FontPickerMonospaceToggled(bool),
     FontPickerCandidateSelected(usize),
@@ -344,10 +325,6 @@ pub struct Kegon {
     metric_drafts: Option<MetricDrafts>,
     /// Window scale factor (physical pixels per logical pixel); 1.0 until the window reports it.
     scale_factor: f32,
-    /// Internal verification switch: draw supported block elements as rectangles.
-    builtin_glyphs: bool,
-    /// Internal verification switch: align cell backgrounds to physical pixels as well.
-    align_backgrounds: bool,
     /// Terminal sessions (and their titles) by tab. Only the active tab's session receives
     /// input and is drawn; the others keep running in the background.
     terminals: TerminalRegistry,
@@ -470,7 +447,6 @@ impl Kegon {
 
         let active_theme = resolve_theme(settings.appearance.theme.effective_id());
 
-        let builtin_glyphs = env_flag(BUILTIN_GLYPHS_ENV, true);
         let mut app = Self {
             localizer: Localizer::new(locale),
             workbench,
@@ -479,8 +455,6 @@ impl Kegon {
             settings_gear_hovered: false,
             metric_drafts: None,
             scale_factor: 1.0,
-            builtin_glyphs,
-            align_backgrounds: env_flag(ALIGN_BACKGROUNDS_ENV, builtin_glyphs),
             terminals,
             terminal_event_tx: tx,
             exit_requested: false,
@@ -676,6 +650,40 @@ impl Kegon {
         updated.appearance.set_metric(metric, None);
         self.commit_settings(updated);
         self.apply_terminal_font_preference();
+    }
+
+    /// Saves the Built-in Glyphs choice and applies it at once. Nothing else changes: the terminal
+    /// sessions, the unapplied metric drafts and the grid size are left alone, and the next frame is
+    /// drawn the other way.
+    fn set_builtin_glyphs(&mut self, enabled: bool) {
+        if self.settings.appearance.terminal_builtin_glyphs
+            == Some(crate::settings::BoolSetting::Value(enabled))
+        {
+            return;
+        }
+        let mut updated = self.settings.clone();
+        updated.appearance.set_builtin_glyphs(enabled);
+        self.commit_settings(updated);
+        self.builtin_glyphs_changed();
+    }
+
+    /// Removes the Built-in Glyphs key, which means the default (on), also replacing an ignored value.
+    fn reset_builtin_glyphs(&mut self) {
+        if !self.settings.appearance.has_builtin_glyphs_key() {
+            return;
+        }
+        let mut updated = self.settings.clone();
+        updated.appearance.clear_builtin_glyphs();
+        self.commit_settings(updated);
+        self.builtin_glyphs_changed();
+    }
+
+    /// Frees the shade tiles when the built-in glyphs are off (nothing draws them then); they are built
+    /// again on demand when the setting is turned back on.
+    fn builtin_glyphs_changed(&mut self) {
+        if !self.settings.appearance.builtin_glyphs() {
+            crate::terminal::renderer::clear_shade_tiles();
+        }
     }
 
     /// Records the window scale factor; a value that is not a positive finite number is ignored.
@@ -1096,6 +1104,8 @@ impl Kegon {
             }
             Message::SettingsMetricApply(metric) => self.apply_metric_draft(metric),
             Message::SettingsMetricReset(metric) => self.reset_metric(metric),
+            Message::SettingsBuiltinGlyphsToggled(enabled) => self.set_builtin_glyphs(enabled),
+            Message::SettingsBuiltinGlyphsReset => self.reset_builtin_glyphs(),
             Message::FontPickerSearchChanged(query) => {
                 if let Some(picker) = self.font_picker.as_mut() {
                     picker.set_search_query(query);
@@ -1745,6 +1755,64 @@ impl Kegon {
         field.into()
     }
 
+    /// The Built-in Glyphs row of the Settings tab: a checkbox that saves and applies at once, its
+    /// description, a Reset button, and a note when the file holds a value that is not a boolean.
+    fn settings_builtin_glyphs_field(&self) -> Element<'_, Message> {
+        let theme = self.active_theme;
+        let appearance = &self.settings.appearance;
+        let small = |content: String, color: Color| {
+            text(content)
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font)
+                .color(color)
+        };
+        let inset = theme.workbench.background;
+        let checkbox = iced::widget::checkbox(appearance.builtin_glyphs())
+            .label(self.localizer.text(MessageKey::SettingsBuiltinGlyphsLabel))
+            .on_toggle(Message::SettingsBuiltinGlyphsToggled)
+            .size(16)
+            .text_size(UI_TEXT_SIZE)
+            .font(self.active_ui_font)
+            .style(move |_, _| iced::widget::checkbox::Style {
+                background: inset.into(),
+                icon_color: theme.text.emphasis,
+                border: iced::Border {
+                    color: theme.workbench.border,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                text_color: Some(theme.text.primary),
+            });
+        let mut reset = button(
+            text(self.localizer.text(MessageKey::SettingsMetricReset))
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font),
+        )
+        .style(move |_, status| style::secondary_button(theme, status, false));
+        if appearance.has_builtin_glyphs_key() {
+            reset = reset.on_press(Message::SettingsBuiltinGlyphsReset);
+        }
+        let mut field = column![
+            row![checkbox, reset].spacing(16).align_y(Center),
+            small(
+                self.localizer
+                    .text(MessageKey::SettingsBuiltinGlyphsDescription),
+                theme.text.muted,
+            ),
+        ]
+        .spacing(6);
+        if let Some(raw) = appearance.invalid_builtin_glyphs_text() {
+            let mut args = FluentArgs::new();
+            args.set("value", raw);
+            field = field.push(small(
+                self.localizer
+                    .text_with(MessageKey::SettingsBuiltinGlyphsStoredInvalid, &args),
+                theme.semantic.destructive,
+            ));
+        }
+        field.into()
+    }
+
     /// A label above a settings control.
     fn settings_label(&self, key: MessageKey) -> Element<'_, Message> {
         text(self.localizer.text(key))
@@ -1814,8 +1882,7 @@ impl Kegon {
                 colors: &theme.terminal,
                 font_config: &self.terminal_font_config,
                 scale_factor: self.scale_factor,
-                builtin_glyphs: self.builtin_glyphs,
-                align_backgrounds: self.align_backgrounds,
+                builtin_glyphs: self.settings.appearance.builtin_glyphs(),
             };
 
             let canvas_widget = Canvas::new(canvas_program).width(Fill).height(Fill);
@@ -2049,6 +2116,7 @@ impl Kegon {
                 self.settings_metric_field(TerminalMetric::FontSize),
                 self.settings_metric_field(TerminalMetric::CellHeight),
                 self.settings_metric_field(TerminalMetric::CellWidth),
+                self.settings_builtin_glyphs_field(),
             ]
             .spacing(16)
             .into(),
@@ -4070,6 +4138,201 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- Built-in Glyphs setting ---
+
+    #[test]
+    fn built_in_glyphs_are_on_by_default_and_the_toggle_saves_and_applies_at_once() {
+        let mut app = new_test_app(Locale::EnUs);
+        assert!(app.settings.appearance.builtin_glyphs(), "unset means on");
+        let first = active_tab(&app);
+        let second = add_terminal_tab(&mut app);
+        app.update(Message::OpenSettingsTab);
+        app.window_size = Size::new(1200.0, 760.0);
+        app.resize_terminal_view();
+        let (cols, rows) = app.terminal_grid_size();
+        let pty_sizes = |app: &Kegon| {
+            [first, second].map(|tab| app.terminals.get(tab).unwrap().session().pty_size())
+        };
+        let before = pty_sizes(&app);
+        // An unapplied metric draft must survive the toggle.
+        type_draft(&mut app, TerminalMetric::FontSize, "12");
+
+        app.update(Message::SettingsBuiltinGlyphsToggled(false));
+        assert!(!app.settings.appearance.builtin_glyphs());
+        let text = saved_text(&app).expect("saved at once");
+        assert!(text.contains("terminal_builtin_glyphs = false"), "{text}");
+        assert_eq!(app.terminal_grid_size(), (cols, rows), "no metric changed");
+        assert_eq!(pty_sizes(&app), before, "no PTY was resized or recreated");
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(
+            app.metric_drafts
+                .as_ref()
+                .unwrap()
+                .get(TerminalMetric::FontSize),
+            "12",
+            "the unapplied draft is kept"
+        );
+        assert_eq!(
+            app.settings.appearance.metric(TerminalMetric::FontSize),
+            None
+        );
+        let _ = app.view(); // draws in both states
+
+        app.update(Message::SettingsBuiltinGlyphsToggled(true));
+        assert!(app.settings.appearance.builtin_glyphs());
+        let text = saved_text(&app).unwrap();
+        assert!(text.contains("terminal_builtin_glyphs = true"), "{text}");
+        let _ = app.view();
+
+        // Reset removes the key, which is the default (on).
+        app.update(Message::SettingsBuiltinGlyphsToggled(false));
+        app.update(Message::SettingsBuiltinGlyphsReset);
+        assert!(app.settings.appearance.builtin_glyphs());
+        let text = saved_text(&app).unwrap();
+        assert!(!text.contains("terminal_builtin_glyphs"), "{text}");
+        // Resetting an absent key changes nothing and writes nothing new.
+        let before = saved_text(&app);
+        app.update(Message::SettingsBuiltinGlyphsReset);
+        assert_eq!(saved_text(&app), before);
+    }
+
+    #[test]
+    fn the_choice_survives_a_restart_and_old_files_mean_on() {
+        let dir = std::env::temp_dir().join(format!("kegon_glyphs_restart_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.toml");
+        // A file written before the setting existed.
+        std::fs::write(
+            &path,
+            "locale = \"en-US\"\n\n[appearance]\ntheme = \"night-dark\"\nterminal_font_size = 12.0\n",
+        )
+        .unwrap();
+        let (settings, warning) = crate::settings::load_settings(Some(&path));
+        assert!(warning.is_none());
+        let mut app = app_with_settings(settings);
+        app.settings_path = Some(path.clone());
+        assert!(app.settings.appearance.builtin_glyphs());
+        // Saving something else does not invent the key.
+        app.update(Message::SettingsLocaleChanged(LocalePreference::JaJp));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("terminal_builtin_glyphs"), "{text}");
+        assert!(text.contains("terminal_font_size = 12.0"), "{text}");
+
+        app.update(Message::SettingsBuiltinGlyphsToggled(false));
+        // "Restart": a new application from what is on disk.
+        let (settings, warning) = crate::settings::load_settings(Some(&path));
+        assert!(warning.is_none());
+        let restarted = app_with_settings(settings);
+        assert!(!restarted.settings.appearance.builtin_glyphs());
+        assert_eq!(
+            restarted
+                .settings
+                .appearance
+                .metric(TerminalMetric::FontSize),
+            Some(12.0),
+            "other settings are untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_counts_as_on_and_is_kept_until_the_user_decides() {
+        let dir = std::env::temp_dir().join(format!("kegon_glyphs_invalid_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.toml");
+        for bad in ["\"no\"", "0", "[true]", "1.5"] {
+            std::fs::write(
+                &path,
+                format!("[appearance]\nterminal_builtin_glyphs = {bad}\nfuture_key = 1\n"),
+            )
+            .unwrap();
+            let (settings, warning) = crate::settings::load_settings(Some(&path));
+            assert!(warning.is_none(), "{bad}");
+            let mut app = app_with_settings(settings);
+            app.settings_path = Some(path.clone());
+            assert!(
+                app.settings.appearance.builtin_glyphs(),
+                "{bad}: counts as on"
+            );
+            assert!(
+                app.settings
+                    .appearance
+                    .invalid_builtin_glyphs_text()
+                    .is_some()
+            );
+            assert!(
+                app.settings
+                    .appearance
+                    .metric_diagnostics()
+                    .iter()
+                    .any(|d| d.contains("terminal_builtin_glyphs")),
+                "{bad}"
+            );
+            for locale in [Locale::EnUs, Locale::JaJp] {
+                app.localizer = Localizer::new(locale);
+                app.update(Message::OpenSettingsTab);
+                let _ = app.view();
+            }
+
+            // Saving something else keeps the original value and the unknown key.
+            app.update(Message::SettingsLocaleChanged(LocalePreference::EnUs));
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.contains("terminal_builtin_glyphs"), "{bad}: {text}");
+            assert!(text.contains("future_key = 1"), "{text}");
+            assert!(
+                !text.contains("terminal_builtin_glyphs = true"),
+                "{bad}: {text}"
+            );
+
+            // The user's explicit choice replaces it with a real boolean.
+            app.update(Message::SettingsBuiltinGlyphsToggled(false));
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains("terminal_builtin_glyphs = false"),
+                "{bad}: {text}"
+            );
+            assert!(text.contains("future_key = 1"), "{text}");
+            assert!(
+                app.settings
+                    .appearance
+                    .invalid_builtin_glyphs_text()
+                    .is_none()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggling_to_the_value_already_set_writes_nothing() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.update(Message::SettingsBuiltinGlyphsToggled(false));
+        let text = saved_text(&app).unwrap();
+        std::fs::remove_file(app.settings_path.as_ref().unwrap()).unwrap();
+        app.update(Message::SettingsBuiltinGlyphsToggled(false));
+        assert!(
+            saved_text(&app).is_none(),
+            "no second write for the same value"
+        );
+        assert!(text.contains("terminal_builtin_glyphs = false"));
+    }
+
+    #[test]
+    fn a_failed_save_does_not_break_the_running_application() {
+        // The settings file's directory cannot be created because a regular file sits there.
+        let blocker =
+            std::env::temp_dir().join(format!("kegon_glyphs_blocker_{}", std::process::id()));
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let mut app = new_test_app(Locale::EnUs);
+        app.settings_path = Some(blocker.join("settings.toml"));
+        app.update(Message::SettingsBuiltinGlyphsToggled(false));
+        // The failure is reported on stderr by `commit_settings` like for every setting; the choice still
+        // applies for this run and nothing is written.
+        assert!(!app.settings.appearance.builtin_glyphs());
+        assert!(!blocker.join("settings.toml").exists());
+        let _ = app.view();
+        let _ = std::fs::remove_file(&blocker);
+    }
+
     #[test]
     fn metric_fields_render_in_both_languages_and_a_narrow_window() {
         for locale in [Locale::EnUs, Locale::JaJp] {
@@ -4100,18 +4363,6 @@ mod tests {
         for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
             app.update(Message::ScaleFactorChanged(bad));
             assert_eq!(app.scale_factor, 1.5, "{bad}");
-        }
-    }
-
-    #[test]
-    fn verification_switch_values_are_parsed() {
-        assert!(flag_value(None, true));
-        assert!(!flag_value(None, false));
-        for off in ["0", "false", "OFF", " no "] {
-            assert!(!flag_value(Some(off), true), "{off}");
-        }
-        for on in ["1", "true", "yes", ""] {
-            assert!(flag_value(Some(on), false), "{on}");
         }
     }
 

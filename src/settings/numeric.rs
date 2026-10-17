@@ -96,3 +96,61 @@ impl<'de> Deserialize<'de> for ExtraKeys {
         toml::Table::deserialize(deserializer).map(Self)
     }
 }
+
+/// A boolean setting as it appears in `settings.toml`.
+///
+/// Anything that is not a TOML boolean is kept as [`BoolSetting::Other`] and written back unchanged;
+/// [`BoolSetting::effective`] then reports it as unusable, so the caller falls back to its default.
+#[derive(Debug, Clone)]
+pub enum BoolSetting {
+    Value(bool),
+    Other(toml::Value),
+}
+
+impl BoolSetting {
+    /// The usable value: a real boolean, otherwise `None` (the setting counts as unset).
+    pub fn effective(&self) -> Option<bool> {
+        match self {
+            Self::Value(value) => Some(*value),
+            Self::Other(_) => None,
+        }
+    }
+
+    /// The value as written in the file, for diagnostics.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Value(value) => value.to_string(),
+            Self::Other(value) => value.to_string(),
+        }
+    }
+}
+
+impl PartialEq for BoolSetting {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Value(a), Self::Value(b)) => a == b,
+            (Self::Other(a), Self::Other(b)) => a.to_string() == b.to_string(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for BoolSetting {}
+
+impl Serialize for BoolSetting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Value(value) => serializer.serialize_bool(*value),
+            Self::Other(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BoolSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match toml::Value::deserialize(deserializer)? {
+            toml::Value::Boolean(value) => Self::Value(value),
+            other => Self::Other(other),
+        })
+    }
+}

@@ -67,6 +67,9 @@ settings-metric-apply = 適用
 settings-metric-reset = リセット
 settings-metric-range-error = { $min } から { $max } の数値を入力してください。
 settings-metric-stored-invalid = settings.toml の値({ $value })は無効なため無視されています。新しい値を適用すると置き換えられます。
+settings-builtin-glyphs-label = 組み込みグリフ
+settings-builtin-glyphs-description = 有効にすると、Unicode の罫線・ブロック文字をフォントではなく専用の図形で描画し、すき間なくセルに接続します。変更はすぐに反映されます。
+settings-builtin-glyphs-stored-invalid = settings.toml の値({ $value })は true / false ではないため、有効として扱われます。設定を変更すると置き換えられます。
 settings-tab-close-tooltip = 設定を閉じる
 
 ## Main area

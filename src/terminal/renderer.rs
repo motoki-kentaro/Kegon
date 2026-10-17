@@ -223,6 +223,36 @@ thread_local! {
     static SHADE_TILES: RefCell<TileCache<SvgHandle>> = RefCell::new(TileCache::default());
 }
 
+/// The built-in drawing for a cell, or `None` when the font draws it: always `None` while the built-in
+/// glyphs are off, for a cell with combining marks, and for any character they do not cover.
+fn builtin_for(
+    enabled: bool,
+    ch: char,
+    has_combining_marks: bool,
+    grid: &CellGrid,
+    col: i32,
+    line: i32,
+) -> Option<glyph::BuiltinGlyph> {
+    if !enabled || has_combining_marks {
+        return None;
+    }
+    glyph::builtin_glyph(ch, grid, col, line)
+}
+
+/// Paints a built-in glyph with `color`, whichever method it uses.
+fn paint_builtin(frame: &mut Frame, builtin: &glyph::BuiltinGlyph, scale: f32, color: Color) {
+    match builtin {
+        glyph::BuiltinGlyph::Rects(rects) => fill_glyph_rects(frame, rects.as_slice(), color),
+        glyph::BuiltinGlyph::Paths(paths) => fill_glyph_paths(frame, paths, color),
+        glyph::BuiltinGlyph::Shade(shade) => fill_shade(frame, shade, scale, color),
+    }
+}
+
+/// Drops the cached shade tiles, for when no shade will be drawn (the built-in glyphs were turned off).
+pub fn clear_shade_tiles() {
+    SHADE_TILES.with(|tiles| tiles.borrow_mut().clear());
+}
+
 /// Paints a shade cell: the SVG tile of its pattern, tinted with `color`.
 ///
 /// The tile is one SVG unit per physical pixel and is placed on the cell's physically aligned bounds, so
@@ -261,10 +291,10 @@ pub struct TerminalProgram<'a> {
     pub font_config: &'a TerminalFontConfig,
     /// Window scale factor (physical pixels per logical pixel), for physical-pixel alignment.
     pub scale_factor: f32,
-    /// Draw the supported block elements as rectangles instead of font glyphs.
+    /// Draw the box-drawing and block characters (U+2500..U+259F) with built-in shapes instead of font
+    /// glyphs, and place cell background rectangles on the same physically aligned edges so shapes and
+    /// backgrounds share them. Off draws everything as before, with the font and unaligned backgrounds.
     pub builtin_glyphs: bool,
-    /// Experimental: place cell background rectangles on the same physically aligned edges.
-    pub align_backgrounds: bool,
 }
 
 impl<'a, Message> Program<Message> for TerminalProgram<'a> {
@@ -320,7 +350,7 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
             // Draw custom background if non-default
             if bg != colors.background {
-                if self.align_backgrounds {
+                if self.builtin_glyphs {
                     let left = grid.cell(col_index, line_index);
                     let right = grid.x_edge(col_index + if is_wide { 2 } else { 1 });
                     frame.fill_rectangle(
@@ -351,32 +381,16 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
                 // Built-in shapes are exact to the cell, so bold or italic never changes them. A cell
                 // with combining marks stays with the font.
-                let builtin = if self.builtin_glyphs && cell.zerowidth().is_none() {
-                    glyph::glyph_rects(cell.c, &grid, col_index, line_index)
-                } else {
-                    None
-                };
-                let builtin_paths =
-                    if builtin.is_none() && self.builtin_glyphs && cell.zerowidth().is_none() {
-                        glyph::glyph_paths(cell.c, &grid, col_index, line_index)
-                    } else {
-                        None
-                    };
-                let builtin_shade = if builtin.is_none()
-                    && builtin_paths.is_none()
-                    && self.builtin_glyphs
-                    && cell.zerowidth().is_none()
-                {
-                    glyph::glyph_shade(cell.c, &grid, col_index, line_index)
-                } else {
-                    None
-                };
-                if let Some(rects) = builtin {
-                    fill_glyph_rects(&mut frame, rects.as_slice(), fg);
-                } else if let Some(paths) = builtin_paths {
-                    fill_glyph_paths(&mut frame, &paths, fg);
-                } else if let Some(shade) = builtin_shade {
-                    fill_shade(&mut frame, &shade, grid.scale, fg);
+                let builtin = builtin_for(
+                    self.builtin_glyphs,
+                    cell.c,
+                    cell.zerowidth().is_some(),
+                    &grid,
+                    col_index,
+                    line_index,
+                );
+                if let Some(builtin) = builtin {
+                    paint_builtin(&mut frame, &builtin, grid.scale, fg);
                 } else {
                     let cell_font = resolve_cell_font(font, cell.flags);
 
@@ -457,43 +471,31 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         // A built-in shape under the cursor is redrawn from the same aligned edges as the cell.
         let cursor_col = cursor_point.column.0 as i32;
         let cursor_line = cursor_point.line.0;
-        let cursor_char = if self.builtin_glyphs {
-            cursor_cell_info.as_ref().and_then(|(content, _)| {
-                let mut chars = content.chars();
-                let ch = chars.next()?;
-                chars.next().is_none().then_some(ch)
-            })
-        } else {
-            None
-        };
-        let cursor_builtin =
-            cursor_char.and_then(|ch| glyph::glyph_rects(ch, &grid, cursor_col, cursor_line));
-        let cursor_paths = if cursor_builtin.is_none() {
-            cursor_char.and_then(|ch| glyph::glyph_paths(ch, &grid, cursor_col, cursor_line))
-        } else {
-            None
-        };
-        let cursor_shade = if cursor_builtin.is_none() && cursor_paths.is_none() {
-            cursor_char.and_then(|ch| glyph::glyph_shade(ch, &grid, cursor_col, cursor_line))
-        } else {
-            None
-        };
+        let cursor_builtin = cursor_cell_info.as_ref().and_then(|(content, _)| {
+            let mut chars = content.chars();
+            let ch = chars.next()?;
+            if chars.next().is_some() {
+                return None; // a cell with combining marks stays with the font
+            }
+            builtin_for(
+                self.builtin_glyphs,
+                ch,
+                false,
+                &grid,
+                cursor_col,
+                cursor_line,
+            )
+        });
 
-        if self.is_focused
-            && (cursor_builtin.is_some() || cursor_paths.is_some() || cursor_shade.is_some())
-        {
+        if self.is_focused && cursor_builtin.is_some() {
             let cell = grid.cell(cursor_col, cursor_line);
             frame.fill_rectangle(
                 Point::new(cell.x0, cell.y0),
                 Size::new(cell.width(), cell.height()),
                 colors.cursor,
             );
-            if let Some(rects) = cursor_builtin {
-                fill_glyph_rects(&mut frame, rects.as_slice(), colors.background);
-            } else if let Some(paths) = cursor_paths {
-                fill_glyph_paths(&mut frame, &paths, colors.background);
-            } else if let Some(shade) = cursor_shade {
-                fill_shade(&mut frame, &shade, grid.scale, colors.background);
+            if let Some(builtin) = cursor_builtin {
+                paint_builtin(&mut frame, &builtin, grid.scale, colors.background);
             }
         } else if self.is_focused {
             frame.fill_rectangle(
@@ -799,5 +801,51 @@ mod tests {
         let font_bold_italic = resolve_cell_font(base, Flags::BOLD | Flags::ITALIC);
         assert_eq!(font_bold_italic.weight, iced::font::Weight::Bold);
         assert_eq!(font_bold_italic.style, iced::font::Style::Italic);
+    }
+
+    fn grid() -> CellGrid {
+        CellGrid::new((0.0, 0.0), 9.6, 19.2, 1.0)
+    }
+
+    #[test]
+    fn with_the_setting_on_every_one_of_the_160_characters_is_drawn_by_exactly_one_builtin_method()
+    {
+        let grid = grid();
+        let (mut rects, mut paths, mut shades) = (0, 0, 0);
+        for cp in 0x2500u32..=0x259F {
+            let ch = char::from_u32(cp).unwrap();
+            match builtin_for(true, ch, false, &grid, 2, 3) {
+                Some(glyph::BuiltinGlyph::Rects(_)) => rects += 1,
+                Some(glyph::BuiltinGlyph::Paths(_)) => paths += 1,
+                Some(glyph::BuiltinGlyph::Shade(_)) => shades += 1,
+                None => panic!("{cp:04X} falls back to the font"),
+            }
+        }
+        assert_eq!((rects, paths, shades), (150, 7, 3));
+    }
+
+    #[test]
+    fn with_the_setting_off_every_character_is_drawn_by_the_font() {
+        let grid = grid();
+        for cp in 0x2500u32..=0x259F {
+            let ch = char::from_u32(cp).unwrap();
+            assert!(
+                builtin_for(false, ch, false, &grid, 2, 3).is_none(),
+                "{cp:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_characters_and_cells_with_combining_marks_stay_with_the_font() {
+        let grid = grid();
+        for ch in ['a', ' ', '\u{3042}', '\u{25A0}', '\u{E0B0}', '\u{24FF}'] {
+            assert!(
+                builtin_for(true, ch, false, &grid, 0, 0).is_none(),
+                "{ch:?}"
+            );
+        }
+        assert!(builtin_for(true, '\u{2588}', true, &grid, 0, 0).is_none());
+        assert!(builtin_for(true, '\u{2588}', false, &grid, 0, 0).is_some());
     }
 }

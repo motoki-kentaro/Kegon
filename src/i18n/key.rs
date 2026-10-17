@@ -84,6 +84,9 @@ message_keys! {
     SettingsMetricReset => "settings-metric-reset",
     SettingsMetricRangeError => "settings-metric-range-error",
     SettingsMetricStoredInvalid => "settings-metric-stored-invalid",
+    SettingsBuiltinGlyphsLabel => "settings-builtin-glyphs-label",
+    SettingsBuiltinGlyphsDescription => "settings-builtin-glyphs-description",
+    SettingsBuiltinGlyphsStoredInvalid => "settings-builtin-glyphs-stored-invalid",
     SettingsTabCloseTooltip => "settings-tab-close-tooltip",
 
     MainPlaceholderTitle => "main-placeholder-title",
