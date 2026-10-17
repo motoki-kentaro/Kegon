@@ -2,6 +2,9 @@
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb};
+use std::cell::RefCell;
+
+use iced::advanced::svg::{Handle as SvgHandle, Svg};
 use iced::alignment::{Horizontal, Vertical};
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Program, Text};
@@ -10,6 +13,7 @@ use iced::{Color, Font, Point, Rectangle, Size, Theme};
 use crate::font::{TerminalCellMetrics, TerminalFontConfig};
 use crate::terminal::glyph::{self, CellGrid};
 use crate::terminal::session::TerminalSession;
+use crate::terminal::tile_cache::TileCache;
 use crate::theme::TerminalColors;
 
 #[allow(dead_code)]
@@ -213,6 +217,39 @@ fn fill_glyph_paths(frame: &mut Frame, paths: &glyph::GlyphPaths, color: Color) 
     }
 }
 
+thread_local! {
+    /// The SVG tiles of the shade characters, shared by every terminal view (it is keyed by what a tile
+    /// looks like, not by tab) and bounded; see `tile_cache`.
+    static SHADE_TILES: RefCell<TileCache<SvgHandle>> = RefCell::new(TileCache::default());
+}
+
+/// Paints a shade cell: the SVG tile of its pattern, tinted with `color`.
+///
+/// The tile is one SVG unit per physical pixel and is placed on the cell's physically aligned bounds, so
+/// the rasteriser produces it 1:1 and the dots land on the pixels the model says. The bounds are a hair
+/// short of the cell (a thousandth of a physical pixel): the rasteriser sizes the image with
+/// `ceil(scale × size)`, which float rounding would otherwise push one pixel too far.
+///
+/// Images are composited above all meshes of the frame. A selection tint or a cursor block painted as a
+/// rectangle therefore lies beneath the dots, like the text of an ordinary cell, and the dots drawn in the
+/// cursor's contrast color cover exactly the pixels of the dots beneath them.
+fn fill_shade(frame: &mut Frame, cell: &glyph::ShadeCell, scale: f32, color: Color) {
+    let handle = SHADE_TILES.with(|tiles| {
+        let key = cell.key();
+        tiles
+            .borrow_mut()
+            .get_or_insert_with(key, || SvgHandle::from_memory(key.svg().into_bytes()))
+    });
+    let trim = 1e-3 / scale;
+    frame.draw_svg(
+        Rectangle::new(
+            Point::new(cell.bounds.x0, cell.bounds.y0),
+            Size::new(cell.bounds.width() - trim, cell.bounds.height() - trim),
+        ),
+        Svg::new(handle).color(color),
+    );
+}
+
 /// The iced [`Program`] responsible for rendering the terminal grid and preedit text.
 pub struct TerminalProgram<'a> {
     pub session: &'a TerminalSession,
@@ -241,6 +278,7 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
+        SHADE_TILES.with(|tiles| tiles.borrow_mut().begin_frame());
         let colors = self.colors;
         let metrics = &self.font_config.metrics;
         let font = self.font_config.font;
@@ -324,10 +362,21 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
                     } else {
                         None
                     };
+                let builtin_shade = if builtin.is_none()
+                    && builtin_paths.is_none()
+                    && self.builtin_glyphs
+                    && cell.zerowidth().is_none()
+                {
+                    glyph::glyph_shade(cell.c, &grid, col_index, line_index)
+                } else {
+                    None
+                };
                 if let Some(rects) = builtin {
                     fill_glyph_rects(&mut frame, rects.as_slice(), fg);
                 } else if let Some(paths) = builtin_paths {
                     fill_glyph_paths(&mut frame, &paths, fg);
+                } else if let Some(shade) = builtin_shade {
+                    fill_shade(&mut frame, &shade, grid.scale, fg);
                 } else {
                     let cell_font = resolve_cell_font(font, cell.flags);
 
@@ -424,8 +473,15 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         } else {
             None
         };
+        let cursor_shade = if cursor_builtin.is_none() && cursor_paths.is_none() {
+            cursor_char.and_then(|ch| glyph::glyph_shade(ch, &grid, cursor_col, cursor_line))
+        } else {
+            None
+        };
 
-        if self.is_focused && (cursor_builtin.is_some() || cursor_paths.is_some()) {
+        if self.is_focused
+            && (cursor_builtin.is_some() || cursor_paths.is_some() || cursor_shade.is_some())
+        {
             let cell = grid.cell(cursor_col, cursor_line);
             frame.fill_rectangle(
                 Point::new(cell.x0, cell.y0),
@@ -436,6 +492,8 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
                 fill_glyph_rects(&mut frame, rects.as_slice(), colors.background);
             } else if let Some(paths) = cursor_paths {
                 fill_glyph_paths(&mut frame, &paths, colors.background);
+            } else if let Some(shade) = cursor_shade {
+                fill_shade(&mut frame, &shade, grid.scale, colors.background);
             }
         } else if self.is_focused {
             frame.fill_rectangle(

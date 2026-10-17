@@ -551,12 +551,131 @@ pub fn path_glyph(ch: char) -> Option<PathGlyph> {
     PathGlyph::from_code(PATH_TABLE[index].1)
 }
 
+/// How dense a shade character is: the share of the cell's pixels drawn in the foreground color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShadeLevel {
+    /// U+2591 LIGHT SHADE, one pixel in four.
+    Light,
+    /// U+2592 MEDIUM SHADE, every other pixel in a checkerboard.
+    Medium,
+    /// U+2593 DARK SHADE, three pixels in four (the pixels the light shade leaves out).
+    Dark,
+}
+
+/// The shade level of `ch`, or `None` for any other character.
+pub fn shade_level(ch: char) -> Option<ShadeLevel> {
+    match ch {
+        '\u{2591}' => Some(ShadeLevel::Light),
+        '\u{2592}' => Some(ShadeLevel::Medium),
+        '\u{2593}' => Some(ShadeLevel::Dark),
+        _ => None,
+    }
+}
+
+/// Width and height in physical pixels of the repeating unit of every shade pattern.
+pub const SHADE_TILE: (i32, i32) = (4, 2);
+
+/// Whether the pixel at absolute physical position (`x`, `y`) of the window is in the foreground color.
+///
+/// The pattern depends only on the absolute pixel, so the dots continue unbroken from cell to cell
+/// whatever size the cells have and wherever the surface starts:
+/// - light: a dot in every fourth column, shifted by two on odd rows (staggered, 4 × 2 tile)
+/// - medium: a checkerboard
+/// - dark: every pixel the light shade leaves out
+pub fn shade_lit(level: ShadeLevel, x: i32, y: i32) -> bool {
+    let light = (x + 2 * y.rem_euclid(2)).rem_euclid(4) == 0;
+    match level {
+        ShadeLevel::Light => light,
+        ShadeLevel::Medium => (x + y).rem_euclid(2) == 0,
+        ShadeLevel::Dark => !light,
+    }
+}
+
+/// What it takes to draw one shade cell: the pattern tile placed on the cell's physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShadeCell {
+    pub level: ShadeLevel,
+    /// The cell in the renderer's logical coordinates (physically aligned edges).
+    pub bounds: Rect,
+    /// The cell's size in physical pixels.
+    pub width_px: i32,
+    pub height_px: i32,
+    /// Offset of the first tile inside the cell, in physical pixels, that puts the pattern on the
+    /// window's absolute pixel grid: `(-x0) mod 4` and `(-y0) mod 2` for a cell at (`x0`, `y0`).
+    pub phase_x: i32,
+    pub phase_y: i32,
+}
+
+/// Everything that decides how a tile looks, and nothing else: the key of the tile cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShadeTileKey {
+    pub level: ShadeLevel,
+    pub width_px: i32,
+    pub height_px: i32,
+    pub phase_x: i32,
+    pub phase_y: i32,
+}
+
+impl ShadeCell {
+    pub fn key(&self) -> ShadeTileKey {
+        ShadeTileKey {
+            level: self.level,
+            width_px: self.width_px,
+            height_px: self.height_px,
+            phase_x: self.phase_x,
+            phase_y: self.phase_y,
+        }
+    }
+}
+
+impl ShadeTileKey {
+    /// The tile as SVG: a `width_px` × `height_px` pixel image (one SVG unit per physical pixel) filled with
+    /// the pattern, drawn in black. The renderer paints it with the cell's foreground color
+    /// (`Svg::color`), so one image serves every color.
+    pub fn svg(&self) -> String {
+        let (tile_w, tile_h) = SHADE_TILE;
+        let mut dots = String::new();
+        for y in 0..tile_h {
+            for x in 0..tile_w {
+                if shade_lit(self.level, x, y) {
+                    dots += &format!(r#"<rect x="{x}" y="{y}" width="1" height="1"/>"#);
+                }
+            }
+        }
+        let (w, h) = (self.width_px, self.height_px);
+        let (px, py) = (self.phase_x, self.phase_y);
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" shape-rendering="crispEdges"><defs><pattern id="p" x="{px}" y="{py}" width="{tile_w}" height="{tile_h}" patternUnits="userSpaceOnUse">{dots}</pattern></defs><rect width="{w}" height="{h}" fill="url(#p)"/></svg>"#
+        )
+    }
+}
+
+/// The shade pattern to draw in the cell at (`col`, `line`), or `None` for any other character.
+pub fn glyph_shade(ch: char, grid: &CellGrid, col: i32, line: i32) -> Option<ShadeCell> {
+    let level = shade_level(ch)?;
+    let bounds = grid.cell(col, line);
+    let p = grid.phys(bounds);
+    let (width_px, height_px) = (p.x1 - p.x0, p.y1 - p.y0);
+    if width_px <= 0 || height_px <= 0 {
+        return None;
+    }
+    Some(ShadeCell {
+        level,
+        bounds,
+        width_px,
+        height_px,
+        phase_x: (-p.x0).rem_euclid(SHADE_TILE.0),
+        phase_y: (-p.y0).rem_euclid(SHADE_TILE.1),
+    })
+}
+
 /// Whether `ch` is drawn by this module.
 pub fn is_builtin(ch: char) -> bool {
     block_regions(ch).is_some()
         || box_connections(ch).is_some()
         || dashed(ch).is_some()
         || path_glyph(ch).is_some()
+        || shade_level(ch).is_some()
 }
 
 /// A rectangle in eighths of the cell: `(x0, y0, x1, y1)`, each in `0..=8`, left/top first.
@@ -1521,11 +1640,10 @@ mod tests {
             assert!(is_builtin(ch), "{ch:?}");
             assert!(glyph_rects(ch, &grid(8.0, 16.0, 1.0), 0, 0).is_some());
         }
-        // Everything else keeps using the font: shades, Powerline and
+        // Everything else keeps using the font: other symbols, Powerline and
         // ordinary text.
         for ch in [
-            'a', ' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{25A0}', '\u{25FE}', '\u{E0B0}',
-            '\u{3042}', '\0',
+            'a', ' ', '\u{25A0}', '\u{25FE}', '\u{E0B0}', '\u{3042}', '\0',
         ] {
             assert!(!is_builtin(ch), "{ch:?}");
             assert!(
@@ -2218,7 +2336,7 @@ mod tests {
     }
 
     #[test]
-    fn all_twenty_four_new_blocks_and_the_old_five_are_built_in_and_shades_are_not() {
+    fn all_twenty_four_new_blocks_and_the_old_five_are_block_rectangles_and_shades_are_not() {
         let blocks = all_blocks();
         assert_eq!(blocks.len(), 29, "{blocks:?}");
         for ch in &blocks {
@@ -2229,8 +2347,9 @@ mod tests {
             assert!(block_regions(ch).is_none() || cp > 0x259F, "{ch:?}");
         }
         for cp in [0x2591u32, 0x2592, 0x2593] {
+            // Shades are built in, but as a pattern tile rather than as block rectangles.
             let ch = char::from_u32(cp).unwrap();
-            assert!(!is_builtin(ch), "{ch:?} must stay with the font");
+            assert!(is_builtin(ch) && glyph_rects(ch, &grid(8.0, 16.0, 1.0), 0, 0).is_none());
         }
         // Neighbours just outside U+2580..=U+259F.
         for ch in ['\u{257F}', '\u{25A0}'] {
@@ -2504,7 +2623,7 @@ mod tests {
                 "{cp:04X} is in exactly one class"
             );
             assert_eq!(block_regions(ch).is_some(), !class[2], "{cp:04X}");
-            assert_eq!(is_builtin(ch), !class[2], "{cp:04X}");
+            assert!(is_builtin(ch), "{cp:04X}");
         }
         // Every one of the 29 is covered by an expected-area table (single rectangles) or the quadrants.
         let table: Vec<u32> = SINGLE.iter().map(|&(ch, _)| ch as u32).collect();
@@ -4261,5 +4380,296 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- shades ----
+
+    const SHADES: [(char, &str, ShadeLevel); 3] = [
+        ('\u{2591}', "LIGHT SHADE", ShadeLevel::Light),
+        ('\u{2592}', "MEDIUM SHADE", ShadeLevel::Medium),
+        ('\u{2593}', "DARK SHADE", ShadeLevel::Dark),
+    ];
+
+    #[test]
+    fn the_three_shade_code_points_map_to_their_levels() {
+        for (ch, name, level) in SHADES {
+            assert_eq!(shade_level(ch), Some(level), "{name}");
+            assert!(is_builtin(ch), "{name}");
+            // Not a rectangle, path or dash glyph: the shade has its own drawing.
+            let g = grid(9.0, 17.0, 1.0);
+            assert!(glyph_rects(ch, &g, 0, 0).is_none(), "{name}");
+            assert!(glyph_paths(ch, &g, 0, 0).is_none(), "{name}");
+            assert!(glyph_shade(ch, &g, 0, 0).is_some(), "{name}");
+        }
+        for ch in ['\u{2590}', '\u{2594}', '\u{2588}', 'a', ' ', '\u{2500}'] {
+            assert!(
+                shade_level(ch).is_none() && glyph_shade(ch, &grid(9.0, 17.0, 1.0), 0, 0).is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn all_160_code_points_of_the_two_blocks_are_built_in() {
+        let g = grid(11.0, 15.0, 1.0);
+        let mut counts = [0; 4];
+        for cp in 0x2500u32..=0x259F {
+            let ch = char::from_u32(cp).unwrap();
+            assert!(is_builtin(ch), "{cp:04X}");
+            let kinds = [
+                glyph_rects(ch, &g, 0, 0).is_some(),
+                glyph_paths(ch, &g, 0, 0).is_some(),
+                glyph_shade(ch, &g, 0, 0).is_some(),
+            ];
+            assert_eq!(
+                kinds.iter().filter(|&&k| k).count(),
+                1,
+                "{cp:04X}: one drawing method"
+            );
+            for (i, k) in kinds.iter().enumerate() {
+                counts[i] += usize::from(*k);
+            }
+            counts[3] += 1;
+        }
+        // 157 as rectangles or paths (109 + 12 + 29 rectangles, 7 paths), 3 shades.
+        assert_eq!(counts, [150, 7, 3, 160]);
+    }
+
+    /// Two rows of eight pixels of a pattern from an absolute origin, `#` lit.
+    fn shade_rows(level: ShadeLevel, x0: i32, y0: i32) -> [String; 2] {
+        let row = |y: i32| -> String {
+            (x0..x0 + 8)
+                .map(|x| if shade_lit(level, x, y) { '#' } else { '.' })
+                .collect()
+        };
+        [row(y0), row(y0 + 1)]
+    }
+
+    #[test]
+    fn the_patterns_match_the_reference_drawings() {
+        // Written out from the specification: light is a staggered dot in every fourth column, medium a
+        // checkerboard, dark whatever the light shade leaves out.
+        let cases = [
+            (ShadeLevel::Light, ["#...#...", "..#...#."]),
+            (ShadeLevel::Medium, ["#.#.#.#.", ".#.#.#.#"]),
+            (ShadeLevel::Dark, [".###.###", "##.###.#"]),
+        ];
+        for (level, rows) in cases {
+            assert_eq!(shade_rows(level, 0, 0), rows, "{level:?}");
+            // The pattern repeats every 4 columns and every 2 rows, also for negative coordinates.
+            assert_eq!(shade_rows(level, 4, 2), rows, "{level:?}: period");
+            assert_eq!(
+                shade_rows(level, -8, -4),
+                rows,
+                "{level:?}: negative origin"
+            );
+        }
+    }
+
+    #[test]
+    fn the_coverage_is_a_quarter_a_half_and_three_quarters() {
+        for (level, share) in [
+            (ShadeLevel::Light, 0.25),
+            (ShadeLevel::Medium, 0.5),
+            (ShadeLevel::Dark, 0.75),
+        ] {
+            for (x0, y0) in [(0, 0), (1, 1), (-3, 5), (1000, 777)] {
+                let (w, h) = (40, 22); // a whole number of 4 × 2 tiles
+                let lit = (0..h)
+                    .flat_map(|y| (0..w).map(move |x| (x, y)))
+                    .filter(|&(x, y)| shade_lit(level, x0 + x, y0 + y))
+                    .count();
+                assert_eq!(
+                    lit as f32 / (w * h) as f32,
+                    share,
+                    "{level:?} at ({x0}, {y0})"
+                );
+            }
+        }
+        // Dark is exactly the complement of light.
+        for y in -4..6 {
+            for x in -8..12 {
+                assert_ne!(
+                    shade_lit(ShadeLevel::Light, x, y),
+                    shade_lit(ShadeLevel::Dark, x, y)
+                );
+            }
+        }
+    }
+
+    /// The pixels of a cell as its tile draws them: the tile is laid out from the cell's top left
+    /// corner shifted by the phase, which is the SVG `<pattern x y>` behaviour.
+    fn tile_pixel(cell: &ShadeCell, i: i32, j: i32) -> bool {
+        let (tw, th) = SHADE_TILE;
+        let (tx, ty) = (
+            (i - cell.phase_x).rem_euclid(tw),
+            (j - cell.phase_y).rem_euclid(th),
+        );
+        shade_lit(cell.level, tx, ty)
+    }
+
+    #[test]
+    fn the_tile_of_every_cell_puts_the_pattern_on_the_absolute_pixel_grid() {
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            for (_, name, level) in SHADES {
+                let ch = SHADES.iter().find(|x| x.2 == level).unwrap().0;
+                for line in 0..4 {
+                    for col in 0..24 {
+                        let cell = glyph_shade(ch, &g, col, line).unwrap();
+                        let p = g.phys(g.cell(col, line));
+                        assert_eq!((cell.width_px, cell.height_px), (p.x1 - p.x0, p.y1 - p.y0));
+                        assert_eq!(cell.bounds, g.cell(col, line), "{name}");
+                        assert!((0..SHADE_TILE.0).contains(&cell.phase_x));
+                        assert!((0..SHADE_TILE.1).contains(&cell.phase_y));
+                        // Every pixel agrees with the absolute pattern, so neighbouring cells,
+                        // whatever their size, continue each other's dots.
+                        for j in 0..cell.height_px {
+                            for i in 0..cell.width_px {
+                                assert_eq!(
+                                    tile_pixel(&cell, i, j),
+                                    shade_lit(level, p.x0 + i, p.y0 + j),
+                                    "{w}x{h}@{s} {name} cell ({col},{line}) pixel ({i},{j})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dots_continue_across_cell_boundaries() {
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            for (ch, name, level) in SHADES {
+                // Rebuild a row of cells pixel by pixel from the tiles and compare with the pattern
+                // painted over the whole row at once.
+                let mut raster: Vec<Vec<bool>> = Vec::new();
+                let rows = 2;
+                let height = g.phys(g.cell(0, rows - 1)).y1 - g.phys(g.cell(0, 0)).y0;
+                for _ in 0..height {
+                    raster.push(Vec::new());
+                }
+                let top = g.phys(g.cell(0, 0)).y0;
+                for line in 0..rows {
+                    for col in 0..12 {
+                        let cell = glyph_shade(ch, &g, col, line).unwrap();
+                        let p = g.phys(cell.bounds);
+                        for j in 0..cell.height_px {
+                            for i in 0..cell.width_px {
+                                let _ = i;
+                                raster[(p.y0 - top + j) as usize].push(tile_pixel(&cell, i, j));
+                            }
+                        }
+                    }
+                }
+                let left = g.phys(g.cell(0, 0)).x0;
+                for (row, pixels) in raster.iter().enumerate() {
+                    for (x, &lit) in pixels.iter().enumerate() {
+                        assert_eq!(
+                            lit,
+                            shade_lit(level, left + x as i32, top + row as i32),
+                            "{w}x{h}@{s} {name}: ({x},{row})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reads the lit pixels back out of a tile's SVG source (independent of `shade_lit`).
+    fn svg_dots(svg: &str) -> Vec<(i32, i32)> {
+        let pattern = svg
+            .split("<pattern")
+            .nth(1)
+            .unwrap()
+            .split("</pattern>")
+            .next()
+            .unwrap();
+        pattern
+            .split("<rect ")
+            .skip(1)
+            .map(|r| {
+                let get = |name: &str| -> i32 {
+                    let at = r.find(&format!("{name}=\"")).unwrap() + name.len() + 2;
+                    r[at..].split('"').next().unwrap().parse().unwrap()
+                };
+                assert_eq!((get("width"), get("height")), (1, 1));
+                (get("x"), get("y"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_svg_of_a_tile_holds_exactly_the_dots_of_its_pattern() {
+        let g = grid(9.6, 19.2, 1.0);
+        for (ch, name, level) in SHADES {
+            let cell = glyph_shade(ch, &g, 3, 2).unwrap();
+            let svg = cell.key().svg();
+            assert!(
+                svg.starts_with("<svg ") && svg.ends_with("</svg>"),
+                "{name}"
+            );
+            let (w, h) = (cell.width_px, cell.height_px);
+            assert!(svg.contains(&format!(
+                "width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\""
+            )));
+            assert!(svg.contains("shape-rendering=\"crispEdges\""));
+            assert!(svg.contains(&format!(
+                "x=\"{}\" y=\"{}\" width=\"4\" height=\"2\"",
+                cell.phase_x, cell.phase_y
+            )));
+            assert!(
+                !svg.contains("fill=\"#") && !svg.contains("rgb("),
+                "colorless: tinted at draw time"
+            );
+            let mut dots = svg_dots(&svg);
+            dots.sort();
+            let mut expected: Vec<(i32, i32)> = (0..2)
+                .flat_map(|y| (0..4).map(move |x| (x, y)))
+                .filter(|&(x, y)| shade_lit(level, x, y))
+                .collect();
+            expected.sort();
+            assert_eq!(dots, expected, "{name}");
+            let share = dots.len() as f32 / 8.0;
+            assert_eq!(share, [0.25, 0.5, 0.75][level as usize], "{name}");
+        }
+    }
+
+    #[test]
+    fn the_tile_key_is_what_decides_the_picture_and_nothing_else() {
+        let g = grid(9.6, 19.2, 1.0);
+        // Same size and phase in different columns / rows (and colors never enter): one key.
+        let a = glyph_shade('\u{2592}', &g, 0, 0).unwrap();
+        let b = glyph_shade('\u{2592}', &g, 0, 0).unwrap();
+        assert_eq!(a.key(), b.key());
+        assert_ne!(
+            glyph_shade('\u{2591}', &g, 0, 0).unwrap().key(),
+            glyph_shade('\u{2593}', &g, 0, 0).unwrap().key()
+        );
+        // A real screen of 136 × 55 cells needs only a handful of distinct tiles per pattern.
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            for (ch, name, _) in SHADES {
+                let mut keys = std::collections::HashSet::new();
+                for line in 0..55 {
+                    for col in 0..136 {
+                        keys.insert(glyph_shade(ch, &g, col, line).unwrap().key());
+                    }
+                }
+                assert!(keys.len() <= 32, "{w}x{h}@{s} {name}: {} tiles", keys.len());
+            }
+        }
+    }
+
+    #[test]
+    fn a_cell_without_pixels_is_not_a_shade() {
+        let tiny = grid(0.2, 0.2, 1.0);
+        assert!(glyph_shade('\u{2592}', &tiny, 0, 0).is_none());
+        let g = grid(1.0, 1.0, 1.0);
+        let cell = glyph_shade('\u{2592}', &g, 5, 5).unwrap();
+        assert_eq!((cell.width_px, cell.height_px), (1, 1));
+        assert!(cell.key().svg().contains("width=\"1\" height=\"1\""));
     }
 }
