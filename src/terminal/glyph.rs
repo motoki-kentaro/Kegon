@@ -84,13 +84,33 @@ impl CellGrid {
         }
     }
 
-    /// The boundary between the two halves of `cell`, on the physical pixel grid.
-    fn mid_x(&self, cell: Rect) -> f32 {
-        self.snap_abs(self.origin_x + (cell.x0 + cell.x1) / 2.0) - self.origin_x
+    /// The vertical boundary `eighth / 8` of the way across `cell`, on the physical pixel grid.
+    ///
+    /// The cell's own edges are already aligned; the inner boundaries are placed on the aligned cell
+    /// and then snapped, so they depend only on the cell and the eighth. 0 and 8 are the cell edges
+    /// themselves, and the result never decreases as `eighth` grows. Glyphs that must tile (a lower
+    /// 3/8 block and the upper 5/8 above it) use the same boundary value.
+    pub fn split_x(&self, cell: Rect, eighth: u8) -> f32 {
+        match eighth {
+            0 => cell.x0,
+            8.. => cell.x1,
+            k => {
+                let v = cell.x0 + (cell.x1 - cell.x0) * f32::from(k) / 8.0;
+                self.snap_abs(self.origin_x + v) - self.origin_x
+            }
+        }
     }
 
-    fn mid_y(&self, cell: Rect) -> f32 {
-        self.snap_abs(self.origin_y + (cell.y0 + cell.y1) / 2.0) - self.origin_y
+    /// The horizontal boundary `eighth / 8` of the way down `cell`; see [`Self::split_x`].
+    pub fn split_y(&self, cell: Rect, eighth: u8) -> f32 {
+        match eighth {
+            0 => cell.y0,
+            8.. => cell.y1,
+            k => {
+                let v = cell.y0 + (cell.y1 - cell.y0) * f32::from(k) / 8.0;
+                self.snap_abs(self.origin_y + v) - self.origin_y
+            }
+        }
     }
 
     /// Thickness of a line style in logical px: a whole number of physical pixels.
@@ -138,12 +158,6 @@ pub struct GlyphRects {
 pub const MAX_RECTS: usize = 4;
 
 impl GlyphRects {
-    fn single(rect: Rect) -> Self {
-        let mut rects = [rect; MAX_RECTS];
-        rects[0] = rect;
-        Self { rects, len: 1 }
-    }
-
     fn empty() -> Self {
         let zero = Rect {
             x0: 0.0,
@@ -235,51 +249,143 @@ pub fn box_connections(ch: char) -> Option<Connections> {
 
 /// Whether `ch` is drawn by this module.
 pub fn is_builtin(ch: char) -> bool {
-    is_block(ch) || box_connections(ch).is_some()
+    block_regions(ch).is_some() || box_connections(ch).is_some()
 }
 
-fn is_block(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{2588}' | '\u{2580}' | '\u{2584}' | '\u{258C}' | '\u{2590}'
-    )
+/// A rectangle in eighths of the cell: `(x0, y0, x1, y1)`, each in `0..=8`, left/top first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eighths {
+    pub x0: u8,
+    pub y0: u8,
+    pub x1: u8,
+    pub y1: u8,
+}
+
+const fn eighths(x0: u8, y0: u8, x1: u8, y1: u8) -> Eighths {
+    Eighths { x0, y0, x1, y1 }
+}
+
+/// The filled area of a block element, in eighths of the cell (at most two rectangles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockRegions {
+    regions: [Eighths; 2],
+    len: usize,
+}
+
+impl BlockRegions {
+    fn one(region: Eighths) -> Self {
+        Self {
+            regions: [region; 2],
+            len: 1,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[Eighths] {
+        &self.regions[..self.len]
+    }
+}
+
+/// Quadrant bits: upper left, upper right, lower left, lower right.
+const UL: u8 = 1;
+const UR: u8 = 2;
+const LL: u8 = 4;
+const LR: u8 = 8;
+
+/// The quadrants filled by U+2596 … U+259F, in code point order.
+const QUADRANTS: [u8; 10] = [
+    LL,           // U+2596 QUADRANT LOWER LEFT
+    LR,           // U+2597 QUADRANT LOWER RIGHT
+    UL,           // U+2598 QUADRANT UPPER LEFT
+    UL | LL | LR, // U+2599 QUADRANT UPPER LEFT AND LOWER LEFT AND LOWER RIGHT
+    UL | LR,      // U+259A QUADRANT UPPER LEFT AND LOWER RIGHT
+    UL | UR | LL, // U+259B QUADRANT UPPER LEFT AND UPPER RIGHT AND LOWER LEFT
+    UL | UR | LR, // U+259C QUADRANT UPPER LEFT AND UPPER RIGHT AND LOWER RIGHT
+    UR,           // U+259D QUADRANT UPPER RIGHT
+    UR | LL,      // U+259E QUADRANT UPPER RIGHT AND LOWER LEFT
+    UR | LL | LR, // U+259F QUADRANT UPPER RIGHT AND LOWER LEFT AND LOWER RIGHT
+];
+
+/// The area a block element fills, in eighths of the cell, from its code point.
+///
+/// - U+2580 upper half, U+2594 upper one eighth
+/// - U+2581 … U+2588 lower 1/8 … 8/8 (U+2588 is the full block)
+/// - U+2589 … U+258F left 7/8 … 1/8, U+2590 right half, U+2595 right one eighth
+/// - U+2596 … U+259F quadrants, from [`QUADRANTS`]
+///
+/// The shades (U+2591 … U+2593) are not block regions; they stay with the font for now.
+pub fn block_regions(ch: char) -> Option<BlockRegions> {
+    let cp = ch as u32;
+    Some(match cp {
+        0x2580 => BlockRegions::one(eighths(0, 0, 8, 4)),
+        0x2581..=0x2588 => BlockRegions::one(eighths(0, 8 - (cp - 0x2580) as u8, 8, 8)),
+        0x2589..=0x258F => BlockRegions::one(eighths(0, 0, (0x2590 - cp) as u8, 8)),
+        0x2590 => BlockRegions::one(eighths(4, 0, 8, 8)),
+        0x2594 => BlockRegions::one(eighths(0, 0, 8, 1)),
+        0x2595 => BlockRegions::one(eighths(7, 0, 8, 8)),
+        0x2596..=0x259F => quadrant_regions(QUADRANTS[(cp - 0x2596) as usize]),
+        _ => return None,
+    })
+}
+
+/// The rectangles of a set of quadrants: each half-row is one rectangle when both its quadrants are
+/// filled, and two rows with the same horizontal extent merge into one tall rectangle.
+fn quadrant_regions(mask: u8) -> BlockRegions {
+    let row = |left: bool, right: bool| -> Option<(u8, u8)> {
+        match (left, right) {
+            (true, true) => Some((0, 8)),
+            (true, false) => Some((0, 4)),
+            (false, true) => Some((4, 8)),
+            (false, false) => None,
+        }
+    };
+    let top = row(mask & UL != 0, mask & UR != 0);
+    let bottom = row(mask & LL != 0, mask & LR != 0);
+    let mut out = BlockRegions {
+        regions: [eighths(0, 0, 0, 0); 2],
+        len: 0,
+    };
+    let mut push = |r: Eighths| {
+        out.regions[out.len] = r;
+        out.len += 1;
+    };
+    match (top, bottom) {
+        (Some(t), Some(b)) if t == b => push(eighths(t.0, 0, t.1, 8)),
+        (t, b) => {
+            if let Some(t) = t {
+                push(eighths(t.0, 0, t.1, 4));
+            }
+            if let Some(b) = b {
+                push(eighths(b.0, 4, b.1, 8));
+            }
+        }
+    }
+    out
 }
 
 /// The rectangles of `ch` in the cell at (`col`, `line`), or `None` when the font should draw it.
 ///
-/// The full block, the four half blocks, and the light box-drawing lines.
+/// Block elements (all of U+2580 … U+259F except the shades) and the light box-drawing lines.
 pub fn glyph_rects(ch: char, grid: &CellGrid, col: i32, line: i32) -> Option<GlyphRects> {
     if !is_builtin(ch) {
         return None;
     }
-    if let Some(connections) = box_connections(ch) {
-        return Some(box_rects(&connections, grid, grid.cell(col, line)));
-    }
-    if !is_block(ch) {
-        return None;
-    }
     let cell = grid.cell(col, line);
-    let rect = match ch {
-        '\u{2588}' => cell,
-        '\u{2580}' => Rect {
-            y1: grid.mid_y(cell),
-            ..cell
-        },
-        '\u{2584}' => Rect {
-            y0: grid.mid_y(cell),
-            ..cell
-        },
-        '\u{258C}' => Rect {
-            x1: grid.mid_x(cell),
-            ..cell
-        },
-        '\u{2590}' => Rect {
-            x0: grid.mid_x(cell),
-            ..cell
-        },
-        _ => return None,
-    };
-    Some(GlyphRects::single(rect))
+    if let Some(connections) = box_connections(ch) {
+        return Some(box_rects(&connections, grid, cell));
+    }
+    let regions = block_regions(ch)?;
+    let mut rects = GlyphRects::empty();
+    for r in regions.as_slice() {
+        // Splits come from `split_x` / `split_y`, so complementary glyphs in the same cell share each
+        // boundary exactly; a region that rounds to nothing is simply not drawn.
+        rects.push(Rect {
+            x0: grid.split_x(cell, r.x0),
+            y0: grid.split_y(cell, r.y0),
+            x1: grid.split_x(cell, r.x1),
+            y1: grid.split_y(cell, r.y1),
+        });
+    }
+    Some(rects)
 }
 
 /// Builds the rectangles of a box-drawing cell from its connections.
@@ -383,9 +489,9 @@ mod tests {
         // Everything else keeps using the font: other blocks, shades, heavy / double / dashed /
         // rounded / diagonal lines, mixed-weight lines, Powerline and ordinary text.
         for ch in [
-            'a', ' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{2581}', '\u{2589}', '\u{2596}',
-            '\u{2501}', '\u{2503}', '\u{250F}', '\u{2550}', '\u{2551}', '\u{2504}', '\u{254C}',
-            '\u{256D}', '\u{2571}', '\u{253D}', '\u{2574}', '\u{E0B0}', '\u{3042}', '\0',
+            'a', ' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{25A0}', '\u{25FE}', '\u{2501}',
+            '\u{2503}', '\u{250F}', '\u{2550}', '\u{2551}', '\u{2504}', '\u{254C}', '\u{256D}',
+            '\u{2571}', '\u{253D}', '\u{2574}', '\u{E0B0}', '\u{3042}', '\0',
         ] {
             assert!(!is_builtin(ch), "{ch:?}");
             assert!(
@@ -546,11 +652,16 @@ mod tests {
         for (w, h) in [(1.0, 1.0), (0.2 * 1.3333, 0.5 * 1.3333), (200.0, 300.0)] {
             let g = grid(w, h, 1.5);
             for ch in [FULL, UPPER, LOWER, LEFT, RIGHT] {
-                let r = rect_of(ch, &g, 3, 3);
-                assert!(
-                    r.x0.is_finite() && r.y0.is_finite() && r.x1.is_finite() && r.y1.is_finite()
-                );
-                assert!(r.x1 >= r.x0 && r.y1 >= r.y0);
+                // A half of a one-pixel cell may round to nothing; whatever is drawn is sane.
+                for r in glyph_rects(ch, &g, 3, 3).unwrap().as_slice() {
+                    assert!(
+                        r.x0.is_finite()
+                            && r.y0.is_finite()
+                            && r.x1.is_finite()
+                            && r.y1.is_finite()
+                    );
+                    assert!(r.x1 > r.x0 && r.y1 > r.y0);
+                }
             }
         }
     }
@@ -926,6 +1037,447 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+    // ---- partial blocks and quadrants ----
+
+    /// (code point, expected filled area in eighths: x0, y0, x1, y1) of every single-rectangle block,
+    /// written from the Unicode names, independently of the code under test.
+    const SINGLE: [(char, [u8; 4]); 23] = [
+        ('\u{2580}', [0, 0, 8, 4]), // UPPER HALF BLOCK
+        ('\u{2581}', [0, 7, 8, 8]), // LOWER ONE EIGHTH BLOCK
+        ('\u{2582}', [0, 6, 8, 8]), // LOWER ONE QUARTER BLOCK
+        ('\u{2583}', [0, 5, 8, 8]), // LOWER THREE EIGHTHS BLOCK
+        ('\u{2584}', [0, 4, 8, 8]), // LOWER HALF BLOCK
+        ('\u{2585}', [0, 3, 8, 8]), // LOWER FIVE EIGHTHS BLOCK
+        ('\u{2586}', [0, 2, 8, 8]), // LOWER THREE QUARTERS BLOCK
+        ('\u{2587}', [0, 1, 8, 8]), // LOWER SEVEN EIGHTHS BLOCK
+        ('\u{2588}', [0, 0, 8, 8]), // FULL BLOCK
+        ('\u{2589}', [0, 0, 7, 8]), // LEFT SEVEN EIGHTHS BLOCK
+        ('\u{258A}', [0, 0, 6, 8]), // LEFT THREE QUARTERS BLOCK
+        ('\u{258B}', [0, 0, 5, 8]), // LEFT FIVE EIGHTHS BLOCK
+        ('\u{258C}', [0, 0, 4, 8]), // LEFT HALF BLOCK
+        ('\u{258D}', [0, 0, 3, 8]), // LEFT THREE EIGHTHS BLOCK
+        ('\u{258E}', [0, 0, 2, 8]), // LEFT ONE QUARTER BLOCK
+        ('\u{258F}', [0, 0, 1, 8]), // LEFT ONE EIGHTH BLOCK
+        ('\u{2590}', [4, 0, 8, 8]), // RIGHT HALF BLOCK
+        ('\u{2594}', [0, 0, 8, 1]), // UPPER ONE EIGHTH BLOCK
+        ('\u{2595}', [7, 0, 8, 8]), // RIGHT ONE EIGHTH BLOCK
+        ('\u{2598}', [0, 0, 4, 4]), // QUADRANT UPPER LEFT
+        ('\u{259D}', [4, 0, 8, 4]), // QUADRANT UPPER RIGHT
+        ('\u{2596}', [0, 4, 4, 8]), // QUADRANT LOWER LEFT
+        ('\u{2597}', [4, 4, 8, 8]), // QUADRANT LOWER RIGHT
+    ];
+
+    /// Quadrant characters and the quadrants each fills: (upper left, upper right, lower left, lower right).
+    const QUADRANT_CHARS: [(char, [bool; 4]); 10] = [
+        ('\u{2596}', [false, false, true, false]),
+        ('\u{2597}', [false, false, false, true]),
+        ('\u{2598}', [true, false, false, false]),
+        ('\u{2599}', [true, false, true, true]),
+        ('\u{259A}', [true, false, false, true]),
+        ('\u{259B}', [true, true, true, false]),
+        ('\u{259C}', [true, true, false, true]),
+        ('\u{259D}', [false, true, false, false]),
+        ('\u{259E}', [false, true, true, false]),
+        ('\u{259F}', [false, true, true, true]),
+    ];
+
+    /// Every block character this module draws (shades excluded).
+    fn all_blocks() -> Vec<char> {
+        (0x2580u32..=0x259F)
+            .filter_map(char::from_u32)
+            .filter(|&ch| block_regions(ch).is_some())
+            .collect()
+    }
+
+    /// Cells of whole physical pixels, odd and even, plus the fractional ones used elsewhere.
+    const BLOCK_CASES: [(f32, f32, f32); 16] = [
+        (8.0, 16.0, 1.0),
+        (7.0, 15.0, 1.0),
+        (9.0, 17.0, 1.0),
+        (10.0, 19.0, 1.0),
+        (6.5, 13.0, 1.0),
+        (6.5, 13.0, 1.25),
+        (6.5, 13.0, 1.5),
+        (9.6, 19.2, 1.0),
+        (9.6, 19.2, 1.25),
+        (9.6, 19.2, 1.5),
+        (10.0, 19.0, 1.25),
+        (10.0, 19.0, 1.5),
+        (7.617, 15.107, 1.0),
+        (7.147, 15.222, 1.25),
+        (12.0, 24.0, 1.0),
+        (8.5, 18.0, 1.75),
+    ];
+
+    fn raster_of(ch: char, g: &CellGrid, col: i32, line: i32, into: &mut Raster) {
+        let rects = glyph_rects(ch, g, col, line).expect("builtin");
+        for r in rects.as_slice() {
+            into.paint(r, g.scale);
+        }
+    }
+
+    /// Physical pixels covered by `ch` in cell (1, 1), as a raster of the 3x3 cell block around it.
+    fn cell_raster(ch: char, g: &CellGrid) -> Raster {
+        let mut raster = Raster::new(
+            (g.x_edge(3) * g.scale).round() as usize + 1,
+            (g.y_edge(3) * g.scale).round() as usize + 1,
+        );
+        raster_of(ch, g, 1, 1, &mut raster);
+        raster
+    }
+
+    fn covered(r: &Raster) -> usize {
+        r.px.iter().filter(|&&n| n > 0).count()
+    }
+
+    #[test]
+    fn the_filled_area_of_every_block_matches_its_unicode_name() {
+        for &(ch, expected) in SINGLE.iter() {
+            let regions = block_regions(ch).unwrap_or_else(|| panic!("{ch:?}"));
+            assert_eq!(regions.as_slice().len(), 1, "{ch:?}");
+            let r = regions.as_slice()[0];
+            assert_eq!([r.x0, r.y0, r.x1, r.y1], expected, "{ch:?}");
+        }
+    }
+
+    #[test]
+    fn quadrant_characters_fill_exactly_their_named_quadrants() {
+        let g = grid(16.0, 32.0, 1.0);
+        let cell = g.cell(1, 1);
+        let (mx, my) = (g.split_x(cell, 4), g.split_y(cell, 4));
+        for (ch, [ul, ur, ll, lr]) in QUADRANT_CHARS {
+            let raster = cell_raster(ch, &g);
+            // Probe the centre of each quadrant.
+            let probe =
+                |x: f32, y: f32| raster.at((x * g.scale) as usize, (y * g.scale) as usize) > 0;
+            let ul_p = probe((cell.x0 + mx) / 2.0, (cell.y0 + my) / 2.0);
+            let ur_p = probe((mx + cell.x1) / 2.0, (cell.y0 + my) / 2.0);
+            let ll_p = probe((cell.x0 + mx) / 2.0, (my + cell.y1) / 2.0);
+            let lr_p = probe((mx + cell.x1) / 2.0, (my + cell.y1) / 2.0);
+            assert_eq!([ul_p, ur_p, ll_p, lr_p], [ul, ur, ll, lr], "{ch:?}");
+            // Whole quadrants only: covered area is the number of quadrants times a quarter.
+            let n = [ul, ur, ll, lr].iter().filter(|&&q| q).count();
+            let cell_px =
+                ((cell.x1 - cell.x0) * g.scale * (cell.y1 - cell.y0) * g.scale).round() as usize;
+            assert_eq!(covered(&raster), cell_px * n / 4, "{ch:?}");
+        }
+    }
+
+    #[test]
+    fn quadrant_shapes_use_at_most_two_rectangles() {
+        for (ch, _) in QUADRANT_CHARS {
+            let n = block_regions(ch).unwrap().as_slice().len();
+            assert!((1..=2).contains(&n), "{ch:?}: {n}");
+        }
+        for ch in all_blocks() {
+            assert!(block_regions(ch).unwrap().as_slice().len() <= MAX_RECTS);
+        }
+        // 2×2 quadrant masks that are a whole row or column collapse to one rectangle.
+        assert_eq!(block_regions('\u{2599}').unwrap().as_slice().len(), 2); // UL + bottom row
+        assert_eq!(block_regions('\u{259B}').unwrap().as_slice().len(), 2); // top row + LL
+        assert_eq!(block_regions('\u{259A}').unwrap().as_slice().len(), 2); // diagonal
+        assert_eq!(block_regions('\u{259E}').unwrap().as_slice().len(), 2); // diagonal
+    }
+
+    #[test]
+    fn all_twenty_four_new_blocks_and_the_old_five_are_built_in_and_shades_are_not() {
+        let blocks = all_blocks();
+        assert_eq!(blocks.len(), 29, "{blocks:?}");
+        for ch in &blocks {
+            assert!(is_builtin(*ch));
+        }
+        for cp in [0x2591u32, 0x2592, 0x2593, 0x2593 + 0x100] {
+            let ch = char::from_u32(cp).unwrap();
+            assert!(block_regions(ch).is_none() || cp > 0x259F, "{ch:?}");
+        }
+        for cp in [0x2591u32, 0x2592, 0x2593] {
+            let ch = char::from_u32(cp).unwrap();
+            assert!(!is_builtin(ch), "{ch:?} must stay with the font");
+        }
+        // Neighbours just outside U+2580..=U+259F.
+        for ch in ['\u{257F}', '\u{25A0}'] {
+            assert!(block_regions(ch).is_none());
+        }
+    }
+
+    #[test]
+    fn rectangles_have_positive_area_stay_in_the_cell_and_never_overlap() {
+        for (w, h, s) in BLOCK_CASES {
+            let g = grid(w, h, s);
+            let cell = g.cell(1, 1);
+            for ch in all_blocks() {
+                let mut raster = Raster::new(
+                    (g.x_edge(3) * s).round() as usize + 1,
+                    (g.y_edge(3) * s).round() as usize + 1,
+                );
+                for r in glyph_rects(ch, &g, 1, 1).unwrap().as_slice() {
+                    assert!(
+                        r.width() > 0.0 && r.height() > 0.0,
+                        "{ch:?} {w}x{h}@{s}: {r:?}"
+                    );
+                    assert!(
+                        r.x0 >= cell.x0 && r.x1 <= cell.x1 && r.y0 >= cell.y0 && r.y1 <= cell.y1,
+                        "{ch:?} {w}x{h}@{s}: {r:?} outside {cell:?}"
+                    );
+                    raster.paint(r, s);
+                }
+                assert!(
+                    raster.px.iter().all(|&n| n <= 1),
+                    "{ch:?} {w}x{h}@{s}: overlap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_boundaries_are_ordered_on_the_pixel_grid_and_shared() {
+        for (w, h, s) in BLOCK_CASES {
+            let g = grid(w, h, s);
+            for (col, line) in [(0, 0), (1, 1), (7, 3), (135, 54)] {
+                let cell = g.cell(col, line);
+                assert_eq!(g.split_x(cell, 0), cell.x0);
+                assert_eq!(g.split_x(cell, 8), cell.x1);
+                assert_eq!(g.split_y(cell, 0), cell.y0);
+                assert_eq!(g.split_y(cell, 8), cell.y1);
+                let mut prev = (cell.x0, cell.y0);
+                for k in 1..=8u8 {
+                    let (x, y) = (g.split_x(cell, k), g.split_y(cell, k));
+                    assert!(x >= prev.0 && y >= prev.1, "{w}x{h}@{s} k={k}: order");
+                    assert!(x <= cell.x1 && y <= cell.y1);
+                    for v in [x * s, y * s] {
+                        // Snapping happens on absolute window coordinates; origin is 0 here.
+                        assert!((v - v.round()).abs() < 1e-3, "{w}x{h}@{s} k={k}: {v}");
+                    }
+                    // Within half a physical pixel of the ideal split.
+                    let ideal_x = cell.x0 + (cell.x1 - cell.x0) * f32::from(k) / 8.0;
+                    let ideal_y = cell.y0 + (cell.y1 - cell.y0) * f32::from(k) / 8.0;
+                    assert!((x - ideal_x).abs() <= 0.5 / s + 1e-3, "{w}x{h}@{s} k={k}");
+                    assert!((y - ideal_y).abs() <= 0.5 / s + 1e-3, "{w}x{h}@{s} k={k}");
+                    prev = (x, y);
+                }
+            }
+        }
+    }
+
+    /// Pairs of blocks that together fill the cell exactly: (a, b).
+    const TILING_PAIRS: [(char, char); 9] = [
+        ('\u{2587}', '\u{2594}'), // lower 7/8 + upper 1/8
+        ('\u{2584}', '\u{2580}'), // lower half + upper half
+        ('\u{2589}', '\u{2595}'), // left 7/8 + right 1/8
+        ('\u{258C}', '\u{2590}'), // left half + right half
+        ('\u{2598}', '\u{259F}'), // UL + (UR LL LR)
+        ('\u{2596}', '\u{259C}'), // LL + (UL UR LR)
+        ('\u{2597}', '\u{259B}'), // LR + (UL UR LL)
+        ('\u{259D}', '\u{2599}'), // UR + (UL LL LR)
+        ('\u{259A}', '\u{259E}'), // UL LR + UR LL
+    ];
+
+    #[test]
+    fn complementary_blocks_tile_the_cell_with_no_gap_and_no_overlap() {
+        for (w, h, s) in BLOCK_CASES {
+            let g = grid(w, h, s);
+            let cell = g.cell(1, 1);
+            let full = {
+                let mut r = Raster::new(
+                    (g.x_edge(3) * s).round() as usize + 1,
+                    (g.y_edge(3) * s).round() as usize + 1,
+                );
+                raster_of('\u{2588}', &g, 1, 1, &mut r);
+                r
+            };
+            for &(a, b) in &TILING_PAIRS {
+                let mut r = Raster::new(full.w, full.h);
+                raster_of(a, &g, 1, 1, &mut r);
+                raster_of(b, &g, 1, 1, &mut r);
+                assert!(
+                    r.px.iter().all(|&n| n <= 1),
+                    "{a:?}+{b:?} {w}x{h}@{s}: overlap"
+                );
+                assert_eq!(r.px, full.px, "{a:?}+{b:?} {w}x{h}@{s}: gap");
+            }
+            let _ = cell;
+        }
+    }
+
+    #[test]
+    fn lower_and_left_eighths_grow_monotonically_and_fill_the_named_share() {
+        for (w, h, s) in BLOCK_CASES {
+            let g = grid(w, h, s);
+            let cell = g.cell(1, 1);
+            let (cw, ch_) = ((cell.x1 - cell.x0) * s, (cell.y1 - cell.y0) * s);
+            let mut last_lower = 0usize;
+            let mut last_left = 0usize;
+            for n in 1..=8u32 {
+                let lower = char::from_u32(0x2580 + n).unwrap();
+                let left = char::from_u32(0x2590 - n).unwrap();
+                let (lo, le) = (
+                    covered(&cell_raster(lower, &g)),
+                    covered(&cell_raster(left, &g)),
+                );
+                assert!(
+                    lo >= last_lower && le >= last_left,
+                    "{w}x{h}@{s} n={n}: not monotonic"
+                );
+                // Share of the cell within one physical pixel row / column of n/8.
+                let lo_expected = ch_ * n as f32 / 8.0;
+                let le_expected = cw * n as f32 / 8.0;
+                let lo_rows = lo as f32 / cw.round();
+                let le_cols = le as f32 / ch_.round();
+                assert!(
+                    (lo_rows - lo_expected).abs() <= 1.0,
+                    "{w}x{h}@{s} lower {n}/8: {lo_rows} vs {lo_expected}"
+                );
+                assert!(
+                    (le_cols - le_expected).abs() <= 1.0,
+                    "{w}x{h}@{s} left {n}/8: {le_cols} vs {le_expected}"
+                );
+                last_lower = lo;
+                last_left = le;
+            }
+        }
+    }
+
+    #[test]
+    fn mirrored_blocks_are_mirror_images_within_one_physical_pixel() {
+        // lower n/8 vs upper n/8 and left vs right only exist for 1/8 and 1/2; compare those.
+        for (w, h, s) in BLOCK_CASES {
+            let g = grid(w, h, s);
+            let cell = g.cell(1, 1);
+            let up = glyph_rects('\u{2594}', &g, 1, 1).unwrap().as_slice()[0];
+            let lo = glyph_rects('\u{2581}', &g, 1, 1).unwrap().as_slice()[0];
+            let (top, bottom) = ((up.y1 - up.y0) * s, (lo.y1 - lo.y0) * s);
+            assert!(
+                (top - bottom).abs() <= 1.0 + 1e-3,
+                "{w}x{h}@{s}: {top} vs {bottom}"
+            );
+            let le = glyph_rects('\u{258F}', &g, 1, 1).unwrap().as_slice()[0];
+            let ri = glyph_rects('\u{2595}', &g, 1, 1).unwrap().as_slice()[0];
+            let (l, r) = ((le.x1 - le.x0) * s, (ri.x1 - ri.x0) * s);
+            assert!((l - r).abs() <= 1.0 + 1e-3, "{w}x{h}@{s}: {l} vs {r}");
+            assert_eq!(
+                (up.y0, lo.y1, le.x0, ri.x1),
+                (cell.y0, cell.y1, cell.x0, cell.x1)
+            );
+        }
+    }
+
+    #[test]
+    fn quadrant_unions_equal_their_single_quadrants() {
+        for (w, h, s) in BLOCK_CASES {
+            let g = grid(w, h, s);
+            let single = |ch| cell_raster(ch, &g);
+            let (ul, ur, ll, lr) = (
+                single('\u{2598}'),
+                single('\u{259D}'),
+                single('\u{2596}'),
+                single('\u{2597}'),
+            );
+            for (ch, [qul, qur, qll, qlr]) in QUADRANT_CHARS {
+                let mut expected = Raster::new(ul.w, ul.h);
+                for (on, q) in [(qul, &ul), (qur, &ur), (qll, &ll), (qlr, &lr)] {
+                    if on {
+                        for (e, p) in expected.px.iter_mut().zip(&q.px) {
+                            *e += p;
+                        }
+                    }
+                }
+                assert_eq!(cell_raster(ch, &g).px, expected.px, "{ch:?} {w}x{h}@{s}");
+            }
+        }
+    }
+
+    #[test]
+    fn neighbouring_block_cells_meet_without_a_seam() {
+        // A row of left-seven-eighths blocks next to right-one-eighth blocks, and stacked lower blocks.
+        for (w, h, s) in BLOCK_CASES {
+            let g = grid(w, h, s);
+            for ch in all_blocks() {
+                for col in 0..30 {
+                    let (a, b) = (
+                        glyph_rects(ch, &g, col, 0).unwrap(),
+                        glyph_rects(ch, &g, col + 1, 0).unwrap(),
+                    );
+                    // Same shape in the same row: heights match exactly, and each lies in its own cell.
+                    for (ra, rb) in a.as_slice().iter().zip(b.as_slice()) {
+                        assert_eq!((ra.y0, ra.y1), (rb.y0, rb.y1), "{ch:?} {w}x{h}@{s}");
+                    }
+                }
+            }
+            // Full blocks in a column abut exactly, including the slice a lower 1/8 leaves for the next row.
+            for line in 0..30 {
+                let a = glyph_rects('\u{2581}', &g, 0, line).unwrap().as_slice()[0];
+                let b = glyph_rects('\u{2594}', &g, 0, line + 1).unwrap().as_slice()[0];
+                assert_eq!(a.y1, b.y0, "{w}x{h}@{s} line {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn collapsing_eighths_of_tiny_cells_stay_ordered_and_never_negative() {
+        for (w, h, s) in [
+            (3.0, 3.0, 1.0),
+            (5.0, 5.0, 1.0),
+            (2.0, 4.0, 1.5),
+            (0.5, 0.7, 1.0),
+        ] {
+            let g = grid(w, h, s);
+            for ch in all_blocks() {
+                let cell = g.cell(2, 2);
+                for r in glyph_rects(ch, &g, 2, 2).unwrap().as_slice() {
+                    assert!(r.x1 > r.x0 && r.y1 > r.y0, "{ch:?} {w}x{h}@{s}: {r:?}");
+                    assert!(
+                        r.x0 >= cell.x0 && r.x1 <= cell.x1 && r.y0 >= cell.y0 && r.y1 <= cell.y1
+                    );
+                }
+            }
+            // The complement of whatever collapsed still tiles: lower 7/8 + upper 1/8.
+            let mut r = Raster::new(
+                (g.x_edge(5) * s).round() as usize + 1,
+                (g.y_edge(5) * s).round() as usize + 1,
+            );
+            raster_of('\u{2587}', &g, 2, 2, &mut r);
+            raster_of('\u{2594}', &g, 2, 2, &mut r);
+            assert!(r.px.iter().all(|&n| n <= 1), "{w}x{h}@{s}: overlap");
+        }
+    }
+
+    #[test]
+    fn the_thirty_two_code_points_split_into_five_existing_twenty_four_new_and_three_shades() {
+        let existing: [u32; 5] = [0x2580, 0x2584, 0x2588, 0x258C, 0x2590];
+        let new: Vec<u32> = [
+            0x2581, 0x2582, 0x2583, 0x2585, 0x2586, 0x2587, 0x2589, 0x258A, 0x258B,
+        ]
+        .into_iter()
+        .chain([0x258D, 0x258E, 0x258F, 0x2594, 0x2595])
+        .chain(0x2596..=0x259F)
+        .collect();
+        let shades: [u32; 3] = [0x2591, 0x2592, 0x2593];
+        assert_eq!(new.len(), 24);
+        for cp in 0x2580u32..=0x259F {
+            let ch = char::from_u32(cp).unwrap();
+            let class = [
+                existing.contains(&cp),
+                new.contains(&cp),
+                shades.contains(&cp),
+            ];
+            assert_eq!(
+                class.iter().filter(|&&c| c).count(),
+                1,
+                "{cp:04X} is in exactly one class"
+            );
+            assert_eq!(block_regions(ch).is_some(), !class[2], "{cp:04X}");
+            assert_eq!(is_builtin(ch), !class[2], "{cp:04X}");
+        }
+        // Every one of the 29 is covered by an expected-area table (single rectangles) or the quadrants.
+        let table: Vec<u32> = SINGLE.iter().map(|&(ch, _)| ch as u32).collect();
+        let quads: Vec<u32> = QUADRANT_CHARS.iter().map(|&(ch, _)| ch as u32).collect();
+        for cp in existing.iter().chain(&new) {
+            assert!(
+                table.contains(cp) || quads.contains(cp),
+                "{cp:04X} has no expectation"
+            );
         }
     }
 }
