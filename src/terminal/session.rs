@@ -280,10 +280,13 @@ pub struct TerminalSession {
     state: Arc<Mutex<SessionState>>,
     window_size: Arc<Mutex<WindowSize>>,
     selection_anchor: Mutex<Option<alacritty_terminal::index::Point>>,
+    shell_program: String,
+    integration_launch: crate::terminal::shell::ShellIntegrationLaunch,
 }
 
 impl TerminalSession {
     /// Spawns a new terminal session with the default shell, in the default directory.
+    #[allow(dead_code)]
     pub fn spawn(
         cols: u16,
         rows: u16,
@@ -296,6 +299,7 @@ impl TerminalSession {
 
     /// Spawns a new terminal session with the default shell, started in `working_directory` when
     /// given. The shell is set up to report its directory (see [`Launch`]).
+    #[allow(dead_code)]
     pub fn spawn_in(
         cols: u16,
         rows: u16,
@@ -306,6 +310,28 @@ impl TerminalSession {
     ) -> Result<Self, String> {
         Self::spawn_launch(
             Launch::resolve_default(),
+            cols,
+            rows,
+            cell_width,
+            cell_height,
+            event_tx,
+            working_directory,
+        )
+    }
+
+    /// Spawns a new terminal session configured according to [`crate::settings::TerminalSettings`].
+    pub fn spawn_with_settings(
+        settings: &crate::settings::TerminalSettings,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+        event_tx: impl Into<EventSink>,
+        working_directory: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let launch = Launch::from_settings(settings, std::env::var("PROMPT").ok().as_deref())?;
+        Self::spawn_launch(
+            launch,
             cols,
             rows,
             cell_width,
@@ -328,6 +354,8 @@ impl TerminalSession {
         #[cfg(all(test, windows))]
         wait_for_shells_at_test_exit();
 
+        let shell_program = launch.config.program.clone();
+        let integration_launch = launch.integration_launch;
         let event_tx = event_tx.into();
         let options = Options {
             drain_on_exit: true,
@@ -386,7 +414,19 @@ impl TerminalSession {
             state,
             window_size: shared_window_size,
             selection_anchor: Mutex::new(None),
+            shell_program,
+            integration_launch,
         })
+    }
+
+    /// Returns the executable path or name of the shell running in this session.
+    pub fn shell_program(&self) -> &str {
+        &self.shell_program
+    }
+
+    /// Returns the Shell Integration disposition determined at session launch.
+    pub fn integration_launch(&self) -> crate::terminal::shell::ShellIntegrationLaunch {
+        self.integration_launch
     }
 
     /// Access the underlying locked terminal for rendering and state queries.

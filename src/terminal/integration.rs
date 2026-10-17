@@ -116,6 +116,30 @@ pub struct StateMachineMetrics {
     pub shell_exit_interrupted_count: u64,
 }
 
+/// Tab-level operational status of Shell Integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellIntegrationStatus {
+    /// Active: received both prompt (A/B) and command execution (C/D) markers.
+    Active,
+    /// Active (Prompt only): received prompt markers (A/B), but command execution markers (C/D) have not been observed.
+    ActivePromptOnly,
+    /// Waiting: injected/applied at launch, waiting for first marker from the shell.
+    Waiting,
+    /// Disabled: explicitly disabled by user configuration.
+    Disabled,
+    /// Unsupported: shell executable does not support OSC 133 (e.g. cmd.exe or non-PowerShell executable).
+    Unsupported,
+    /// Unavailable: shell process exited or failed without emitting any markers.
+    Unavailable,
+}
+
+impl ShellIntegrationStatus {
+    /// True if the session has received verified OSC 133 prompt or command markers.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Active | Self::ActivePromptOnly)
+    }
+}
+
 /// Pure state machine coordinating OSC 133 markers into verified command events.
 #[derive(Debug, Clone)]
 pub struct CommandStateMachine {
@@ -123,6 +147,7 @@ pub struct CommandStateMachine {
     next_command_id: u64,
     metrics: StateMachineMetrics,
     last_verified_event: Option<VerifiedCommandEvent>,
+    last_result: Option<CommandResult>,
 }
 
 impl Default for CommandStateMachine {
@@ -139,6 +164,7 @@ impl CommandStateMachine {
             next_command_id: 0,
             metrics: StateMachineMetrics::default(),
             last_verified_event: None,
+            last_result: None,
         }
     }
 
@@ -296,6 +322,10 @@ impl CommandStateMachine {
         self.next_command_id = new_id;
         self.last_verified_event = event;
 
+        if let Some(VerifiedCommandEvent::CommandFinished { result, .. }) = event {
+            self.last_result = Some(result);
+        }
+
         match marker {
             Osc133Marker::PromptStarted => self.metrics.prompt_count += 1,
             Osc133Marker::InputStarted => self.metrics.input_count += 1,
@@ -331,6 +361,7 @@ impl CommandStateMachine {
             self.state = CommandState::Finished { command_id, result };
             let event = VerifiedCommandEvent::CommandFinished { command_id, result };
             self.last_verified_event = Some(event);
+            self.last_result = Some(result);
             debug_log(|| {
                 format!(
                     "shell exit interrupted active command: command_id={command_id}, result={result:?}"
@@ -340,6 +371,11 @@ impl CommandStateMachine {
         } else {
             None
         }
+    }
+
+    /// Returns the result of the last finished command, if any.
+    pub fn last_result(&self) -> Option<CommandResult> {
+        self.last_result
     }
 }
 
@@ -546,5 +582,56 @@ mod tests {
 
         // When not executing, on_shell_exit does nothing
         assert_eq!(sm.on_shell_exit(), None);
+    }
+
+    #[test]
+    fn last_result_tracks_confirmed_command_results() {
+        let mut sm = CommandStateMachine::new();
+        assert_eq!(sm.last_result(), None);
+
+        // Orphaned D does not record a last result
+        sm.transition(Osc133Marker::CommandFinished(Some(0)));
+        assert_eq!(sm.last_result(), None);
+
+        // Command 1 -> D;0
+        sm.transition(Osc133Marker::CommandStarted);
+        sm.transition(Osc133Marker::CommandFinished(Some(0)));
+        assert_eq!(sm.last_result(), Some(CommandResult::Success));
+
+        // Prompt arrives -> last_result remains 0
+        sm.transition(Osc133Marker::PromptStarted);
+        assert_eq!(sm.last_result(), Some(CommandResult::Success));
+
+        // Command 2 -> D;42
+        sm.transition(Osc133Marker::CommandStarted);
+        // While executing, last_result is still the previous finished command
+        assert_eq!(sm.last_result(), Some(CommandResult::Success));
+        sm.transition(Osc133Marker::CommandFinished(Some(42)));
+        assert_eq!(sm.last_result(), Some(CommandResult::Failure(42)));
+
+        // Command 3 -> D (None)
+        sm.transition(Osc133Marker::CommandStarted);
+        sm.transition(Osc133Marker::CommandFinished(None));
+        assert_eq!(sm.last_result(), Some(CommandResult::Unknown));
+
+        // Command 4 -> interrupted by next prompt A
+        sm.transition(Osc133Marker::CommandStarted);
+        sm.transition(Osc133Marker::PromptStarted);
+        assert_eq!(sm.last_result(), Some(CommandResult::Unknown));
+
+        // Command 5 -> interrupted by shell exit
+        sm.transition(Osc133Marker::CommandStarted);
+        sm.on_shell_exit();
+        assert_eq!(sm.last_result(), Some(CommandResult::Unknown));
+    }
+
+    #[test]
+    fn shell_integration_status_is_active() {
+        assert!(ShellIntegrationStatus::Active.is_active());
+        assert!(ShellIntegrationStatus::ActivePromptOnly.is_active());
+        assert!(!ShellIntegrationStatus::Waiting.is_active());
+        assert!(!ShellIntegrationStatus::Disabled.is_active());
+        assert!(!ShellIntegrationStatus::Unsupported.is_active());
+        assert!(!ShellIntegrationStatus::Unavailable.is_active());
     }
 }

@@ -76,6 +76,17 @@ fn shell_kind(program: &str) -> Option<ShellKind> {
     }
 }
 
+/// The OSC 133 integration injection disposition decided at launch time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellIntegrationLaunch {
+    /// Injected OSC 133 hooks into PowerShell.
+    Injected,
+    /// Explicitly disabled by user configuration or environment.
+    Disabled,
+    /// Shell does not support OSC 133 hooks (e.g. cmd.exe or generic executable).
+    Unsupported,
+}
+
 /// How a shell is started so that it reports its working directory, with nothing written to the
 /// user's profile or configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +96,8 @@ pub struct Launch {
     pub env: HashMap<String, String>,
     /// Whether the shell was set up to report its working directory.
     pub integrated: bool,
+    /// The OSC 133 integration launch disposition for this session.
+    pub integration_launch: ShellIntegrationLaunch,
 }
 
 impl Launch {
@@ -105,10 +118,20 @@ impl Launch {
         local_host: &str,
         existing_prompt: Option<&str>,
     ) -> Self {
+        let integration_launch = if !enabled {
+            ShellIntegrationLaunch::Disabled
+        } else {
+            match shell_kind(&config.program) {
+                Some(ShellKind::PowerShell) => ShellIntegrationLaunch::Injected,
+                _ => ShellIntegrationLaunch::Unsupported,
+            }
+        };
+
         let plain = |config| Self {
             config,
             env: HashMap::new(),
             integrated: false,
+            integration_launch,
         };
         if !enabled || !config.args.is_empty() {
             return plain(config);
@@ -127,6 +150,7 @@ impl Launch {
                     },
                     env: HashMap::new(),
                     integrated: true,
+                    integration_launch,
                 }
             }
             Some(ShellKind::Cmd) => {
@@ -135,21 +159,71 @@ impl Launch {
                     config,
                     env: HashMap::from([("PROMPT".to_string(), prompt)]),
                     integrated: true,
+                    integration_launch,
                 }
             }
             None => plain(config),
         }
     }
 
-    /// The launch for the default shell, honoring [`SHELL_INTEGRATION_ENV`].
-    pub fn resolve_default() -> Self {
-        let enabled = !env::var(SHELL_INTEGRATION_ENV).is_ok_and(|v| v.trim() == "0");
-        Self::new(
-            ShellConfig::resolve_default(),
+    /// Resolves a launch from user settings, honoring custom executable paths and integration toggles.
+    pub fn from_settings(
+        settings: &crate::settings::TerminalSettings,
+        existing_prompt: Option<&str>,
+    ) -> Result<Self, String> {
+        let enabled = match settings.shell_integration {
+            crate::settings::ShellIntegrationMode::Auto => {
+                !env::var(SHELL_INTEGRATION_ENV).is_ok_and(|v| v.trim() == "0")
+            }
+            crate::settings::ShellIntegrationMode::Disabled => false,
+            crate::settings::ShellIntegrationMode::Unknown(ref raw) => {
+                return Err(format!("unknown terminal.shell_integration: {raw:?}"));
+            }
+        };
+
+        let config = match settings.shell_mode {
+            crate::settings::ShellMode::Auto => ShellConfig::resolve_default(),
+            crate::settings::ShellMode::Custom => {
+                let validated_path = crate::settings::validate_shell_path(&settings.shell_path)
+                    .map_err(|err| {
+                        format!(
+                            "invalid terminal.shell_path {:?}: {:?}",
+                            settings.shell_path, err
+                        )
+                    })?;
+                ShellConfig {
+                    program: validated_path.to_string_lossy().into_owned(),
+                    args: vec![],
+                }
+            }
+            crate::settings::ShellMode::Unknown(ref raw) => {
+                return Err(format!("unknown terminal.shell_mode: {raw:?}"));
+            }
+        };
+
+        Ok(Self::new(
+            config,
             enabled,
             &crate::terminal::cwd::local_host_name(),
+            existing_prompt,
+        ))
+    }
+
+    /// The launch for the default shell, honoring [`SHELL_INTEGRATION_ENV`].
+    #[allow(dead_code)]
+    pub fn resolve_default() -> Self {
+        Self::from_settings(
+            &crate::settings::TerminalSettings::default(),
             env::var("PROMPT").ok().as_deref(),
         )
+        .unwrap_or_else(|_| {
+            Self::new(
+                ShellConfig::resolve_default(),
+                true,
+                &crate::terminal::cwd::local_host_name(),
+                None,
+            )
+        })
     }
 }
 
@@ -337,6 +411,97 @@ mod tests {
             script.contains("PSConsoleHostReadLine"),
             "Must hook PSConsoleHostReadLine for command boundaries"
         );
+    }
+
+    #[test]
+    fn launch_from_settings_auto_auto() {
+        let settings = crate::settings::TerminalSettings::default();
+        let launch = Launch::from_settings(&settings, None).expect("should resolve auto launch");
+        assert!(launch.integrated);
+    }
+
+    #[test]
+    fn launch_from_settings_auto_disabled() {
+        let mut settings = crate::settings::TerminalSettings::default();
+        settings.shell_integration = crate::settings::ShellIntegrationMode::Disabled;
+        let launch = Launch::from_settings(&settings, None).expect("should resolve");
+        assert!(!launch.integrated);
+        assert!(launch.config.args.is_empty());
+        assert!(launch.env.is_empty());
+    }
+
+    #[test]
+    fn launch_from_settings_custom_cmd() {
+        let mut settings = crate::settings::TerminalSettings::default();
+        settings.shell_mode = crate::settings::ShellMode::Custom;
+        settings.shell_path = r"C:\Windows\System32\cmd.exe".to_string();
+        settings.shell_integration = crate::settings::ShellIntegrationMode::Auto;
+
+        let launch = Launch::from_settings(&settings, Some("$P$G")).expect("cmd launch");
+        assert!(launch.integrated);
+        assert_eq!(launch.config.program, r"C:\Windows\System32\cmd.exe");
+        assert!(launch.config.args.is_empty());
+        assert!(launch.env.contains_key("PROMPT"));
+    }
+
+    #[test]
+    fn launch_from_settings_custom_powershell_and_disabled() {
+        if let Some(pwsh_path) = installed::pwsh().or_else(installed::windows_powershell) {
+            let mut settings = crate::settings::TerminalSettings::default();
+            settings.shell_mode = crate::settings::ShellMode::Custom;
+            settings.shell_path = pwsh_path.clone();
+            settings.shell_integration = crate::settings::ShellIntegrationMode::Auto;
+
+            let launch_auto = Launch::from_settings(&settings, None).expect("pwsh auto launch");
+            assert!(launch_auto.integrated);
+            assert_eq!(launch_auto.config.args.len(), 3);
+            assert_eq!(launch_auto.config.args[0], "-NoExit");
+            assert_eq!(launch_auto.config.args[1], "-EncodedCommand");
+
+            settings.shell_integration = crate::settings::ShellIntegrationMode::Disabled;
+            let launch_dis = Launch::from_settings(&settings, None).expect("pwsh disabled launch");
+            assert!(!launch_dis.integrated);
+            assert!(launch_dis.config.args.is_empty());
+            assert!(launch_dis.env.is_empty());
+        }
+    }
+
+    #[test]
+    fn launch_from_settings_custom_non_shell_exe_is_untouched() {
+        let notepad_path = r"C:\Windows\System32\notepad.exe".to_string();
+        if std::path::Path::new(&notepad_path).exists() {
+            let mut settings = crate::settings::TerminalSettings::default();
+            settings.shell_mode = crate::settings::ShellMode::Custom;
+            settings.shell_path = notepad_path.clone();
+            settings.shell_integration = crate::settings::ShellIntegrationMode::Auto;
+
+            let launch = Launch::from_settings(&settings, None).expect("other exe launch");
+            assert!(!launch.integrated);
+            assert_eq!(launch.config.program, notepad_path);
+            assert!(launch.config.args.is_empty());
+            assert!(launch.env.is_empty());
+        }
+    }
+
+    #[test]
+    fn launch_from_settings_custom_invalid_path_errors() {
+        let mut settings = crate::settings::TerminalSettings::default();
+        settings.shell_mode = crate::settings::ShellMode::Custom;
+        settings.shell_path =
+            r"C:\Windows\System32\definitely_not_a_real_shell_xyz.exe".to_string();
+
+        let err = Launch::from_settings(&settings, None).unwrap_err();
+        assert!(err.contains("invalid terminal.shell_path"), "{err}");
+    }
+
+    #[test]
+    fn launch_from_settings_unknown_integration_errors() {
+        let mut settings = crate::settings::TerminalSettings::default();
+        settings.shell_integration =
+            crate::settings::ShellIntegrationMode::Unknown("bogus".to_string());
+
+        let err = Launch::from_settings(&settings, None).unwrap_err();
+        assert!(err.contains("unknown terminal.shell_integration"), "{err}");
     }
 }
 

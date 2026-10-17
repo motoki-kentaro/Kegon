@@ -7,7 +7,8 @@ mod precedence;
 mod store;
 
 pub use model::{
-    AppearanceSettings, ApplicationSettings, LocalePreference, TerminalMetric, ThemePreference,
+    AppearanceSettings, ApplicationSettings, LocalePreference, ShellIntegrationMode, ShellMode,
+    ShellPathError, TerminalMetric, TerminalSettings, ThemePreference, validate_shell_path,
 };
 #[allow(unused_imports)]
 pub use numeric::{BoolSetting, NumericSetting};
@@ -680,6 +681,194 @@ future = 1
             let text = save_and_read(&settings, "glyphs_bad_clear");
             assert!(!text.contains("terminal_builtin_glyphs"), "{text}");
         }
+    }
+
+    #[test]
+    fn terminal_settings_default_values() {
+        let defaults = TerminalSettings::default();
+        assert_eq!(defaults.shell_mode, ShellMode::Auto);
+        assert_eq!(defaults.shell_path, "");
+        assert_eq!(defaults.shell_integration, ShellIntegrationMode::Auto);
+        assert!(defaults.extra.0.is_empty());
+        assert!(defaults.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn terminal_settings_toml_persistence_round_trip() {
+        let mut settings = ApplicationSettings::default();
+        settings.terminal.shell_mode = ShellMode::Custom;
+        settings.terminal.shell_path = "C:\\テスト ユーザー\\bin\\custom shell.exe".to_string();
+        settings.terminal.shell_integration = ShellIntegrationMode::Disabled;
+
+        let text = save_and_read(&settings, "terminal_settings_round_trip");
+        assert!(text.contains("shell_mode = \"custom\""), "{text}");
+        assert!(
+            text.contains("C:\\テスト ユーザー\\bin\\custom shell.exe"),
+            "{text}"
+        );
+        assert!(text.contains("shell_integration = \"disabled\""), "{text}");
+
+        let (reloaded, warning) = load_str("terminal_settings_reload", &text);
+        assert!(warning.is_none());
+        assert_eq!(reloaded.terminal.shell_mode, ShellMode::Custom);
+        assert_eq!(
+            reloaded.terminal.shell_path,
+            "C:\\テスト ユーザー\\bin\\custom shell.exe"
+        );
+        assert_eq!(
+            reloaded.terminal.shell_integration,
+            ShellIntegrationMode::Disabled
+        );
+    }
+
+    #[test]
+    fn legacy_settings_toml_without_terminal_loads_clean_defaults() {
+        let content = "locale = \"ja-JP\"\n";
+        let (settings, warning) = load_str("legacy_no_terminal", content);
+        assert!(warning.is_none());
+        assert_eq!(settings.terminal.shell_mode, ShellMode::Auto);
+        assert_eq!(settings.terminal.shell_path, "");
+        assert_eq!(
+            settings.terminal.shell_integration,
+            ShellIntegrationMode::Auto
+        );
+        assert!(settings.terminal.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn unknown_shell_mode_and_integration_are_preserved_and_emit_diagnostics() {
+        let content = r#"
+[terminal]
+shell_mode = "zsh"
+shell_path = "C:\\Windows\\System32\\cmd.exe"
+shell_integration = "hypothetical"
+"#;
+        let (settings, warning) = load_str("unknown_enums", content);
+        assert!(warning.is_none());
+        assert_eq!(
+            settings.terminal.shell_mode,
+            ShellMode::Unknown("zsh".into())
+        );
+        assert_eq!(
+            settings.terminal.shell_integration,
+            ShellIntegrationMode::Unknown("hypothetical".into())
+        );
+
+        let diagnostics = settings.terminal.diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics[0].contains("unknown terminal.shell_mode = \"zsh\""));
+        assert!(diagnostics[1].contains("unknown terminal.shell_integration = \"hypothetical\""));
+
+        // When saved, the raw strings are preserved verbatim
+        let text = save_and_read(&settings, "unknown_enums_save");
+        assert!(text.contains("shell_mode = \"zsh\""), "{text}");
+        assert!(
+            text.contains("shell_integration = \"hypothetical\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn non_string_shell_mode_and_integration_survive_as_unknown() {
+        let content = r#"
+[terminal]
+shell_mode = 42
+shell_integration = true
+"#;
+        let (settings, warning) = load_str("non_string_enums", content);
+        assert!(warning.is_none());
+        assert_eq!(
+            settings.terminal.shell_mode,
+            ShellMode::Unknown("42".into())
+        );
+        assert_eq!(
+            settings.terminal.shell_integration,
+            ShellIntegrationMode::Unknown("true".into())
+        );
+
+        let diagnostics = settings.terminal.diagnostics();
+        assert_eq!(diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn extra_unknown_keys_in_terminal_section_are_preserved() {
+        let content = r#"
+[terminal]
+shell_mode = "auto"
+custom_experimental_feature = true
+timeout_seconds = 120
+"#;
+        let (settings, warning) = load_str("extra_terminal_keys", content);
+        assert!(warning.is_none());
+        assert_eq!(settings.terminal.extra.0.len(), 2);
+
+        let text = save_and_read(&settings, "extra_terminal_keys_save");
+        assert!(
+            text.contains("custom_experimental_feature = true"),
+            "{text}"
+        );
+        assert!(text.contains("timeout_seconds = 120"), "{text}");
+    }
+
+    #[test]
+    fn validate_shell_path_rules() {
+        // Empty / whitespace
+        assert_eq!(validate_shell_path(""), Err(ShellPathError::Empty));
+        assert_eq!(validate_shell_path("   "), Err(ShellPathError::Empty));
+
+        // Relative paths
+        assert_eq!(
+            validate_shell_path("cmd.exe"),
+            Err(ShellPathError::NotAbsolute)
+        );
+        assert_eq!(
+            validate_shell_path(r".\cmd.exe"),
+            Err(ShellPathError::NotAbsolute)
+        );
+        assert_eq!(
+            validate_shell_path(r"bin\pwsh.exe"),
+            Err(ShellPathError::NotAbsolute)
+        );
+        assert_eq!(
+            validate_shell_path("/pwsh.exe"),
+            Err(ShellPathError::NotAbsolute)
+        );
+        assert_eq!(
+            validate_shell_path(r"\Windows\System32\cmd.exe"),
+            Err(ShellPathError::NotAbsolute)
+        );
+
+        // Arguments prohibited
+        assert_eq!(
+            validate_shell_path(r"C:\Windows\System32\cmd.exe /c dir"),
+            Err(ShellPathError::HasArguments)
+        );
+        assert_eq!(
+            validate_shell_path(r#""C:\Windows\System32\cmd.exe" -NoLogo"#),
+            Err(ShellPathError::HasArguments)
+        );
+
+        // Non-existent file
+        assert_eq!(
+            validate_shell_path(r"C:\Windows\System32\nonexistent_shell_98765.exe"),
+            Err(ShellPathError::NotFound)
+        );
+
+        // Directory
+        assert_eq!(
+            validate_shell_path(r"C:\Windows"),
+            Err(ShellPathError::IsDirectory)
+        );
+
+        // Non-executable extension
+        assert_eq!(
+            validate_shell_path(r"C:\Windows\System32\drivers\etc\hosts"),
+            Err(ShellPathError::NotExecutable)
+        );
+
+        // Valid system cmd.exe (always exists on Windows)
+        let valid = validate_shell_path(r"C:\Windows\System32\cmd.exe");
+        assert!(valid.is_ok(), "{valid:?}");
     }
 
     fn tempfile_dir(prefix: &str) -> std::path::PathBuf {

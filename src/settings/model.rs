@@ -1,6 +1,7 @@
 //! Typed application settings model.
 
 use std::ops::RangeInclusive;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -277,6 +278,242 @@ impl AppearanceSettings {
     }
 }
 
+/// Validation errors when verifying an explicit custom shell path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellPathError {
+    Empty,
+    NotAbsolute,
+    NotFound,
+    IsDirectory,
+    NotExecutable,
+    HasArguments,
+}
+
+/// Validates an explicit custom shell executable path.
+///
+/// Acceptance criteria:
+/// - Must not be empty.
+/// - Must not contain command-line arguments or quotation marks.
+/// - Must be an absolute path with drive letter/prefix on Windows.
+/// - Must end with `.exe` (case-insensitive).
+/// - Must exist on disk.
+/// - Must be a regular file, not a directory.
+pub fn validate_shell_path(raw: &str) -> Result<PathBuf, ShellPathError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ShellPathError::Empty);
+    }
+
+    if trimmed.contains('"') || trimmed.contains('\'') {
+        return Err(ShellPathError::HasArguments);
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(pos) = lower.find(".exe") {
+        let remainder = &trimmed[pos + 4..];
+        if remainder.starts_with(|c: char| c.is_whitespace()) && !remainder.trim().is_empty() {
+            return Err(ShellPathError::HasArguments);
+        }
+    }
+
+    let path = Path::new(trimmed);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::path::Component;
+        let mut components = path.components();
+        let is_valid_abs = matches!(components.next(), Some(Component::Prefix(_)))
+            && matches!(components.next(), Some(Component::RootDir));
+        if !is_valid_abs {
+            return Err(ShellPathError::NotAbsolute);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if !path.is_absolute() {
+            return Err(ShellPathError::NotAbsolute);
+        }
+    }
+
+    if path.is_dir() {
+        return Err(ShellPathError::IsDirectory);
+    }
+
+    let ext_is_exe = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("exe"))
+        == Some(true);
+
+    if !ext_is_exe {
+        return Err(ShellPathError::NotExecutable);
+    }
+
+    if !path.exists() {
+        return Err(ShellPathError::NotFound);
+    }
+
+    if !path.is_file() {
+        return Err(ShellPathError::NotExecutable);
+    }
+
+    Ok(path.to_path_buf())
+}
+
+/// Selection mode for which shell executable to run in terminal sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ShellMode {
+    /// Auto-detect the best available shell (pwsh -> powershell -> cmd).
+    #[default]
+    Auto,
+    /// Explicitly run a user-specified executable path.
+    Custom,
+    /// Unknown string in settings.toml; kept as-is and reported as diagnostic.
+    Unknown(String),
+}
+
+impl ShellMode {
+    #[allow(dead_code)]
+    pub const ALL: [Self; 2] = [Self::Auto, Self::Custom];
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Auto => "auto",
+            Self::Custom => "custom",
+            Self::Unknown(raw) => raw.as_str(),
+        }
+    }
+
+    pub fn diagnostic(&self) -> Option<String> {
+        match self {
+            Self::Auto | Self::Custom => None,
+            Self::Unknown(raw) => Some(format!(
+                "unknown terminal.shell_mode = {raw:?} in settings (expected \"auto\" or \"custom\"); \
+                 the setting is kept as is"
+            )),
+        }
+    }
+}
+
+impl Serialize for ShellMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ShellMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let val = toml::Value::deserialize(deserializer)?;
+        Ok(match val {
+            toml::Value::String(s) => match s.as_str() {
+                "auto" => Self::Auto,
+                "custom" => Self::Custom,
+                _ => Self::Unknown(s),
+            },
+            other => Self::Unknown(other.to_string()),
+        })
+    }
+}
+
+/// Mode for Shell Integration (OSC 133 semantic prompt marking).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ShellIntegrationMode {
+    /// Automatically inject Shell Integration in supported shells (pwsh, powershell).
+    #[default]
+    Auto,
+    /// Disable Shell Integration for all shells.
+    Disabled,
+    /// Unknown string in settings.toml; kept as-is and reported as diagnostic.
+    Unknown(String),
+}
+
+impl ShellIntegrationMode {
+    #[allow(dead_code)]
+    pub const ALL: [Self; 2] = [Self::Auto, Self::Disabled];
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Auto => "auto",
+            Self::Disabled => "disabled",
+            Self::Unknown(raw) => raw.as_str(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn diagnostic(&self) -> Option<String> {
+        match self {
+            Self::Auto | Self::Disabled => None,
+            Self::Unknown(raw) => Some(format!(
+                "unknown terminal.shell_integration = {raw:?} in settings (expected \"auto\" or \"disabled\"); \
+                 the setting is kept as is"
+            )),
+        }
+    }
+}
+
+impl Serialize for ShellIntegrationMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ShellIntegrationMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let val = toml::Value::deserialize(deserializer)?;
+        Ok(match val {
+            toml::Value::String(s) => match s.as_str() {
+                "auto" => Self::Auto,
+                "disabled" => Self::Disabled,
+                _ => Self::Unknown(s),
+            },
+            other => Self::Unknown(other.to_string()),
+        })
+    }
+}
+
+/// User preferences for terminal shell launching and integration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TerminalSettings {
+    /// Shell selection mode ("auto" or "custom").
+    #[serde(default)]
+    pub shell_mode: ShellMode,
+    /// Explicit executable path when `shell_mode` is `custom`.
+    #[serde(default)]
+    pub shell_path: String,
+    /// Shell Integration mode ("auto" or "disabled").
+    #[serde(default)]
+    pub shell_integration: ShellIntegrationMode,
+    /// Keys of `[terminal]` this build does not know; written back untouched.
+    #[serde(flatten)]
+    pub extra: ExtraKeys,
+}
+
+impl TerminalSettings {
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut list = Vec::new();
+        if let Some(d) = self.shell_mode.diagnostic() {
+            list.push(d);
+        }
+        if let Some(d) = self.shell_integration.diagnostic() {
+            list.push(d);
+        }
+        if self.shell_mode == ShellMode::Custom
+            && let Err(err) = validate_shell_path(&self.shell_path)
+        {
+            list.push(format!(
+                "invalid terminal.shell_path {:?} in settings: {:?}",
+                self.shell_path, err
+            ));
+        }
+        list
+    }
+}
+
 /// Typed model holding Kegon application-level configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ApplicationSettings {
@@ -286,6 +523,9 @@ pub struct ApplicationSettings {
     /// Preferred visual appearance.
     #[serde(default)]
     pub appearance: AppearanceSettings,
+    /// Terminal shell and integration settings.
+    #[serde(default)]
+    pub terminal: TerminalSettings,
     /// Top-level keys this build does not know; written back untouched.
     #[serde(flatten)]
     pub extra: ExtraKeys,
