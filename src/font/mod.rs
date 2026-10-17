@@ -13,5 +13,6 @@ pub use catalog::SystemFontCatalog;
 #[allow(unused_imports)]
 pub use resolution::{
     DEFAULT_TERMINAL_FONT_SIZE, TerminalCellMetrics, TerminalFontConfig, TerminalFontStatus,
-    UiFontResolution, UiFontStatus, resolve_terminal_font, resolve_ui_font,
+    TerminalMetricOverrides, UiFontResolution, UiFontStatus, resolve_terminal_font,
+    resolve_ui_font,
 };

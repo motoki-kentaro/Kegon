@@ -9,7 +9,7 @@ Kegon provides a typed, persistent application settings foundation with runtime 
 
 The scope of `ApplicationSettings` covers:
 - **Application Language** (`locale`)
-- **Appearance Settings** (`appearance.theme`, `appearance.ui_font_family`, `appearance.terminal_font_family`)
+- **Appearance Settings** (`appearance.theme`, `appearance.ui_font_family`, `appearance.terminal_font_family`, `appearance.terminal_font_size`, `appearance.terminal_cell_height`, `appearance.terminal_cell_width`)
 
 Future settings (more themes, Terminal font size / line height, Keybindings) will extend this architecture without breaking changes or migration friction.
 
@@ -175,9 +175,27 @@ Selecting a Terminal font in Settings > Appearance (or clicking Reset):
 5. Resizes the active `TerminalSession` (preserves PTY child process, shell state, scrollback, and TUI state).
 6. Re-renders the terminal grid, cursor, selection highlight, and IME preedit using active cell metrics.
 
+## Terminal Display Metrics (font size, line height, cell width)
+
+Three optional keys under `[appearance]` control the terminal text size and cell geometry. Every key may be omitted; with all three omitted the metrics and the rendering are exactly what they were before these keys existed.
+
+| Key | Type | Range | Meaning |
+|---|---|---|---|
+| `terminal_font_size` | float | 1.0 – 100.0 | Font size in points. `font_px = pt × 96 / 72` (logical px). Unset: 13 logical px. |
+| `terminal_cell_height` | float | 0.5 – 3.0 | Cell height as a multiple of `font_px`. Unset: derived from the font's vertical metrics. |
+| `terminal_cell_width` | float | 0.2 – 2.0 | Cell width as a multiple of `font_px`. Unset: derived from the font's glyph advance. |
+
+- **Calculation** (`TerminalMetricOverrides` in `font/resolution.rs`): the font-derived cell is computed at `font_px`, then `cell_width = font_px × terminal_cell_width` and `cell_height = font_px × terminal_cell_height` replace the derived values when set. The three are independent. Setting only a cell multiple uses the unset size's 13 px as the reference. Cell sizes stay fractional (no rounding to physical pixels). The multiples follow Windows Terminal's unitless `cellWidth` / `cellHeight`, which are also multiples of the font size.
+- **One source of truth**: the resulting `TerminalCellMetrics` is what the renderer, cursor, selection, IME position, the `Term` grid and the ConPTY size all use.
+- **Invalid values**: a value that is not a number, is not finite, or is outside its range counts as unset at run time and a warning is printed at startup. The original TOML value is kept verbatim and written back on every save; it is replaced only when the user applies a new valid value, or resets the field. An invalid metric never falls back the whole file to defaults.
+- **Unknown keys** (top level and in `[appearance]`) are preserved when saving.
+- **Downgrade**: a Kegon version that predates these keys ignores them and drops them the next time it saves; the file otherwise stays valid.
+- **Settings tab**: each metric has a text field, an Apply button (also bound to Enter) and a Reset button. Typing only edits a draft held by the Settings tab; nothing is saved or applied until Apply/Enter. Apply is enabled for a valid value that differs from the saved one, and "not applied" is shown while the draft differs. Reset saves and applies immediately. iced 0.14 gives `text_input` no focus-lost message, so leaving a field (Tab, click elsewhere) neither applies nor discards the draft. Drafts are discarded when the Settings tab closes and rebuilt from the saved values when it opens.
+- **Applying** reuses the terminal font path: all sessions are resized to the new grid in place (no PTY is recreated, tab ids and selection are unchanged).
+
 ## Future Extensions
 
 The `ApplicationSettings` structure and UI surface are designed to accommodate future configuration domains:
 - **More Themes**: Light and other built-in themes, added through the theme registry.
-- **UI Font Size & Terminal Font Size**: User-facing font size and line height controls.
+- **UI Font Size**: A user-facing size control for the interface font.
 - **Keybinding Overrides**: User-customizable keybinding shortcuts in `settings.toml`.

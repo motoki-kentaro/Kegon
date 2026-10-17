@@ -52,6 +52,22 @@ settings-category-appearance-title = Appearance
 settings-category-appearance-description = Theme and the font used by the interface.
 settings-category-terminal-title = Terminal
 settings-category-terminal-description = How terminal sessions are displayed.
+settings-font-size-label = Font size
+settings-font-size-description = Size of the terminal text, in points. Cell width and height follow it unless set below.
+settings-font-size-default = 9.75 pt (13 px)
+settings-cell-height-label = Line height
+settings-cell-height-description = Cell height as a multiple of the font size (0.5 to 3.0). Unset follows the font.
+settings-cell-height-default = follows the font
+settings-cell-width-label = Cell width
+settings-cell-width-description = Cell width as a multiple of the font size (0.2 to 2.0). Unset follows the font.
+settings-cell-width-default = follows the font
+settings-metric-current = Current: { $value }
+settings-metric-default-value = Default: { $value }
+settings-metric-pending = Not applied
+settings-metric-apply = Apply
+settings-metric-reset = Reset
+settings-metric-range-error = Enter a number from { $min } to { $max }.
+settings-metric-stored-invalid = The value in settings.toml ({ $value }) is not valid and is ignored. Applying a new value replaces it.
 settings-tab-close-tooltip = Close Settings
 
 ## Main area

@@ -110,6 +110,54 @@ impl TerminalCellMetrics {
     }
 }
 
+/// User overrides of the terminal display metrics (all optional).
+///
+/// - `font_size_pt`: font size in points; `font_px = pt × 96 / 72`. Unset keeps the built-in
+///   [`DEFAULT_TERMINAL_FONT_SIZE`] (13 logical px).
+/// - `cell_width` / `cell_height`: multiples of `font_px`. Unset follows the font's own metrics
+///   (scaled to `font_px`).
+///
+/// Values are expected to be validated (finite, inside the settings ranges); anything else is
+/// ignored here as a last line of defence so the grid can never see NaN or zero.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TerminalMetricOverrides {
+    pub font_size_pt: Option<f32>,
+    pub cell_width: Option<f32>,
+    pub cell_height: Option<f32>,
+}
+
+impl TerminalMetricOverrides {
+    /// The usable (valid, in-range) metric settings; ignored values count as unset.
+    pub fn from_settings(appearance: &crate::settings::AppearanceSettings) -> Self {
+        use crate::settings::TerminalMetric;
+        let get = |metric| appearance.metric(metric).map(|v| v as f32);
+        Self {
+            font_size_pt: get(TerminalMetric::FontSize),
+            cell_width: get(TerminalMetric::CellWidth),
+            cell_height: get(TerminalMetric::CellHeight),
+        }
+    }
+
+    fn usable(value: Option<f32>) -> Option<f32> {
+        value.filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    /// The glyph size in logical px.
+    pub fn font_px(&self) -> f32 {
+        Self::usable(self.font_size_pt)
+            .map(|pt| pt * 96.0 / 72.0)
+            .unwrap_or(DEFAULT_TERMINAL_FONT_SIZE)
+    }
+
+    /// Applies the cell overrides to metrics derived (or scaled) for [`Self::font_px`].
+    pub fn apply(&self, base: TerminalCellMetrics) -> TerminalCellMetrics {
+        let px = self.font_px();
+        let width = Self::usable(self.cell_width).map_or(base.cell_width, |m| px * m);
+        let height = Self::usable(self.cell_height).map_or(base.cell_height, |m| px * m);
+        TerminalCellMetrics::new(width, height, px)
+    }
+}
+
 /// Operational status of the application Terminal font.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalFontStatus {
@@ -191,9 +239,10 @@ struct ConcreteTerminalFont {
 fn resolve_concrete_terminal_font(
     candidate: &FontCandidate,
     cache: &mut FontCache,
+    overrides: &TerminalMetricOverrides,
 ) -> Option<ConcreteTerminalFont> {
     let bytes = cache.get_or_load(candidate)?;
-    let metrics = derive_font_metrics(candidate, &bytes, DEFAULT_TERMINAL_FONT_SIZE)?;
+    let metrics = overrides.apply(derive_font_metrics(candidate, &bytes, overrides.font_px())?);
     let static_name: &'static str = Box::leak(candidate.family_name.clone().into_boxed_str());
     Some(ConcreteTerminalFont {
         font: Font::with_name(static_name),
@@ -204,25 +253,34 @@ fn resolve_concrete_terminal_font(
 fn resolve_default_terminal_font(
     catalog: &SystemFontCatalog,
     cache: &mut FontCache,
+    overrides: &TerminalMetricOverrides,
 ) -> ConcreteTerminalFont {
     if let Some(candidate) = catalog.candidates().iter().find(|c| c.is_monospace)
-        && let Some(concrete) = resolve_concrete_terminal_font(candidate, cache)
+        && let Some(concrete) = resolve_concrete_terminal_font(candidate, cache, overrides)
     {
         return concrete;
     }
+    // No usable font file: scale the built-in cell to the requested size, then apply the overrides.
+    let default = TerminalCellMetrics::default();
+    let scale = overrides.font_px() / DEFAULT_TERMINAL_FONT_SIZE;
     ConcreteTerminalFont {
         font: Font::MONOSPACE,
-        metrics: TerminalCellMetrics::default(),
+        metrics: overrides.apply(TerminalCellMetrics::new(
+            default.cell_width * scale,
+            default.cell_height * scale,
+            overrides.font_px(),
+        )),
     }
 }
 
 /// Resolves the requested Terminal font family against the system catalog and byte cache.
 pub fn resolve_terminal_font(
     configured_family: Option<&str>,
+    overrides: &TerminalMetricOverrides,
     catalog: &SystemFontCatalog,
     cache: &mut FontCache,
 ) -> TerminalFontConfig {
-    let default_font = resolve_default_terminal_font(catalog, cache);
+    let default_font = resolve_default_terminal_font(catalog, cache, overrides);
 
     let Some(family) = configured_family else {
         return TerminalFontConfig {
@@ -254,7 +312,7 @@ pub fn resolve_terminal_font(
         };
     };
 
-    if let Some(concrete) = resolve_concrete_terminal_font(candidate, cache) {
+    if let Some(concrete) = resolve_concrete_terminal_font(candidate, cache, overrides) {
         TerminalFontConfig {
             status: TerminalFontStatus::Active(candidate.family_name.clone()),
             font: concrete.font,
@@ -342,9 +400,149 @@ mod tests {
         let catalog = test_catalog();
         let mut cache = FontCache::new();
 
-        let config = resolve_terminal_font(None, &catalog, &mut cache);
+        let config = resolve_terminal_font(None, &Default::default(), &catalog, &mut cache);
         assert_eq!(config.status, TerminalFontStatus::Default);
         assert_eq!(config.font, Font::MONOSPACE);
+    }
+
+    fn overrides(
+        size: Option<f32>,
+        width: Option<f32>,
+        height: Option<f32>,
+    ) -> TerminalMetricOverrides {
+        TerminalMetricOverrides {
+            font_size_pt: size,
+            cell_width: width,
+            cell_height: height,
+        }
+    }
+
+    #[test]
+    fn no_overrides_keep_the_legacy_metrics_bit_for_bit() {
+        let base = TerminalCellMetrics::new(7.617, 15.107, DEFAULT_TERMINAL_FONT_SIZE);
+        let none = TerminalMetricOverrides::default();
+        assert_eq!(none.font_px(), DEFAULT_TERMINAL_FONT_SIZE);
+        assert_eq!(none.apply(base), base);
+
+        // The fallback cell (no usable font file) is the built-in one, unscaled.
+        let catalog = test_catalog();
+        let mut cache = FontCache::new();
+        let config = resolve_terminal_font(None, &none, &catalog, &mut cache);
+        assert_eq!(config.metrics, TerminalCellMetrics::default());
+    }
+
+    #[test]
+    fn size_only_scales_the_font_derived_cell_proportionally() {
+        let catalog = test_catalog();
+        let mut cache = FontCache::new();
+        let config = resolve_terminal_font(
+            None,
+            &overrides(Some(12.0), None, None),
+            &catalog,
+            &mut cache,
+        );
+        let scale = 16.0 / DEFAULT_TERMINAL_FONT_SIZE;
+        let default = TerminalCellMetrics::default();
+        assert!((config.metrics.font_size - 16.0).abs() < 1e-4);
+        assert!((config.metrics.cell_width - default.cell_width * scale).abs() < 1e-3);
+        assert!((config.metrics.cell_height - default.cell_height * scale).abs() < 1e-3);
+    }
+
+    #[test]
+    fn width_only_and_height_only_use_the_default_13px_as_reference() {
+        let catalog = test_catalog();
+        let mut cache = FontCache::new();
+        let default = TerminalCellMetrics::default();
+
+        let w = resolve_terminal_font(
+            None,
+            &overrides(None, Some(0.6), None),
+            &catalog,
+            &mut cache,
+        )
+        .metrics;
+        assert!((w.cell_width - 13.0 * 0.6).abs() < 1e-4);
+        assert_eq!(w.cell_height, default.cell_height);
+        assert_eq!(w.font_size, DEFAULT_TERMINAL_FONT_SIZE);
+
+        let h = resolve_terminal_font(
+            None,
+            &overrides(None, None, Some(1.2)),
+            &catalog,
+            &mut cache,
+        )
+        .metrics;
+        assert!((h.cell_height - 13.0 * 1.2).abs() < 1e-4);
+        assert_eq!(h.cell_width, default.cell_width);
+        assert_eq!(h.font_size, DEFAULT_TERMINAL_FONT_SIZE);
+    }
+
+    #[test]
+    fn all_three_overrides_follow_pt_to_px_conversion() {
+        let catalog = test_catalog();
+        let mut cache = FontCache::new();
+        let m = resolve_terminal_font(
+            None,
+            &overrides(Some(12.0), Some(0.6), Some(1.2)),
+            &catalog,
+            &mut cache,
+        )
+        .metrics;
+        assert!((m.font_size - 16.0).abs() < 1e-4);
+        assert!((m.cell_width - 9.6).abs() < 1e-4);
+        assert!((m.cell_height - 19.2).abs() < 1e-4);
+    }
+
+    #[test]
+    fn boundary_values_give_positive_finite_metrics_and_sane_grids() {
+        for (size, width, height) in [
+            (1.0, 0.2, 0.5),
+            (100.0, 2.0, 3.0),
+            (1.0, 2.0, 3.0),
+            (100.0, 0.2, 0.5),
+        ] {
+            let ov = overrides(Some(size), Some(width), Some(height));
+            let m = ov.apply(TerminalCellMetrics::new(6.5, 13.0, ov.font_px()));
+            assert!(m.cell_width.is_finite() && m.cell_width >= 1.0, "{m:?}");
+            assert!(m.cell_height.is_finite() && m.cell_height >= 1.0, "{m:?}");
+            assert!(m.font_size.is_finite() && m.font_size >= 1.0, "{m:?}");
+            let (cols, rows) = m.grid_size(888.0, 725.0);
+            assert!(cols >= 1 && rows >= 1);
+            assert_eq!(m.grid_size(0.0, 0.0), (1, 1));
+        }
+    }
+
+    #[test]
+    fn unusable_override_values_are_ignored_as_a_last_line_of_defence() {
+        let default = TerminalCellMetrics::default();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0] {
+            let ov = overrides(Some(bad), Some(bad), Some(bad));
+            assert_eq!(ov.font_px(), DEFAULT_TERMINAL_FONT_SIZE);
+            assert_eq!(ov.apply(default), default, "{bad}");
+        }
+    }
+
+    #[test]
+    fn real_system_font_size_scales_proportionally() {
+        let catalog = SystemFontCatalog::load_system();
+        let mut cache = FontCache::new();
+        let base = resolve_terminal_font(None, &Default::default(), &catalog, &mut cache).metrics;
+        let big = resolve_terminal_font(
+            None,
+            &overrides(Some(24.0), None, None),
+            &catalog,
+            &mut cache,
+        )
+        .metrics;
+        let k = 32.0 / DEFAULT_TERMINAL_FONT_SIZE;
+        assert!(
+            (big.cell_width - base.cell_width * k).abs() < 0.01,
+            "{base:?} {big:?}"
+        );
+        assert!(
+            (big.cell_height - base.cell_height * k).abs() < 0.01,
+            "{base:?} {big:?}"
+        );
     }
 
     #[test]
@@ -352,7 +550,12 @@ mod tests {
         let catalog = test_catalog();
         let mut cache = FontCache::new();
 
-        let config = resolve_terminal_font(Some("Missing Terminal Font"), &catalog, &mut cache);
+        let config = resolve_terminal_font(
+            Some("Missing Terminal Font"),
+            &Default::default(),
+            &catalog,
+            &mut cache,
+        );
         assert_eq!(
             config.status,
             TerminalFontStatus::NotInstalled("Missing Terminal Font".into())
@@ -365,7 +568,7 @@ mod tests {
         let catalog = SystemFontCatalog::load_system();
         let mut cache = FontCache::new();
 
-        let config = resolve_terminal_font(None, &catalog, &mut cache);
+        let config = resolve_terminal_font(None, &Default::default(), &catalog, &mut cache);
         assert_eq!(config.status, TerminalFontStatus::Default);
 
         if let Some(mono_cand) = catalog.candidates().iter().find(|c| c.is_monospace)
@@ -393,7 +596,8 @@ mod tests {
             .map(|c| c.family_name.clone());
 
         if let Some(family) = target_family {
-            let config = resolve_terminal_font(Some(&family), &catalog, &mut cache);
+            let config =
+                resolve_terminal_font(Some(&family), &Default::default(), &catalog, &mut cache);
             assert_eq!(config.status, TerminalFontStatus::Active(family.clone()));
             assert_eq!(
                 config.font,
@@ -407,9 +611,13 @@ mod tests {
         let catalog = SystemFontCatalog::load_system();
         let mut cache = FontCache::new();
 
-        let default_config = resolve_terminal_font(None, &catalog, &mut cache);
-        let missing_config =
-            resolve_terminal_font(Some("Nonexistent Font 12345"), &catalog, &mut cache);
+        let default_config = resolve_terminal_font(None, &Default::default(), &catalog, &mut cache);
+        let missing_config = resolve_terminal_font(
+            Some("Nonexistent Font 12345"),
+            &Default::default(),
+            &catalog,
+            &mut cache,
+        );
 
         assert_eq!(
             missing_config.status,

@@ -51,6 +51,22 @@ settings-category-appearance-title = 外観
 settings-category-appearance-description = テーマと、インターフェースで使うフォントです。
 settings-category-terminal-title = ターミナル
 settings-category-terminal-description = ターミナルセッションの表示方法です。
+settings-font-size-label = フォントサイズ
+settings-font-size-description = ターミナル文字の大きさ(pt)です。下の設定がなければ、セルの幅と高さもこれに合わせて変わります。
+settings-font-size-default = 9.75 pt(13 px)
+settings-cell-height-label = 行の高さ
+settings-cell-height-description = セルの高さを、フォントサイズに対する倍率で指定します(0.5〜3.0)。未設定ならフォントに従います。
+settings-cell-height-default = フォントに従う
+settings-cell-width-label = セルの幅
+settings-cell-width-description = セルの幅を、フォントサイズに対する倍率で指定します(0.2〜2.0)。未設定ならフォントに従います。
+settings-cell-width-default = フォントに従う
+settings-metric-current = 現在値: { $value }
+settings-metric-default-value = 既定: { $value }
+settings-metric-pending = 未適用
+settings-metric-apply = 適用
+settings-metric-reset = リセット
+settings-metric-range-error = { $min } から { $max } の数値を入力してください。
+settings-metric-stored-invalid = settings.toml の値({ $value })は無効なため無視されています。新しい値を適用すると置き換えられます。
 settings-tab-close-tooltip = 設定を閉じる
 
 ## Main area

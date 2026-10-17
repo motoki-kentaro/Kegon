@@ -1,7 +1,10 @@
 //! Typed application settings model.
 
+use std::ops::RangeInclusive;
+
 use serde::{Deserialize, Serialize};
 
+use super::numeric::{ExtraKeys, NumericSetting};
 use crate::theme::ThemeId;
 
 /// Supported user preferences for application UI language.
@@ -116,6 +119,120 @@ pub struct AppearanceSettings {
     /// `None` indicates system default monospaced font.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_font_family: Option<String>,
+    /// Terminal font size in points. `None` keeps the built-in 13 logical px.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_font_size: Option<NumericSetting>,
+    /// Terminal cell height as a multiple of the font size in px. `None` follows the font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_cell_height: Option<NumericSetting>,
+    /// Terminal cell width as a multiple of the font size in px. `None` follows the font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_cell_width: Option<NumericSetting>,
+    /// Keys of `[appearance]` this build does not know; written back untouched.
+    #[serde(flatten)]
+    pub extra: ExtraKeys,
+}
+
+/// Allowed range of `terminal_font_size` (points).
+pub const TERMINAL_FONT_SIZE_RANGE: RangeInclusive<f64> = RangeInclusive::new(1.0, 100.0);
+/// Allowed range of `terminal_cell_height` (multiple of the font size).
+pub const TERMINAL_CELL_HEIGHT_RANGE: RangeInclusive<f64> = RangeInclusive::new(0.5, 3.0);
+/// Allowed range of `terminal_cell_width` (multiple of the font size).
+pub const TERMINAL_CELL_WIDTH_RANGE: RangeInclusive<f64> = RangeInclusive::new(0.2, 2.0);
+
+/// One of the three terminal display metrics a user can set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TerminalMetric {
+    FontSize,
+    CellHeight,
+    CellWidth,
+}
+
+impl TerminalMetric {
+    pub const ALL: [Self; 3] = [Self::FontSize, Self::CellHeight, Self::CellWidth];
+
+    pub fn range(self) -> RangeInclusive<f64> {
+        match self {
+            Self::FontSize => TERMINAL_FONT_SIZE_RANGE,
+            Self::CellHeight => TERMINAL_CELL_HEIGHT_RANGE,
+            Self::CellWidth => TERMINAL_CELL_WIDTH_RANGE,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::FontSize => "terminal_font_size",
+            Self::CellHeight => "terminal_cell_height",
+            Self::CellWidth => "terminal_cell_width",
+        }
+    }
+}
+
+impl AppearanceSettings {
+    fn metric_slot(&self, metric: TerminalMetric) -> &Option<NumericSetting> {
+        match metric {
+            TerminalMetric::FontSize => &self.terminal_font_size,
+            TerminalMetric::CellHeight => &self.terminal_cell_height,
+            TerminalMetric::CellWidth => &self.terminal_cell_width,
+        }
+    }
+
+    /// Sets (or, with `None`, clears) one metric. `Some(v)` replaces whatever was stored, including
+    /// an invalid value.
+    pub fn set_metric(&mut self, metric: TerminalMetric, value: Option<f64>) {
+        let slot = match metric {
+            TerminalMetric::FontSize => &mut self.terminal_font_size,
+            TerminalMetric::CellHeight => &mut self.terminal_cell_height,
+            TerminalMetric::CellWidth => &mut self.terminal_cell_width,
+        };
+        *slot = value.map(NumericSetting::from_number);
+    }
+
+    /// The usable value of a metric: set, finite, and inside its range.
+    pub fn metric(&self, metric: TerminalMetric) -> Option<f64> {
+        self.metric_slot(metric)
+            .as_ref()
+            .and_then(|setting| setting.effective(&metric.range()))
+    }
+
+    /// Whether the file has a key for this metric at all (valid or not).
+    pub fn has_metric_key(&self, metric: TerminalMetric) -> bool {
+        self.metric_slot(metric).is_some()
+    }
+
+    /// Whether the file holds a value for this metric that is being ignored.
+    pub fn metric_is_invalid(&self, metric: TerminalMetric) -> bool {
+        self.metric_slot(metric).is_some() && self.metric(metric).is_none()
+    }
+
+    /// The raw stored value of an ignored metric, for the notice.
+    pub fn invalid_metric_text(&self, metric: TerminalMetric) -> Option<String> {
+        self.metric_is_invalid(metric)
+            .then(|| {
+                self.metric_slot(metric)
+                    .as_ref()
+                    .map(NumericSetting::describe)
+            })
+            .flatten()
+    }
+
+    /// Warnings for every ignored metric value (the file is left as it is).
+    pub fn metric_diagnostics(&self) -> Vec<String> {
+        TerminalMetric::ALL
+            .into_iter()
+            .filter_map(|metric| {
+                let raw = self.invalid_metric_text(metric)?;
+                let range = metric.range();
+                Some(format!(
+                    "invalid {} = {raw} in settings (expected a number from {} to {}); \
+                     ignoring it (the setting is kept as is)",
+                    metric.key(),
+                    range.start(),
+                    range.end()
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Typed model holding Kegon application-level configuration.
@@ -127,4 +244,7 @@ pub struct ApplicationSettings {
     /// Preferred visual appearance.
     #[serde(default)]
     pub appearance: AppearanceSettings,
+    /// Top-level keys this build does not know; written back untouched.
+    #[serde(flatten)]
+    pub extra: ExtraKeys,
 }

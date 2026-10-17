@@ -383,6 +383,18 @@ impl TerminalSession {
         let _ = self.event_loop_sender.send(Msg::Input(input.into()));
     }
 
+    /// The size last sent to the PTY: (columns, rows, cell width px, cell height px).
+    #[cfg(test)]
+    pub(crate) fn pty_size(&self) -> (u16, u16, u16, u16) {
+        let size = *self.window_size.lock().unwrap();
+        (
+            size.num_cols,
+            size.num_lines,
+            size.cell_width,
+            size.cell_height,
+        )
+    }
+
     /// Resizes the terminal grid and PTY.
     pub fn resize(&self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
         if self.is_exited() {

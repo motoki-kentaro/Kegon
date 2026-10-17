@@ -1,12 +1,16 @@
 //! Application settings model, persistence, and precedence resolution.
 
 mod model;
+mod numeric;
 mod path;
 mod precedence;
 mod store;
 
+pub use model::{
+    AppearanceSettings, ApplicationSettings, LocalePreference, TerminalMetric, ThemePreference,
+};
 #[allow(unused_imports)]
-pub use model::{AppearanceSettings, ApplicationSettings, LocalePreference, ThemePreference};
+pub use numeric::NumericSetting;
 #[allow(unused_imports)]
 pub use path::{default_settings_dir, default_settings_file_path};
 pub use precedence::resolve_application_locale;
@@ -39,6 +43,7 @@ mod tests {
             let settings = ApplicationSettings {
                 locale: pref,
                 appearance: AppearanceSettings::default(),
+                ..Default::default()
             };
             let serialized = toml::to_string_pretty(&settings).expect("should serialize");
             assert!(serialized.contains(expected_str));
@@ -58,6 +63,7 @@ mod tests {
                 ui_font_family: Some("Noto Sans JP".into()),
                 ..AppearanceSettings::default()
             },
+            ..Default::default()
         };
 
         let serialized = toml::to_string_pretty(&settings).expect("should serialize");
@@ -133,6 +139,7 @@ mod tests {
         let settings = ApplicationSettings {
             locale: LocalePreference::EnUs,
             appearance: AppearanceSettings::default(),
+            ..Default::default()
         };
 
         assert!(save_settings(&settings, Some(&path)).is_ok());
@@ -363,6 +370,238 @@ mod tests {
         assert_eq!(
             resolve_application_locale(None, LocalePreference::System, os_fr.into_iter()),
             Locale::EnUs
+        );
+    }
+
+    // --- terminal metric settings (font size / cell height / cell width) ---
+
+    fn save_and_read(settings: &ApplicationSettings, prefix: &str) -> String {
+        let temp_dir = tempfile_dir(prefix);
+        let path = temp_dir.join("settings.toml");
+        save_settings(settings, Some(&path)).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_dir_all(temp_dir);
+        text
+    }
+
+    #[test]
+    fn legacy_file_without_metric_keys_loads_with_all_metrics_unset() {
+        let (settings, warning) = load_str(
+            "metrics_legacy",
+            "locale = \"en-US\"\n\n[appearance]\ntheme = \"night-dark\"\nterminal_font_family = \"Consolas\"\n",
+        );
+        assert!(warning.is_none());
+        for metric in TerminalMetric::ALL {
+            assert_eq!(settings.appearance.metric(metric), None);
+            assert!(!settings.appearance.metric_is_invalid(metric));
+        }
+        // Saving does not invent the new keys.
+        let text = save_and_read(&settings, "metrics_legacy_save");
+        assert!(!text.contains("terminal_font_size"), "{text}");
+        assert!(!text.contains("terminal_cell"), "{text}");
+    }
+
+    #[test]
+    fn valid_metrics_round_trip_including_boundaries() {
+        let mut settings = ApplicationSettings::default();
+        for (metric, value) in [
+            (TerminalMetric::FontSize, 1.0),
+            (TerminalMetric::CellHeight, 3.0),
+            (TerminalMetric::CellWidth, 0.2),
+        ] {
+            settings.appearance.set_metric(metric, Some(value));
+        }
+        let text = save_and_read(&settings, "metrics_round_trip");
+        let (reloaded, warning) = load_str("metrics_round_trip_load", &text);
+        assert!(warning.is_none(), "{text}");
+        assert_eq!(
+            reloaded.appearance.metric(TerminalMetric::FontSize),
+            Some(1.0)
+        );
+        assert_eq!(
+            reloaded.appearance.metric(TerminalMetric::CellHeight),
+            Some(3.0)
+        );
+        assert_eq!(
+            reloaded.appearance.metric(TerminalMetric::CellWidth),
+            Some(0.2)
+        );
+
+        settings
+            .appearance
+            .set_metric(TerminalMetric::FontSize, Some(100.0));
+        settings
+            .appearance
+            .set_metric(TerminalMetric::CellHeight, Some(0.5));
+        settings
+            .appearance
+            .set_metric(TerminalMetric::CellWidth, Some(2.0));
+        let text = save_and_read(&settings, "metrics_round_trip2");
+        let (reloaded, _) = load_str("metrics_round_trip2_load", &text);
+        assert_eq!(
+            reloaded.appearance.metric(TerminalMetric::FontSize),
+            Some(100.0)
+        );
+        assert_eq!(
+            reloaded.appearance.metric(TerminalMetric::CellHeight),
+            Some(0.5)
+        );
+        assert_eq!(
+            reloaded.appearance.metric(TerminalMetric::CellWidth),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn integers_are_accepted_as_numbers() {
+        let (settings, warning) = load_str(
+            "metrics_integer",
+            "[appearance]\nterminal_font_size = 12\nterminal_cell_height = 1\n",
+        );
+        assert!(warning.is_none());
+        assert_eq!(
+            settings.appearance.metric(TerminalMetric::FontSize),
+            Some(12.0)
+        );
+        assert_eq!(
+            settings.appearance.metric(TerminalMetric::CellHeight),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn invalid_metric_values_count_as_unset_without_resetting_other_settings() {
+        let content = "locale = \"ja-JP\"\n\n[appearance]\nui_font_family = \"Segoe UI\"\n\
+            terminal_font_size = \"big\"\nterminal_cell_height = 0.0\nterminal_cell_width = nan\n";
+        let (settings, warning) = load_str("metrics_invalid", content);
+        assert!(
+            warning.is_none(),
+            "a bad metric must not trigger the malformed-file fallback"
+        );
+        assert_eq!(settings.locale, LocalePreference::JaJp);
+        assert_eq!(
+            settings.appearance.ui_font_family.as_deref(),
+            Some("Segoe UI")
+        );
+        for metric in TerminalMetric::ALL {
+            assert_eq!(settings.appearance.metric(metric), None, "{metric:?}");
+            assert!(settings.appearance.metric_is_invalid(metric), "{metric:?}");
+        }
+        assert_eq!(settings.appearance.metric_diagnostics().len(), 3);
+    }
+
+    #[test]
+    fn out_of_range_negative_and_infinite_values_are_ignored() {
+        for (key, bad) in [
+            ("terminal_font_size", "0.9"),
+            ("terminal_font_size", "100.1"),
+            ("terminal_font_size", "-12"),
+            ("terminal_cell_height", "0.49"),
+            ("terminal_cell_height", "3.01"),
+            ("terminal_cell_width", "0.19"),
+            ("terminal_cell_width", "2.01"),
+            ("terminal_cell_width", "inf"),
+            ("terminal_cell_width", "-inf"),
+            ("terminal_font_size", "true"),
+            ("terminal_font_size", "[1, 2]"),
+        ] {
+            let (settings, warning) =
+                load_str("metrics_bad", &format!("[appearance]\n{key} = {bad}\n"));
+            assert!(warning.is_none(), "{key} = {bad}");
+            let metric = TerminalMetric::ALL
+                .into_iter()
+                .find(|m| {
+                    key.ends_with(match m {
+                        TerminalMetric::FontSize => "font_size",
+                        TerminalMetric::CellHeight => "cell_height",
+                        TerminalMetric::CellWidth => "cell_width",
+                    })
+                })
+                .unwrap();
+            assert_eq!(settings.appearance.metric(metric), None, "{key} = {bad}");
+            assert!(
+                settings.appearance.metric_is_invalid(metric),
+                "{key} = {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_values_survive_saving_other_settings() {
+        let content = "[appearance]\nterminal_font_size = \"big\"\nterminal_cell_width = 9.5\n";
+        let (mut settings, _) = load_str("metrics_keep", content);
+        settings.locale = LocalePreference::EnUs;
+        settings.appearance.ui_font_family = Some("Segoe UI".into());
+
+        let text = save_and_read(&settings, "metrics_keep_save");
+        let (reloaded, warning) = load_str("metrics_keep_reload", &text);
+        assert!(warning.is_none(), "{text}");
+        assert!(text.contains("terminal_font_size = \"big\""), "{text}");
+        assert!(text.contains("terminal_cell_width = 9.5"), "{text}");
+        assert!(
+            reloaded
+                .appearance
+                .metric_is_invalid(TerminalMetric::FontSize)
+        );
+        assert!(
+            reloaded
+                .appearance
+                .metric_is_invalid(TerminalMetric::CellWidth)
+        );
+    }
+
+    #[test]
+    fn committing_a_valid_value_replaces_an_invalid_one_and_reset_clears_the_key() {
+        let (mut settings, _) = load_str(
+            "metrics_replace",
+            "[appearance]\nterminal_font_size = \"big\"\n",
+        );
+        settings
+            .appearance
+            .set_metric(TerminalMetric::FontSize, Some(12.0));
+        assert!(
+            !settings
+                .appearance
+                .metric_is_invalid(TerminalMetric::FontSize)
+        );
+        let text = save_and_read(&settings, "metrics_replace_save");
+        assert!(text.contains("terminal_font_size = 12.0"), "{text}");
+        assert!(!text.contains("big"), "{text}");
+
+        settings
+            .appearance
+            .set_metric(TerminalMetric::FontSize, None);
+        let text = save_and_read(&settings, "metrics_reset_save");
+        assert!(!text.contains("terminal_font_size"), "{text}");
+    }
+
+    #[test]
+    fn unknown_keys_and_tables_are_not_dropped_when_saving() {
+        let content = "locale = \"en-US\"\nfuture_top_level = 7\n\n[appearance]\nterminal_font_size = 12.0\n\
+            future_appearance_key = \"x\"\n\n[future_table]\nanswer = 42\n";
+        let (mut settings, warning) = load_str("metrics_unknown", content);
+        assert!(warning.is_none());
+        settings
+            .appearance
+            .set_metric(TerminalMetric::CellWidth, Some(0.6));
+
+        let text = save_and_read(&settings, "metrics_unknown_save");
+        let (reloaded, warning) = load_str("metrics_unknown_reload", &text);
+        assert!(warning.is_none(), "{text}");
+        for needle in [
+            "future_top_level = 7",
+            "future_appearance_key = \"x\"",
+            "answer = 42",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+        assert_eq!(
+            reloaded.appearance.metric(TerminalMetric::CellWidth),
+            Some(0.6)
+        );
+        assert_eq!(
+            reloaded.appearance.metric(TerminalMetric::FontSize),
+            Some(12.0)
         );
     }
 

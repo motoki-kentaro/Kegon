@@ -29,6 +29,9 @@ fn main() -> iced::Result {
     if let Some(warning) = settings.appearance.theme.diagnostic() {
         eprintln!("kegon: {warning}");
     }
+    for warning in settings.appearance.metric_diagnostics() {
+        eprintln!("kegon: {warning}");
+    }
 
     let locale = settings::resolve_application_locale(
         options.locale.as_deref(),

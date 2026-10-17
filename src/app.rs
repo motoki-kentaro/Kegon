@@ -28,7 +28,8 @@ use crate::dialog::{
 };
 use crate::font::{
     FontCache, SystemFontCatalog, TerminalCellMetrics, TerminalFontConfig, TerminalFontStatus,
-    UiFontResolution, UiFontStatus, resolve_terminal_font, resolve_ui_font,
+    TerminalMetricOverrides, UiFontResolution, UiFontStatus, resolve_terminal_font,
+    resolve_ui_font,
 };
 use crate::i18n::{self, FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{
@@ -36,8 +37,8 @@ use crate::icons::{
     settings_icon, tab_add_icon, tab_close_icon, tab_scroll_left_icon, tab_scroll_right_icon,
 };
 use crate::settings::{
-    ApplicationSettings, LocalePreference, ThemePreference, resolve_application_locale,
-    save_settings,
+    AppearanceSettings, ApplicationSettings, LocalePreference, TerminalMetric, ThemePreference,
+    resolve_application_locale, save_settings,
 };
 use crate::terminal::{
     EventSink, InputArbiter, InputRoute, SystemClipboard, TerminalEvent, TerminalInputEvent,
@@ -69,6 +70,116 @@ struct ActivityButton {
     press: Message,
     enter: Message,
     exit: Message,
+}
+
+/// Text the user is typing into the terminal metric fields of the Settings tab.
+///
+/// Drafts are never written to the application settings; they only become settings when applied.
+/// They live while the Settings tab is open and are rebuilt from the saved settings when it is
+/// opened again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MetricDrafts {
+    font_size: String,
+    cell_height: String,
+    cell_width: String,
+}
+
+impl MetricDrafts {
+    /// Drafts showing the saved values (empty for an unset or ignored value).
+    fn from_settings(appearance: &AppearanceSettings) -> Self {
+        let text = |metric| {
+            appearance
+                .metric(metric)
+                .map(format_metric)
+                .unwrap_or_default()
+        };
+        Self {
+            font_size: text(TerminalMetric::FontSize),
+            cell_height: text(TerminalMetric::CellHeight),
+            cell_width: text(TerminalMetric::CellWidth),
+        }
+    }
+
+    fn get(&self, metric: TerminalMetric) -> &str {
+        match metric {
+            TerminalMetric::FontSize => &self.font_size,
+            TerminalMetric::CellHeight => &self.cell_height,
+            TerminalMetric::CellWidth => &self.cell_width,
+        }
+    }
+
+    fn set(&mut self, metric: TerminalMetric, text: String) {
+        match metric {
+            TerminalMetric::FontSize => self.font_size = text,
+            TerminalMetric::CellHeight => self.cell_height = text,
+            TerminalMetric::CellWidth => self.cell_width = text,
+        }
+    }
+}
+
+/// Why a draft cannot be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftError {
+    /// Nothing typed: not an error to show, just nothing to apply.
+    Empty,
+    /// Not a finite number inside the metric's range.
+    Invalid,
+}
+
+/// Parses a draft into a value the settings accept.
+fn parse_metric_draft(metric: TerminalMetric, draft: &str) -> Result<f64, DraftError> {
+    let draft = draft.trim();
+    if draft.is_empty() {
+        return Err(DraftError::Empty);
+    }
+    match draft.parse::<f64>() {
+        Ok(value) if value.is_finite() && metric.range().contains(&value) => Ok(value),
+        _ => Err(DraftError::Invalid),
+    }
+}
+
+/// A metric value as shown in an input field (`12`, `1.2`).
+fn format_metric(value: f64) -> String {
+    value.to_string()
+}
+
+/// What the Settings tab shows and enables for one metric, derived from the draft and the saved value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MetricFieldState {
+    /// The draft is valid and differs from the saved value.
+    can_apply: bool,
+    /// The draft differs from what is saved (shown as "not applied").
+    pending: bool,
+    /// The draft is not usable and an error is shown.
+    invalid: bool,
+}
+
+fn metric_field_state(
+    metric: TerminalMetric,
+    draft: &str,
+    appearance: &AppearanceSettings,
+) -> MetricFieldState {
+    let saved = appearance.metric(metric);
+    match parse_metric_draft(metric, draft) {
+        Ok(value) => {
+            let differs = saved != Some(value);
+            MetricFieldState {
+                can_apply: differs,
+                pending: differs,
+                invalid: false,
+            }
+        }
+        Err(DraftError::Empty) => MetricFieldState {
+            can_apply: false,
+            pending: saved.is_some(),
+            invalid: false,
+        },
+        Err(DraftError::Invalid) => MetricFieldState {
+            can_apply: false,
+            pending: true,
+            invalid: true,
+        },
+    }
 }
 
 /// A terminal event tagged with the tab whose session produced it.
@@ -181,6 +292,12 @@ pub enum Message {
     SettingsResetUiFontClicked,
     SettingsChooseTerminalFontClicked,
     SettingsResetTerminalFontClicked,
+    /// A terminal metric field was edited (draft only; nothing is saved).
+    SettingsMetricDraftChanged(TerminalMetric, String),
+    /// Enter or the Apply button of a terminal metric field.
+    SettingsMetricApply(TerminalMetric),
+    /// The Reset button of a terminal metric field.
+    SettingsMetricReset(TerminalMetric),
     FontPickerSearchChanged(String),
     FontPickerMonospaceToggled(bool),
     FontPickerCandidateSelected(usize),
@@ -198,6 +315,8 @@ pub struct Kegon {
     hovered_activity: Option<ActivityItem>,
     /// Whether the pointer is over the Settings gear.
     settings_gear_hovered: bool,
+    /// Drafts of the terminal metric fields while the Settings tab is open.
+    metric_drafts: Option<MetricDrafts>,
     /// Terminal sessions (and their titles) by tab. Only the active tab's session receives
     /// input and is drawn; the others keep running in the background.
     terminals: TerminalRegistry,
@@ -287,6 +406,7 @@ impl Kegon {
         let mut font_cache = FontCache::default();
         let terminal_font_config = resolve_terminal_font(
             settings.appearance.terminal_font_family.as_deref(),
+            &TerminalMetricOverrides::from_settings(&settings.appearance),
             &font_catalog,
             &mut font_cache,
         );
@@ -325,6 +445,7 @@ impl Kegon {
             resizing_side_bar: false,
             hovered_activity: None,
             settings_gear_hovered: false,
+            metric_drafts: None,
             terminals,
             terminal_event_tx: tx,
             exit_requested: false,
@@ -455,6 +576,7 @@ impl Kegon {
         let catalog = self.font_catalog.as_ref().unwrap();
         self.terminal_font_config = resolve_terminal_font(
             self.settings.appearance.terminal_font_family.as_deref(),
+            &TerminalMetricOverrides::from_settings(&self.settings.appearance),
             catalog,
             &mut self.font_cache,
         );
@@ -489,6 +611,38 @@ impl Kegon {
         self.terminal_focused = self.active_terminal().is_some();
     }
 
+    /// Validates the draft of `metric` and, if it is usable and new, saves and applies it.
+    fn apply_metric_draft(&mut self, metric: TerminalMetric) {
+        let drafts = self
+            .metric_drafts
+            .get_or_insert_with(|| MetricDrafts::from_settings(&self.settings.appearance));
+        let Ok(value) = parse_metric_draft(metric, drafts.get(metric)) else {
+            return;
+        };
+        if self.settings.appearance.metric(metric) == Some(value) {
+            return;
+        }
+        drafts.set(metric, format_metric(value));
+        let mut updated = self.settings.clone();
+        updated.appearance.set_metric(metric, Some(value));
+        self.commit_settings(updated);
+        self.apply_terminal_font_preference();
+    }
+
+    /// Clears `metric` (also replacing an ignored value), saves, applies, and empties its draft.
+    fn reset_metric(&mut self, metric: TerminalMetric) {
+        self.metric_drafts
+            .get_or_insert_with(|| MetricDrafts::from_settings(&self.settings.appearance))
+            .set(metric, String::new());
+        if !self.settings.appearance.has_metric_key(metric) {
+            return;
+        }
+        let mut updated = self.settings.clone();
+        updated.appearance.set_metric(metric, None);
+        self.commit_settings(updated);
+        self.apply_terminal_font_preference();
+    }
+
     /// Scrolls the strip to a tab that was just appended and activated.
     fn follow_new_last_tab(&mut self) {
         self.pending_tab_scroll_task = Some(TabScrollTask::SnapToEnd);
@@ -503,6 +657,10 @@ impl Kegon {
     /// singleton kind that is already open is only brought to the front.
     fn open_special_tab(&mut self, kind: TabKind) -> TabId {
         let (tab, is_new) = self.workbench.open_special_tab(kind);
+        if is_new && kind == TabKind::Settings {
+            // A reopened Settings tab starts from the saved values, never from an old draft.
+            self.metric_drafts = Some(MetricDrafts::from_settings(&self.settings.appearance));
+        }
         self.focus_active_terminal();
         if is_new {
             self.follow_new_last_tab();
@@ -575,6 +733,9 @@ impl Kegon {
     /// exit because no tab is left.
     fn close_tab(&mut self, tab: TabId) -> bool {
         let was_active = self.workbench.tabs().is_active(tab);
+        if self.workbench.tabs().get(tab).map(|t| t.kind) == Some(TabKind::Settings) {
+            self.metric_drafts = None;
+        }
         // Dropping the entry hands the session to its shutdown; later events for `tab` are
         // ignored by the registry.
         self.terminals.remove(tab);
@@ -877,6 +1038,13 @@ impl Kegon {
                 self.commit_settings(updated_settings);
                 self.apply_terminal_font_preference();
             }
+            Message::SettingsMetricDraftChanged(metric, text) => {
+                self.metric_drafts
+                    .get_or_insert_with(|| MetricDrafts::from_settings(&self.settings.appearance))
+                    .set(metric, text);
+            }
+            Message::SettingsMetricApply(metric) => self.apply_metric_draft(metric),
+            Message::SettingsMetricReset(metric) => self.reset_metric(metric),
             Message::FontPickerSearchChanged(query) => {
                 if let Some(picker) = self.font_picker.as_mut() {
                     picker.set_search_query(query);
@@ -1400,6 +1568,131 @@ impl Kegon {
             .into()
     }
 
+    /// One terminal metric row of the Settings tab: label, description, current value, a draft input
+    /// with Apply and Reset, and the pending / error / ignored-value notes.
+    fn settings_metric_field(&self, metric: TerminalMetric) -> Element<'_, Message> {
+        let theme = self.active_theme;
+        let (label_key, description_key, default_key) = match metric {
+            TerminalMetric::FontSize => (
+                MessageKey::SettingsFontSizeLabel,
+                MessageKey::SettingsFontSizeDescription,
+                MessageKey::SettingsFontSizeDefault,
+            ),
+            TerminalMetric::CellHeight => (
+                MessageKey::SettingsCellHeightLabel,
+                MessageKey::SettingsCellHeightDescription,
+                MessageKey::SettingsCellHeightDefault,
+            ),
+            TerminalMetric::CellWidth => (
+                MessageKey::SettingsCellWidthLabel,
+                MessageKey::SettingsCellWidthDescription,
+                MessageKey::SettingsCellWidthDefault,
+            ),
+        };
+        let appearance = &self.settings.appearance;
+        let fallback;
+        let draft = match &self.metric_drafts {
+            Some(drafts) => drafts.get(metric),
+            None => {
+                fallback = MetricDrafts::from_settings(appearance);
+                fallback.get(metric)
+            }
+        };
+        let state = metric_field_state(metric, draft, appearance);
+
+        let small = |content: String, color: Color| {
+            text(content)
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font)
+                .color(color)
+        };
+
+        let default_text = self.localizer.text(default_key);
+        let current = match appearance.metric(metric) {
+            Some(value) => {
+                let shown = match metric {
+                    TerminalMetric::FontSize => format!("{} pt", format_metric(value)),
+                    _ => format!("× {}", format_metric(value)),
+                };
+                let mut args = FluentArgs::new();
+                args.set("value", shown);
+                self.localizer
+                    .text_with(MessageKey::SettingsMetricCurrent, &args)
+            }
+            None => {
+                let mut args = FluentArgs::new();
+                args.set("value", default_text.clone());
+                self.localizer
+                    .text_with(MessageKey::SettingsMetricDefaultValue, &args)
+            }
+        };
+
+        let input = iced::widget::text_input(&default_text, draft)
+            .on_input(move |text| Message::SettingsMetricDraftChanged(metric, text))
+            .on_submit(Message::SettingsMetricApply(metric))
+            .size(UI_TEXT_SIZE)
+            .font(self.active_ui_font)
+            .width(160);
+
+        let mut apply = button(
+            text(self.localizer.text(MessageKey::SettingsMetricApply))
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font),
+        )
+        .style(move |_, status| style::secondary_button(theme, status, false));
+        if state.can_apply {
+            apply = apply.on_press(Message::SettingsMetricApply(metric));
+        }
+
+        let mut reset = button(
+            text(self.localizer.text(MessageKey::SettingsMetricReset))
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font),
+        )
+        .style(move |_, status| style::secondary_button(theme, status, false));
+        if appearance.has_metric_key(metric) {
+            reset = reset.on_press(Message::SettingsMetricReset(metric));
+        }
+
+        let mut controls = row![input, apply, reset].spacing(8).align_y(Center);
+        if state.pending && !state.invalid {
+            controls = controls.push(small(
+                self.localizer.text(MessageKey::SettingsMetricPending),
+                theme.semantic.warning,
+            ));
+        }
+
+        let mut field = column![
+            self.settings_label(label_key),
+            small(self.localizer.text(description_key), theme.text.muted),
+            small(current, theme.text.muted),
+            controls,
+        ]
+        .spacing(6);
+
+        if state.invalid {
+            let range = metric.range();
+            let mut args = FluentArgs::new();
+            args.set("min", format_metric(*range.start()));
+            args.set("max", format_metric(*range.end()));
+            field = field.push(small(
+                self.localizer
+                    .text_with(MessageKey::SettingsMetricRangeError, &args),
+                theme.semantic.destructive,
+            ));
+        }
+        if let Some(raw) = appearance.invalid_metric_text(metric) {
+            let mut args = FluentArgs::new();
+            args.set("value", raw);
+            field = field.push(small(
+                self.localizer
+                    .text_with(MessageKey::SettingsMetricStoredInvalid, &args),
+                theme.semantic.destructive,
+            ));
+        }
+        field.into()
+    }
+
     /// A label above a settings control.
     fn settings_label(&self, key: MessageKey) -> Element<'_, Message> {
         text(self.localizer.text(key))
@@ -1696,7 +1989,14 @@ impl Kegon {
         let terminal = self.settings_category(
             MessageKey::SettingsCategoryTerminalTitle,
             MessageKey::SettingsCategoryTerminalDescription,
-            terminal_font_col.into(),
+            column![
+                terminal_font_col,
+                self.settings_metric_field(TerminalMetric::FontSize),
+                self.settings_metric_field(TerminalMetric::CellHeight),
+                self.settings_metric_field(TerminalMetric::CellWidth),
+            ]
+            .spacing(16)
+            .into(),
         );
 
         let page = column![
@@ -2449,7 +2749,9 @@ mod tests {
                 theme: ThemePreference::Unknown("future-theme".into()),
                 ui_font_family: None,
                 terminal_font_family: None,
+                ..Default::default()
             },
+            ..Default::default()
         };
         let mut app = with_test_settings_path(Kegon::new(Locale::JaJp, settings, None, None, None));
         let font_before = app.active_ui_font;
@@ -3417,6 +3719,317 @@ mod tests {
         // The page renders for both locales at a narrow window.
         app.window_size = Size::new(360.0, 300.0);
         let _ = app.view();
+    }
+
+    // --- terminal metric settings in the Settings tab ---
+
+    fn app_with_settings(settings: ApplicationSettings) -> Kegon {
+        with_test_settings_path(Kegon::new(Locale::EnUs, settings, None, None, None))
+    }
+
+    fn saved_text(app: &Kegon) -> Option<String> {
+        std::fs::read_to_string(app.settings_path.as_ref().unwrap()).ok()
+    }
+
+    fn type_draft(app: &mut Kegon, metric: TerminalMetric, text: &str) {
+        app.update(Message::SettingsMetricDraftChanged(
+            metric,
+            text.to_string(),
+        ));
+    }
+
+    #[test]
+    fn metric_drafts_do_not_touch_settings_or_the_file_until_applied() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.update(Message::OpenSettingsTab);
+        let before = app.settings.clone();
+        let metrics_before = app.terminal_font_config.metrics;
+
+        type_draft(&mut app, TerminalMetric::FontSize, "12");
+        type_draft(&mut app, TerminalMetric::CellWidth, "garbage");
+
+        assert_eq!(app.settings, before);
+        assert_eq!(app.terminal_font_config.metrics, metrics_before);
+        assert!(
+            saved_text(&app).is_none(),
+            "nothing may be saved while typing"
+        );
+    }
+
+    #[test]
+    fn applying_a_valid_draft_saves_and_updates_the_metrics_for_every_terminal() {
+        let mut app = new_test_app(Locale::EnUs);
+        let first = active_tab(&app);
+        let second = add_terminal_tab(&mut app);
+        app.update(Message::OpenSettingsTab);
+        let settings_tab = settings_tab_of(&app).unwrap();
+        app.window_size = Size::new(1200.0, 760.0);
+        app.resize_terminal_view();
+
+        type_draft(&mut app, TerminalMetric::FontSize, " 12 ");
+        type_draft(&mut app, TerminalMetric::CellHeight, "1.2");
+        type_draft(&mut app, TerminalMetric::CellWidth, "0.6");
+        for metric in TerminalMetric::ALL {
+            app.update(Message::SettingsMetricApply(metric));
+        }
+
+        let m = app.terminal_font_config.metrics;
+        assert!((m.font_size - 16.0).abs() < 1e-4);
+        assert!((m.cell_width - 9.6).abs() < 1e-4);
+        assert!((m.cell_height - 19.2).abs() < 1e-4);
+        let text = saved_text(&app).expect("saved");
+        assert!(text.contains("terminal_font_size = 12.0"), "{text}");
+        assert!(text.contains("terminal_cell_height = 1.2"), "{text}");
+        assert!(text.contains("terminal_cell_width = 0.6"), "{text}");
+
+        // Every session follows with one shared grid, PTY size and cell size; nothing is recreated.
+        let (cols, rows) = app.terminal_grid_size();
+        for tab in [first, second] {
+            let session = app.terminals.get(tab).unwrap().session();
+            assert_eq!(session.pty_size(), (cols, rows, 9, 19), "tab {tab:?}");
+            use alacritty_terminal::grid::Dimensions;
+            let term = session.term().lock();
+            assert_eq!(
+                (term.columns() as u16, term.screen_lines() as u16),
+                (cols, rows)
+            );
+        }
+        assert_eq!(tab_order(&app), [first, second, settings_tab]);
+        assert_eq!(app.terminals.len(), 2);
+        assert_eq!(
+            active_tab(&app),
+            settings_tab,
+            "applying must not change the selected tab"
+        );
+    }
+
+    #[test]
+    fn invalid_empty_and_unchanged_drafts_are_not_applied() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.update(Message::OpenSettingsTab);
+        let before = app.settings.clone();
+        for (metric, text) in [
+            (TerminalMetric::FontSize, "0.9"),
+            (TerminalMetric::FontSize, "100.1"),
+            (TerminalMetric::FontSize, "abc"),
+            (TerminalMetric::FontSize, "nan"),
+            (TerminalMetric::FontSize, "inf"),
+            (TerminalMetric::FontSize, "-12"),
+            (TerminalMetric::FontSize, ""),
+            (TerminalMetric::CellHeight, "0.49"),
+            (TerminalMetric::CellHeight, "3.01"),
+            (TerminalMetric::CellWidth, "0.19"),
+            (TerminalMetric::CellWidth, "2.01"),
+        ] {
+            type_draft(&mut app, metric, text);
+            app.update(Message::SettingsMetricApply(metric));
+            assert_eq!(app.settings, before, "{metric:?} {text:?}");
+        }
+        assert!(saved_text(&app).is_none());
+
+        // Applying the value that is already saved does nothing either.
+        type_draft(&mut app, TerminalMetric::FontSize, "12");
+        app.update(Message::SettingsMetricApply(TerminalMetric::FontSize));
+        let saved = app.settings.clone();
+        app.update(Message::SettingsMetricApply(TerminalMetric::FontSize));
+        assert_eq!(app.settings, saved);
+    }
+
+    #[test]
+    fn field_state_enables_apply_only_for_a_valid_new_value() {
+        let mut appearance = AppearanceSettings::default();
+        let m = TerminalMetric::FontSize;
+        let flags = |s: MetricFieldState| (s.can_apply, s.pending, s.invalid);
+
+        assert_eq!(
+            flags(metric_field_state(m, "", &appearance)),
+            (false, false, false)
+        );
+        assert_eq!(
+            flags(metric_field_state(m, "12", &appearance)),
+            (true, true, false)
+        );
+        assert_eq!(
+            flags(metric_field_state(m, "x", &appearance)),
+            (false, true, true)
+        );
+
+        appearance.set_metric(m, Some(12.0));
+        assert_eq!(
+            flags(metric_field_state(m, "12.0", &appearance)),
+            (false, false, false)
+        );
+        assert_eq!(
+            flags(metric_field_state(m, "", &appearance)),
+            (false, true, false)
+        );
+    }
+
+    #[test]
+    fn other_setting_changes_keep_unapplied_drafts() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.update(Message::OpenSettingsTab);
+        type_draft(&mut app, TerminalMetric::CellHeight, "1.5");
+
+        app.update(Message::SettingsLocaleChanged(LocalePreference::JaJp));
+        app.update(Message::SettingsThemeChanged(ThemeId::NightDark));
+        app.update(Message::SettingsResetTerminalFontClicked);
+        type_draft(&mut app, TerminalMetric::CellWidth, "0.7");
+        app.update(Message::SettingsMetricApply(TerminalMetric::CellWidth));
+
+        let drafts = app.metric_drafts.as_ref().unwrap();
+        assert_eq!(drafts.get(TerminalMetric::CellHeight), "1.5");
+        assert_eq!(
+            app.settings.appearance.metric(TerminalMetric::CellHeight),
+            None
+        );
+        assert_eq!(
+            app.settings.appearance.metric(TerminalMetric::CellWidth),
+            Some(0.7)
+        );
+    }
+
+    #[test]
+    fn closing_settings_discards_drafts_and_reopening_starts_from_saved_values() {
+        let mut settings = ApplicationSettings::default();
+        settings
+            .appearance
+            .set_metric(TerminalMetric::FontSize, Some(11.0));
+        let mut app = app_with_settings(settings);
+        app.update(Message::OpenSettingsTab);
+        assert_eq!(
+            app.metric_drafts
+                .as_ref()
+                .unwrap()
+                .get(TerminalMetric::FontSize),
+            "11"
+        );
+
+        type_draft(&mut app, TerminalMetric::FontSize, "20");
+        // Switching tabs keeps the draft; closing the Settings tab drops it.
+        let terminal = app.workbench.tabs().iter().next().unwrap().id;
+        app.update(Message::TabSelected(terminal));
+        assert_eq!(
+            app.metric_drafts
+                .as_ref()
+                .unwrap()
+                .get(TerminalMetric::FontSize),
+            "20"
+        );
+        let settings_tab = settings_tab_of(&app).unwrap();
+        app.update(Message::TabClosed(settings_tab));
+        assert!(app.metric_drafts.is_none());
+        assert_eq!(
+            app.settings.appearance.metric(TerminalMetric::FontSize),
+            Some(11.0)
+        );
+
+        app.update(Message::OpenSettingsTab);
+        assert_eq!(
+            app.metric_drafts
+                .as_ref()
+                .unwrap()
+                .get(TerminalMetric::FontSize),
+            "11"
+        );
+    }
+
+    #[test]
+    fn reset_applies_immediately_and_restores_the_legacy_metrics() {
+        let mut app = new_test_app(Locale::EnUs);
+        let legacy = app.terminal_font_config.metrics;
+        app.update(Message::OpenSettingsTab);
+        type_draft(&mut app, TerminalMetric::FontSize, "20");
+        app.update(Message::SettingsMetricApply(TerminalMetric::FontSize));
+        type_draft(&mut app, TerminalMetric::CellWidth, "1.0");
+        app.update(Message::SettingsMetricApply(TerminalMetric::CellWidth));
+        assert_ne!(app.terminal_font_config.metrics, legacy);
+
+        app.update(Message::SettingsMetricReset(TerminalMetric::FontSize));
+        app.update(Message::SettingsMetricReset(TerminalMetric::CellWidth));
+
+        assert_eq!(app.terminal_font_config.metrics, legacy);
+        assert_eq!(
+            app.metric_drafts
+                .as_ref()
+                .unwrap()
+                .get(TerminalMetric::FontSize),
+            ""
+        );
+        let text = saved_text(&app).unwrap();
+        assert!(
+            !text.contains("terminal_font_size") && !text.contains("terminal_cell_width"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn ignored_stored_values_are_kept_until_the_user_commits_or_resets() {
+        let dir = std::env::temp_dir().join(format!("kegon_metric_keep_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.toml");
+        std::fs::write(
+            &path,
+            "[appearance]\nterminal_font_size = \"big\"\nfuture_key = 1\n",
+        )
+        .unwrap();
+        let (settings, warning) = crate::settings::load_settings(Some(&path));
+        assert!(warning.is_none());
+
+        let mut app = app_with_settings(settings);
+        app.settings_path = Some(path.clone());
+        let legacy = new_test_app(Locale::EnUs).terminal_font_config.metrics;
+        assert_eq!(
+            app.terminal_font_config.metrics, legacy,
+            "an ignored value leaves the legacy look"
+        );
+
+        // An unrelated change keeps the original TOML value and unknown keys.
+        app.update(Message::SettingsLocaleChanged(LocalePreference::JaJp));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("terminal_font_size = \"big\""), "{text}");
+        assert!(text.contains("future_key = 1"), "{text}");
+
+        // A valid commit replaces it.
+        app.update(Message::OpenSettingsTab);
+        type_draft(&mut app, TerminalMetric::FontSize, "12");
+        app.update(Message::SettingsMetricApply(TerminalMetric::FontSize));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("terminal_font_size = 12.0") && !text.contains("big"),
+            "{text}"
+        );
+        assert!(text.contains("future_key = 1"), "{text}");
+
+        // Reset also replaces an ignored value (clears the key).
+        let (settings, _) = crate::settings::load_settings(Some(&path));
+        let mut app2 = app_with_settings(settings);
+        app2.settings_path = Some(path.clone());
+        app2.settings.appearance.terminal_font_size.replace(
+            crate::settings::NumericSetting::Other(toml::Value::String("bad".into())),
+        );
+        app2.update(Message::OpenSettingsTab);
+        app2.update(Message::SettingsMetricReset(TerminalMetric::FontSize));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("terminal_font_size"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metric_fields_render_in_both_languages_and_a_narrow_window() {
+        for locale in [Locale::EnUs, Locale::JaJp] {
+            let mut settings = ApplicationSettings::default();
+            settings.appearance.terminal_font_size = Some(crate::settings::NumericSetting::Other(
+                toml::Value::String("big".into()),
+            ));
+            let mut app = app_with_settings(settings);
+            app.localizer = Localizer::new(locale);
+            app.update(Message::OpenSettingsTab);
+            type_draft(&mut app, TerminalMetric::CellWidth, "abc");
+            type_draft(&mut app, TerminalMetric::CellHeight, "1.2");
+            app.window_size = Size::new(360.0, 300.0);
+            let _ = app.view();
+        }
     }
 
     #[test]
