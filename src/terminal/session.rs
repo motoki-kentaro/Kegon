@@ -15,7 +15,9 @@ use alacritty_terminal::term::Config;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 
-use crate::terminal::cwd::{CwdScanner, local_host_name};
+use crate::terminal::cwd::local_host_name;
+use crate::terminal::integration::Osc133Marker;
+use crate::terminal::osc::{OscEvent, OscScanner};
 use crate::terminal::shell::Launch;
 
 /// State of a terminal session lifecycle.
@@ -39,24 +41,41 @@ pub enum TerminalEvent {
     ChildExit(Option<i32>),
     /// The shell reported its current local working directory (Shell Integration).
     WorkingDirectory(PathBuf),
+    /// Raw OSC 133 shell integration marker.
+    ShellIntegration(Osc133Marker),
 }
 
-/// The PTY with a tap on its output: every read is also scanned for working-directory reports.
+/// The PTY with a tap on its output: every read is scanned for working-directory reports
+/// and OSC 133 shell integration markers.
 ///
-/// `alacritty_terminal` ignores OSC 7, and the event loop owns the only read path, so the tap sits
-/// between the loop and the real PTY. Bytes are passed through unchanged.
+/// `alacritty_terminal` ignores OSC 7, 9;9, and 133, and the event loop owns the only read path,
+/// so the tap sits between the loop and the real PTY. Bytes are passed through unchanged.
 struct TappedPty<P> {
     inner: P,
-    scanner: CwdScanner,
+    scanner: OscScanner,
     sink: EventSink,
 }
 
 impl<P: EventedReadWrite> io::Read for TappedPty<P> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let read = io::Read::read(self.inner.reader(), buf)?;
-        // Only the last report of a read matters: it supersedes the others, and forwarding just
-        // one keeps a flood of reports from flooding the event channel.
-        if let Some(path) = self.scanner.scan(&buf[..read]).pop() {
+        let events = self.scanner.scan(&buf[..read]);
+        let mut last_cwd = None;
+        for event in events {
+            match event {
+                OscEvent::WorkingDirectory(path) => {
+                    last_cwd = Some(path);
+                }
+                OscEvent::ShellIntegration(marker) => {
+                    let _ = self
+                        .sink
+                        .unbounded_send(TerminalEvent::ShellIntegration(marker));
+                }
+            }
+        }
+        // Only the last working directory report of a read matters: it supersedes the others,
+        // and forwarding just one keeps a flood of reports from flooding the event channel.
+        if let Some(path) = last_cwd {
             let _ = self
                 .sink
                 .unbounded_send(TerminalEvent::WorkingDirectory(path));
@@ -329,7 +348,7 @@ impl TerminalSession {
             tty::new(&options, window_size, 0).map_err(|e| format!("Failed to spawn PTY: {e}"))?;
         let pty = TappedPty {
             inner: pty,
-            scanner: CwdScanner::new(local_host_name()),
+            scanner: OscScanner::new(local_host_name()),
             sink: event_tx.clone(),
         };
 

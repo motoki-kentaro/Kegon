@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::terminal::integration::{CommandState, CommandStateMachine};
 use crate::terminal::session::{TerminalEvent, TerminalSession};
 use crate::terminal::title::normalize_terminal_title;
 use crate::workbench::TabId;
@@ -20,6 +21,8 @@ pub struct TerminalEntry {
     /// never filled from a guess or from the directory the session was started in, since the
     /// shell may have changed directory since without being able to tell us.
     reported_cwd: Option<PathBuf>,
+    /// Command execution state machine tracking OSC 133 shell integration.
+    command_state: CommandStateMachine,
 }
 
 impl TerminalEntry {
@@ -36,14 +39,30 @@ impl TerminalEntry {
         self.reported_cwd.as_deref()
     }
 
+    /// Returns the current command execution state for this terminal.
+    pub fn command_state(&self) -> &CommandState {
+        self.command_state.state()
+    }
+
+    /// Returns a reference to the command state machine for this terminal.
+    pub fn command_state_machine(&self) -> &CommandStateMachine {
+        &self.command_state
+    }
+
     fn apply(&mut self, event: TerminalEvent) {
         match event {
             TerminalEvent::Title(raw) => self.title = normalize_terminal_title(&raw),
             TerminalEvent::ResetTitle => self.title = None,
             TerminalEvent::WorkingDirectory(path) => self.reported_cwd = Some(path),
+            TerminalEvent::ShellIntegration(marker) => {
+                let _ = self.command_state.transition(marker);
+            }
+            TerminalEvent::ChildExit(_) => {
+                let _ = self.command_state.on_shell_exit();
+            }
             // Redraw happens because a message was processed; the last title is kept after exit
             // since the terminal contents stay on screen.
-            TerminalEvent::Wakeup | TerminalEvent::ChildExit(_) => {}
+            TerminalEvent::Wakeup => {}
         }
     }
 }
@@ -71,6 +90,7 @@ impl TerminalRegistry {
                 session,
                 title: None,
                 reported_cwd: None,
+                command_state: CommandStateMachine::new(),
             },
         );
         Ok(())
@@ -83,6 +103,20 @@ impl TerminalRegistry {
     #[allow(dead_code)] // Part of the session-management API; no caller needs it yet.
     pub fn get_mut(&mut self, tab: TabId) -> Option<&mut TerminalEntry> {
         self.entries.get_mut(&tab)
+    }
+
+    /// Returns the command state of `tab` if registered.
+    #[allow(dead_code)]
+    pub fn command_state(&self, tab: TabId) -> Option<&CommandState> {
+        self.entries.get(&tab).map(TerminalEntry::command_state)
+    }
+
+    /// Returns a reference to the command state machine of `tab` if registered.
+    #[allow(dead_code)]
+    pub fn command_state_machine(&self, tab: TabId) -> Option<&CommandStateMachine> {
+        self.entries
+            .get(&tab)
+            .map(TerminalEntry::command_state_machine)
     }
 
     #[cfg(test)]
@@ -340,5 +374,80 @@ mod tests {
             ids[0],
             TerminalEvent::WorkingDirectory(PathBuf::from(r"C:\x"))
         ));
+    }
+
+    #[test]
+    fn shell_integration_state_machine_tab_isolation_and_lifecycle() {
+        use crate::terminal::integration::{CommandResult, CommandState, Osc133Marker};
+
+        let ids = tab_ids(2);
+        let mut registry = TerminalRegistry::new();
+        registry.insert(ids[0], session()).ok().unwrap();
+        registry.insert(ids[1], session()).ok().unwrap();
+
+        assert_eq!(registry.command_state(ids[0]), Some(&CommandState::Unknown));
+        assert_eq!(registry.command_state(ids[1]), Some(&CommandState::Unknown));
+
+        // Advance tab 0: A -> B -> C
+        registry.handle_event(
+            ids[0],
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        );
+        assert_eq!(registry.command_state(ids[0]), Some(&CommandState::Prompt));
+        // Tab 1 remains completely isolated
+        assert_eq!(registry.command_state(ids[1]), Some(&CommandState::Unknown));
+
+        registry.handle_event(
+            ids[0],
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        );
+        assert_eq!(registry.command_state(ids[0]), Some(&CommandState::Editing));
+
+        registry.handle_event(
+            ids[0],
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStarted),
+        );
+        assert_eq!(
+            registry.command_state(ids[0]),
+            Some(&CommandState::Executing { command_id: 1 })
+        );
+        assert_eq!(registry.command_state(ids[1]), Some(&CommandState::Unknown));
+
+        // Finish tab 0 command with exit code 0
+        registry.handle_event(
+            ids[0],
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+        );
+        assert_eq!(
+            registry.command_state(ids[0]),
+            Some(&CommandState::Finished {
+                command_id: 1,
+                result: CommandResult::Success,
+            })
+        );
+
+        // Advance tab 1 into Executing
+        registry.handle_event(
+            ids[1],
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStarted),
+        );
+        assert_eq!(
+            registry.command_state(ids[1]),
+            Some(&CommandState::Executing { command_id: 1 })
+        );
+
+        // Child exit on tab 1 interrupts active command as Unknown (does NOT borrow shell exit code)
+        registry.handle_event(ids[1], TerminalEvent::ChildExit(Some(42)));
+        assert_eq!(
+            registry.command_state(ids[1]),
+            Some(&CommandState::Finished {
+                command_id: 1,
+                result: CommandResult::Unknown,
+            })
+        );
+
+        // Removing a tab drops its entry and state
+        registry.remove(ids[0]);
+        assert_eq!(registry.command_state(ids[0]), None);
     }
 }

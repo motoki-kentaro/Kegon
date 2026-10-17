@@ -11,8 +11,10 @@ pub mod cwd;
 pub mod glyph;
 pub mod input;
 pub mod input_event;
+pub mod integration;
 pub mod key_encoder;
 pub mod mode;
+pub mod osc;
 pub mod registry;
 pub mod renderer;
 pub mod session;
@@ -25,8 +27,13 @@ pub use arbitration::{InputArbiter, InputRoute};
 pub use clipboard::SystemClipboard;
 pub use input::{InputAction, format_paste, process_key_event};
 pub use input_event::{KeyEventKind, TerminalInputEvent};
+pub use integration::{
+    CommandExecutionEvent, CommandResult, CommandState, CommandStateMachine, Osc133Marker,
+    StateMachineMetrics, TransitionAnomaly, VerifiedCommandEvent,
+};
 pub use key_encoder::TerminalKeyEncoder;
 pub use mode::TerminalKeyboardMode;
+pub use osc::{OscEvent, OscScanner};
 pub use registry::TerminalRegistry;
 pub use renderer::{DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, TerminalProgram, calculate_grid_size};
 pub use session::{
