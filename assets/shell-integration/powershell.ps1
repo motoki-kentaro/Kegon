@@ -14,7 +14,7 @@ try {
     }
 
     # 3. Require an existing prompt function to wrap
-    if (-not (Get-Command -Name prompt -CommandType Function,Filter -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command -Name prompt -CommandType Function,Filter -ErrorAction Ignore)) {
         return
     }
 
@@ -23,7 +23,6 @@ try {
         OriginalReadLine = $null
         HasReadLine = $false
         Executing = $false
-        HasNative = $false
         HostName = '@HOST@'
     }
 
@@ -36,7 +35,7 @@ try {
     } catch { }
 
     try {
-        if (Get-Command -Name PSConsoleHostReadLine -ErrorAction SilentlyContinue) {
+        if (Get-Command -Name PSConsoleHostReadLine -ErrorAction Ignore) {
             $global:__KegonState.OriginalReadLine = $function:PSConsoleHostReadLine
             $global:__KegonState.HasReadLine = $true
 
@@ -44,34 +43,6 @@ try {
                 $line = & $global:__KegonState.OriginalReadLine
                 if ($null -ne $line -and $line.Trim().Length -gt 0) {
                     $global:__KegonState.Executing = $true
-                    $global:__KegonState.HasNative = $false
-                    try {
-                        $tokens = $null
-                        $errors = $null
-                        $ast = [System.Management.Automation.Language.Parser]::ParseInput($line, [ref]$tokens, [ref]$errors)
-                        if ($null -ne $ast) {
-                            $commands = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)
-                            foreach ($cmd in $commands) {
-                                $cmdName = $cmd.GetCommandName()
-                                if ($cmdName) {
-                                    $info = Get-Command $cmdName -ErrorAction SilentlyContinue
-                                    if ($null -ne $info) {
-                                        if ($info.CommandType -eq 'Alias') {
-                                            if ($info.ResolvedCommand) {
-                                                $info = $info.ResolvedCommand
-                                            } else {
-                                                $info = Get-Command $info.Definition -ErrorAction SilentlyContinue
-                                            }
-                                        }
-                                        if ($null -ne $info -and $info.CommandType -eq 'Application') {
-                                            $global:__KegonState.HasNative = $true
-                                            break
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } catch { }
                     # Command execution start marker: OSC 133;C
                     [Console]::Write("$([char]27)]133;C$([char]7)")
                 }
@@ -81,23 +52,15 @@ try {
     } catch { }
 
     function global:prompt {
-        # Capture exit status before any statement can overwrite $?
+        # Preserve $? only for the user's original prompt, never to infer an exit code.
         $lastSuccess = $global:?
-        $lastExitCode = $global:LASTEXITCODE
 
         $out = ''
         if ($global:__KegonState.HasReadLine -and $global:__KegonState.Executing) {
             $global:__KegonState.Executing = $false
-            if ($lastSuccess) {
-                # Verified success: exit code 0
-                $out += "$([char]27)]133;D;0$([char]7)"
-            } elseif ($global:__KegonState.HasNative -and $null -ne $lastExitCode -and $lastExitCode -ne 0) {
-                # Verified native process failure
-                $out += "$([char]27)]133;D;$lastExitCode$([char]7)"
-            } else {
-                # Non-native failure (cmdlet, script exception, Ctrl+C, etc.): omit code (Unknown)
-                $out += "$([char]27)]133;D$([char]7)"
-            }
+            # Boundary only: neither $? nor a possibly stale LASTEXITCODE proves the
+            # exit code of this input. Success, failure, and compound input are Unknown.
+            $out += "$([char]27)]133;D$([char]7)"
         }
 
         # Prompt start marker: OSC 133;A

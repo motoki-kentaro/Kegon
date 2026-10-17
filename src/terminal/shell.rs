@@ -239,7 +239,7 @@ fn powershell_script(local_host: &str) -> String {
 }
 
 /// `-EncodedCommand` takes base64 of the UTF-16LE script, which avoids every quoting problem.
-fn encode_powershell_command(script: &str) -> String {
+pub(super) fn encode_powershell_command(script: &str) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -497,8 +497,9 @@ mod tests {
     #[test]
     fn launch_from_settings_unknown_integration_errors() {
         let mut settings = crate::settings::TerminalSettings::default();
-        settings.shell_integration =
-            crate::settings::ShellIntegrationMode::Unknown("bogus".to_string());
+        settings.shell_integration = crate::settings::ShellIntegrationMode::Unknown(
+            toml::Value::String("bogus".to_string()),
+        );
 
         let err = Launch::from_settings(&settings, None).unwrap_err();
         assert!(err.contains("unknown terminal.shell_integration"), "{err}");

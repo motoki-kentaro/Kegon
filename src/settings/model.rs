@@ -362,34 +362,39 @@ pub fn validate_shell_path(raw: &str) -> Result<PathBuf, ShellPathError> {
 }
 
 /// Selection mode for which shell executable to run in terminal sessions.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum ShellMode {
     /// Auto-detect the best available shell (pwsh -> powershell -> cmd).
     #[default]
     Auto,
     /// Explicitly run a user-specified executable path.
     Custom,
-    /// Unknown string in settings.toml; kept as-is and reported as diagnostic.
-    Unknown(String),
+    /// Unknown value in settings.toml; kept as-is and reported as diagnostic.
+    Unknown(toml::Value),
 }
+
+impl PartialEq for ShellMode {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Auto, Self::Auto) => true,
+            (Self::Custom, Self::Custom) => true,
+            (Self::Unknown(a), Self::Unknown(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ShellMode {}
 
 impl ShellMode {
     #[allow(dead_code)]
     pub const ALL: [Self; 2] = [Self::Auto, Self::Custom];
 
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Auto => "auto",
-            Self::Custom => "custom",
-            Self::Unknown(raw) => raw.as_str(),
-        }
-    }
-
     pub fn diagnostic(&self) -> Option<String> {
         match self {
             Self::Auto | Self::Custom => None,
             Self::Unknown(raw) => Some(format!(
-                "unknown terminal.shell_mode = {raw:?} in settings (expected \"auto\" or \"custom\"); \
+                "unknown terminal.shell_mode = {raw} in settings (expected \"auto\" or \"custom\"); \
                  the setting is kept as is"
             )),
         }
@@ -398,7 +403,11 @@ impl ShellMode {
 
 impl Serialize for ShellMode {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Custom => serializer.serialize_str("custom"),
+            Self::Unknown(val) => val.serialize(serializer),
+        }
     }
 }
 
@@ -406,39 +415,41 @@ impl<'de> Deserialize<'de> for ShellMode {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let val = toml::Value::deserialize(deserializer)?;
         Ok(match val {
-            toml::Value::String(s) => match s.as_str() {
-                "auto" => Self::Auto,
-                "custom" => Self::Custom,
-                _ => Self::Unknown(s),
-            },
-            other => Self::Unknown(other.to_string()),
+            toml::Value::String(ref s) if s == "auto" => Self::Auto,
+            toml::Value::String(ref s) if s == "custom" => Self::Custom,
+            other => Self::Unknown(other),
         })
     }
 }
 
 /// Mode for Shell Integration (OSC 133 semantic prompt marking).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum ShellIntegrationMode {
     /// Automatically inject Shell Integration in supported shells (pwsh, powershell).
     #[default]
     Auto,
     /// Disable Shell Integration for all shells.
     Disabled,
-    /// Unknown string in settings.toml; kept as-is and reported as diagnostic.
-    Unknown(String),
+    /// Unknown value in settings.toml; kept as-is and reported as diagnostic.
+    Unknown(toml::Value),
 }
+
+impl PartialEq for ShellIntegrationMode {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Auto, Self::Auto) => true,
+            (Self::Disabled, Self::Disabled) => true,
+            (Self::Unknown(a), Self::Unknown(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ShellIntegrationMode {}
 
 impl ShellIntegrationMode {
     #[allow(dead_code)]
     pub const ALL: [Self; 2] = [Self::Auto, Self::Disabled];
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Auto => "auto",
-            Self::Disabled => "disabled",
-            Self::Unknown(raw) => raw.as_str(),
-        }
-    }
 
     #[allow(dead_code)]
     pub fn is_enabled(&self) -> bool {
@@ -449,7 +460,7 @@ impl ShellIntegrationMode {
         match self {
             Self::Auto | Self::Disabled => None,
             Self::Unknown(raw) => Some(format!(
-                "unknown terminal.shell_integration = {raw:?} in settings (expected \"auto\" or \"disabled\"); \
+                "unknown terminal.shell_integration = {raw} in settings (expected \"auto\" or \"disabled\"); \
                  the setting is kept as is"
             )),
         }
@@ -458,7 +469,11 @@ impl ShellIntegrationMode {
 
 impl Serialize for ShellIntegrationMode {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Disabled => serializer.serialize_str("disabled"),
+            Self::Unknown(val) => val.serialize(serializer),
+        }
     }
 }
 
@@ -466,12 +481,9 @@ impl<'de> Deserialize<'de> for ShellIntegrationMode {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let val = toml::Value::deserialize(deserializer)?;
         Ok(match val {
-            toml::Value::String(s) => match s.as_str() {
-                "auto" => Self::Auto,
-                "disabled" => Self::Disabled,
-                _ => Self::Unknown(s),
-            },
-            other => Self::Unknown(other.to_string()),
+            toml::Value::String(ref s) if s == "auto" => Self::Auto,
+            toml::Value::String(ref s) if s == "disabled" => Self::Disabled,
+            other => Self::Unknown(other),
         })
     }
 }

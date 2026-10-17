@@ -747,11 +747,11 @@ shell_integration = "hypothetical"
         assert!(warning.is_none());
         assert_eq!(
             settings.terminal.shell_mode,
-            ShellMode::Unknown("zsh".into())
+            ShellMode::Unknown(toml::Value::String("zsh".into()))
         );
         assert_eq!(
             settings.terminal.shell_integration,
-            ShellIntegrationMode::Unknown("hypothetical".into())
+            ShellIntegrationMode::Unknown(toml::Value::String("hypothetical".into()))
         );
 
         let diagnostics = settings.terminal.diagnostics();
@@ -779,15 +779,33 @@ shell_integration = true
         assert!(warning.is_none());
         assert_eq!(
             settings.terminal.shell_mode,
-            ShellMode::Unknown("42".into())
+            ShellMode::Unknown(toml::Value::Integer(42))
         );
         assert_eq!(
             settings.terminal.shell_integration,
-            ShellIntegrationMode::Unknown("true".into())
+            ShellIntegrationMode::Unknown(toml::Value::Boolean(true))
         );
 
         let diagnostics = settings.terminal.diagnostics();
         assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics[0].contains("unknown terminal.shell_mode = 42"));
+        assert!(diagnostics[1].contains("unknown terminal.shell_integration = true"));
+
+        // When saved, the raw types (integer and boolean) are preserved verbatim without turning into strings
+        let text = save_and_read(&settings, "non_string_enums_save");
+        assert!(text.contains("shell_mode = 42"), "{text}");
+        assert!(text.contains("shell_integration = true"), "{text}");
+
+        // And reloading preserves the typed representation
+        let (reloaded, _) = load_str("non_string_enums_reload", &text);
+        assert_eq!(
+            reloaded.terminal.shell_mode,
+            ShellMode::Unknown(toml::Value::Integer(42))
+        );
+        assert_eq!(
+            reloaded.terminal.shell_integration,
+            ShellIntegrationMode::Unknown(toml::Value::Boolean(true))
+        );
     }
 
     #[test]

@@ -62,10 +62,9 @@ impl TerminalEntry {
             ShellIntegrationLaunch::Disabled => ShellIntegrationStatus::Disabled,
             ShellIntegrationLaunch::Unsupported => ShellIntegrationStatus::Unsupported,
             ShellIntegrationLaunch::Injected => {
-                let metrics = self.command_state.metrics();
-                if metrics.command_count > 0 || metrics.finished_count > 0 {
+                if self.command_state.has_verified_command_execution() {
                     ShellIntegrationStatus::Active
-                } else if metrics.prompt_count > 0 || metrics.input_count > 0 {
+                } else if self.command_state.has_verified_prompt() {
                     ShellIntegrationStatus::ActivePromptOnly
                 } else if self.session.is_exited() {
                     ShellIntegrationStatus::Unavailable
@@ -586,5 +585,86 @@ mod tests {
             registry.shell_integration_status(ids[0]),
             Some(ShellIntegrationStatus::Disabled)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn orphaned_d_does_not_promote_shell_integration_to_active() {
+        use crate::terminal::integration::{Osc133Marker, ShellIntegrationStatus};
+        use crate::terminal::shell::{Launch, ShellConfig, installed};
+
+        let ids = tab_ids(1);
+        let mut registry = TerminalRegistry::new();
+        // Explicit launch: neither the user's integration environment variable nor shell
+        // auto-detection may silently skip this regression. Its real events are not applied.
+        let launch = Launch::new(
+            ShellConfig {
+                program: installed::windows_powershell().expect("Windows PowerShell is required"),
+                args: vec![],
+            },
+            true,
+            &crate::terminal::cwd::local_host_name(),
+            None,
+        );
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx, None).unwrap();
+        registry.insert(ids[0], session).ok().unwrap();
+        assert_eq!(
+            registry.shell_integration_status(ids[0]),
+            Some(ShellIntegrationStatus::Waiting)
+        );
+        {
+            // 1. Orphaned D received without C: must NOT become Active; stays Waiting
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::Waiting),
+                "Orphaned D alone must not promote to Active"
+            );
+
+            // 2. Prompt A received: becomes ActivePromptOnly
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::ActivePromptOnly)
+            );
+
+            // 3. Another orphaned D received: still ActivePromptOnly, NOT Active
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::ActivePromptOnly),
+                "Orphaned D after prompt must not promote to Active"
+            );
+
+            // 4. Legitimate C received: now promoted to Active
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::CommandStarted),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::Active)
+            );
+
+            // 5. Normal D finishes command: remains Active
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::Active)
+            );
+        }
     }
 }

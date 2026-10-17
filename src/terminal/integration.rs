@@ -110,6 +110,8 @@ pub struct StateMachineMetrics {
     pub input_count: u64,
     pub command_count: u64,
     pub finished_count: u64,
+    pub verified_command_starts: u64,
+    pub verified_command_finishes: u64,
     pub orphaned_d_count: u64,
     pub duplicate_c_count: u64,
     pub missing_d_count: u64,
@@ -266,23 +268,21 @@ impl CommandStateMachine {
                 }
             }
             Osc133Marker::CommandStarted => {
-                let new_id = next_id.wrapping_add(1);
                 match current {
                     CommandState::Executing { .. } => {
-                        // Duplicate C: previous command did not receive D before new one started
+                        // Duplicate C: previous command is still executing; record anomaly without
+                        // re-assigning command_id or emitting duplicate CommandStarted event.
+                        (current, next_id, None, TransitionAnomaly::DuplicateCommand)
+                    }
+                    _ => {
+                        let new_id = next_id.wrapping_add(1);
                         (
                             CommandState::Executing { command_id: new_id },
                             new_id,
                             Some(VerifiedCommandEvent::CommandStarted { command_id: new_id }),
-                            TransitionAnomaly::DuplicateCommand,
+                            TransitionAnomaly::None,
                         )
                     }
-                    _ => (
-                        CommandState::Executing { command_id: new_id },
-                        new_id,
-                        Some(VerifiedCommandEvent::CommandStarted { command_id: new_id }),
-                        TransitionAnomaly::None,
-                    ),
                 }
             }
             Osc133Marker::CommandFinished(raw_code) => {
@@ -320,10 +320,15 @@ impl CommandStateMachine {
 
         self.state = new_state;
         self.next_command_id = new_id;
-        self.last_verified_event = event;
+        if event.is_some() {
+            self.last_verified_event = event;
+        }
 
         if let Some(VerifiedCommandEvent::CommandFinished { result, .. }) = event {
             self.last_result = Some(result);
+            self.metrics.verified_command_finishes += 1;
+        } else if let Some(VerifiedCommandEvent::CommandStarted { .. }) = event {
+            self.metrics.verified_command_starts += 1;
         }
 
         match marker {
@@ -376,6 +381,16 @@ impl CommandStateMachine {
     /// Returns the result of the last finished command, if any.
     pub fn last_result(&self) -> Option<CommandResult> {
         self.last_result
+    }
+
+    /// Returns true if any verified command execution (legitimate C or D) has occurred.
+    pub fn has_verified_command_execution(&self) -> bool {
+        self.metrics.verified_command_starts > 0 || self.metrics.verified_command_finishes > 0
+    }
+
+    /// Returns true if any verified prompt marker (A or B) has been received.
+    pub fn has_verified_prompt(&self) -> bool {
+        self.metrics.prompt_count > 0 || self.metrics.input_count > 0
     }
 }
 
@@ -520,22 +535,39 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_c_aborts_previous_command_and_starts_new_id() {
+    fn duplicate_c_preserves_active_id_and_completes_with_subsequent_d() {
         let mut sm = CommandStateMachine::new();
         let ev1 = sm.transition(Osc133Marker::CommandStarted);
         assert_eq!(
             ev1,
             Some(VerifiedCommandEvent::CommandStarted { command_id: 1 })
         );
+        assert_eq!(*sm.state(), CommandState::Executing { command_id: 1 });
 
-        // Duplicate C: previous command is superseded, new command ID issued
+        // Duplicate C: active command ID 1 is preserved, no new event emitted, anomaly counted
         let ev2 = sm.transition(Osc133Marker::CommandStarted);
-        assert_eq!(
-            ev2,
-            Some(VerifiedCommandEvent::CommandStarted { command_id: 2 })
-        );
-        assert_eq!(*sm.state(), CommandState::Executing { command_id: 2 });
+        assert_eq!(ev2, None);
+        assert_eq!(*sm.state(), CommandState::Executing { command_id: 1 });
         assert_eq!(sm.metrics().duplicate_c_count, 1);
+        assert_eq!(sm.metrics().verified_command_starts, 1);
+
+        // Subsequent D;0 cleanly completes command 1
+        let ev3 = sm.transition(Osc133Marker::CommandFinished(Some(0)));
+        assert_eq!(
+            ev3,
+            Some(VerifiedCommandEvent::CommandFinished {
+                command_id: 1,
+                result: CommandResult::Success
+            })
+        );
+        assert_eq!(
+            *sm.state(),
+            CommandState::Finished {
+                command_id: 1,
+                result: CommandResult::Success
+            }
+        );
+        assert_eq!(sm.metrics().verified_command_finishes, 1);
     }
 
     #[test]

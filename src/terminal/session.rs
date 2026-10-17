@@ -1438,6 +1438,64 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "needs PowerShell 7 and ConPTY; spawns a real shell"]
+    fn pwsh_hook_preserves_error_history_and_prompt_status() {
+        assert_hook_preserves_state(
+            crate::terminal::shell::installed::pwsh().expect("pwsh is not installed"),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Windows PowerShell 5.1 and ConPTY; spawns a real shell"]
+    fn windows_powershell_hook_preserves_error_history_and_prompt_status() {
+        assert_hook_preserves_state(
+            crate::terminal::shell::installed::windows_powershell()
+                .expect("Windows PowerShell is not installed"),
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_hook_preserves_state(program: String) {
+        use crate::terminal::shell::{ShellConfig, encode_powershell_command};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Define an input provider even if PSReadLine is unavailable in this host.
+        // The fixture replaces only that provider after installing the production hooks.
+        let script = format!(
+            "try {{ function global:PSConsoleHostReadLine {{ '' }}\n{}\n{}\nexit 0\n}} catch {{ [Console]::Error.WriteLine($_); exit 1 }}",
+            include_str!("../../assets/shell-integration/powershell.ps1"),
+            include_str!("../../assets/shell-integration/tests/hook-state.ps1"),
+        );
+        let launch = Launch::new(
+            ShellConfig {
+                program,
+                args: vec![
+                    "-NoProfile".into(),
+                    "-EncodedCommand".into(),
+                    encode_powershell_command(&script),
+                ],
+            },
+            false,
+            &local_host_name(),
+            None,
+        );
+        let (tx, rx) = mpsc::channel();
+        let sink = EventSink::from_fn(move |event| {
+            if let TerminalEvent::ChildExit(code) = event {
+                let _ = tx.send(code);
+            }
+        });
+        let session = TerminalSession::spawn_launch(launch, 120, 40, 10, 20, sink, None).unwrap();
+        let result = rx.recv_timeout(Duration::from_secs(30));
+        // Drop on success, failure, or timeout; the PTY shutdown reaps the process.
+        drop(session);
+        assert_eq!(result, Ok(Some(0)), "hook state regression: {result:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
     #[ignore = "needs Windows PowerShell 5.1 and ConPTY; spawns real shells"]
     fn windows_powershell_shell_integration_emits_osc133_markers() {
         let program = crate::terminal::shell::installed::windows_powershell()
@@ -1450,9 +1508,11 @@ mod tests {
     #[cfg(windows)]
     fn assert_powershell_emits_osc133_markers(program: String, expect_command_markers: bool) {
         use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
 
         let start = scratch_dir("pwsh-osc133-start");
+        let missing_output = start.join("missing-parent").join("out.txt");
+        assert!(!missing_output.parent().unwrap().exists());
         let (tx, rx) = mpsc::channel();
         let sink = EventSink::from_fn(move |event| {
             if let TerminalEvent::ShellIntegration(marker) = event {
@@ -1473,110 +1533,76 @@ mod tests {
             TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
                 .unwrap();
 
-        let wait_for_marker = |predicate: Box<dyn Fn(&Osc133Marker) -> bool>, desc: &str| {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while Instant::now() < deadline {
-                if let Ok(marker) = rx.recv_timeout(Duration::from_millis(200))
-                    && predicate(&marker)
-                {
-                    return marker;
-                }
-            }
-            panic!("timed out waiting for {desc}");
+        // Assert every marker, not just the eventual presence of a matching D:
+        // a numeric D, duplicate C/D, or reordered boundary must fail immediately.
+        let expect = |marker: Osc133Marker, context: &str| {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(30)),
+                Ok(marker),
+                "{context}: expected {marker:?}"
+            );
         };
-
-        // 1. Initial prompt should emit PromptStarted (A) and InputStarted (B)
-        wait_for_marker(
-            Box::new(|m| matches!(m, Osc133Marker::PromptStarted)),
-            "initial PromptStarted",
-        );
-        wait_for_marker(
-            Box::new(|m| matches!(m, Osc133Marker::InputStarted)),
-            "initial InputStarted",
-        );
+        expect(Osc133Marker::PromptStarted, "initial prompt");
+        expect(Osc133Marker::InputStarted, "initial input");
 
         if expect_command_markers {
-            // 2. Run a successful command: cmd.exe /c exit 0
-            session.write_input(b"cmd.exe /c exit 0\r".to_vec());
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::CommandStarted)),
-                "CommandStarted for exit 0",
+            let redirect_failure = format!(
+                "cmd.exe /c exit 0 > '{}'",
+                missing_output.display().to_string().replace('\'', "''")
             );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::CommandFinished(Some(0)))),
-                "CommandFinished(Some(0))",
-            );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::PromptStarted)),
-                "PromptStarted after exit 0",
-            );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::InputStarted)),
-                "InputStarted after exit 0",
-            );
+            let cases = [
+                ("native success", "cmd.exe /c exit 0"),
+                ("native failure", "cmd.exe /c exit 42"),
+                (
+                    "pre-execution redirection failure with stale 42",
+                    redirect_failure.as_str(),
+                ),
+                (
+                    "unexecuted branch",
+                    "if ($false) { cmd.exe /c exit 0 }; Write-Error bad -ErrorAction Ignore",
+                ),
+                (
+                    "argument evaluation failure",
+                    "cmd.exe /c exit $(throw 'kegon argument failure')",
+                ),
+                (
+                    "command resolution failure",
+                    "nonexistent_kegon_command_784392",
+                ),
+                ("compound success", "cmd.exe /c exit 0; Write-Output done"),
+                (
+                    "compound failure",
+                    "cmd.exe /c exit 0; Write-Error bad -ErrorAction Ignore",
+                ),
+                (
+                    "failure followed by success",
+                    "cmd.exe /c exit 42; Write-Output done",
+                ),
+                ("quoted native invocation", "& \"cmd.exe\" /c exit 17"),
+                ("dynamic invocation", "$exe = 'cmd.exe'; & $exe /c exit 42"),
+                ("pipeline", "cmd.exe /c exit 42 | Out-Null"),
+                ("cmdlet failure", "Get-Item NonExistentPath_Test123"),
+            ];
+            for (context, command) in cases {
+                session.write_input(format!("{command}\r").into_bytes());
+                expect(Osc133Marker::CommandStarted, context);
+                expect(Osc133Marker::CommandFinished(None), context);
+                expect(Osc133Marker::PromptStarted, context);
+                expect(Osc133Marker::InputStarted, context);
+            }
 
-            // 3. Run a failing command: cmd.exe /c exit 42
-            session.write_input(b"cmd.exe /c exit 42\r".to_vec());
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::CommandStarted)),
-                "CommandStarted for exit 42",
-            );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::CommandFinished(Some(42)))),
-                "CommandFinished(Some(42))",
-            );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::PromptStarted)),
-                "PromptStarted after exit 42",
-            );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::InputStarted)),
-                "InputStarted after exit 42",
-            );
-
-            // 4. Run a failing cmdlet: Get-Item NonExistentPath_Test123
-            // AST detects Get-Item is not an Application, so it must emit CommandFinished(None) (Unknown)
-            // and NOT inherit the stale LASTEXITCODE 42 from the previous command, nor emit false Some(0).
-            session.write_input(b"Get-Item NonExistentPath_Test123\r".to_vec());
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::CommandStarted)),
-                "CommandStarted for Get-Item",
-            );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::CommandFinished(None))),
-                "CommandFinished(None) for cmdlet failure",
-            );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::PromptStarted)),
-                "PromptStarted after cmdlet failure",
-            );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::InputStarted)),
-                "InputStarted after cmdlet failure",
-            );
-
-            // 5. Run a dynamic native invocation: & "cmd.exe" /c exit 17
-            // AST resolves CommandName to cmd.exe and detects Application, emitting CommandFinished(Some(17))
-            session.write_input(b"& \"cmd.exe\" /c exit 17\r".to_vec());
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::CommandStarted)),
-                "CommandStarted for & cmd.exe",
-            );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::CommandFinished(Some(17)))),
-                "CommandFinished(Some(17)) for dynamic native invocation",
-            );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::PromptStarted)),
-                "PromptStarted after dynamic native failure",
-            );
-            wait_for_marker(
-                Box::new(|m| matches!(m, Osc133Marker::InputStarted)),
-                "InputStarted after dynamic native failure",
-            );
+            // Empty input must not create a command. Accept either no redraw or A/B.
+            session.write_input(b"\r".to_vec());
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(Osc133Marker::PromptStarted) => {
+                    expect(Osc133Marker::InputStarted, "empty input");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                other => panic!("empty input emitted a command marker: {other:?}"),
+            }
         }
 
-        // 4. Verify that OSC 133 control sequences do not leak into visible terminal grid
+        // OSC 133 must not leak into the visible terminal grid.
         let text = {
             let term = session.term().lock();
             let grid = term.grid();
@@ -1603,6 +1629,9 @@ mod tests {
                 && !text.contains("133;D"),
             "{text}"
         );
+        // Drop also runs on any failed assertion/timeout; existing PTY shutdown and
+        // the test binary's bounded cleanup wait reap the child.
+        drop(session);
         let _ = std::fs::remove_dir_all(&start);
     }
 
