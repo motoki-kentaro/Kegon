@@ -95,7 +95,6 @@ impl WorkbenchTabs {
         self.tabs.iter()
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.tabs.len()
     }

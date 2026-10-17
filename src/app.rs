@@ -9,8 +9,10 @@ use iced::futures::StreamExt;
 use iced::futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use iced::keyboard;
 use iced::widget::canvas::Canvas;
+use iced::widget::operation::{self, AbsoluteOffset};
+use iced::widget::scrollable::{self, Direction, Scrollbar};
 use iced::widget::{
-    Space, button, column, container, mouse_area, pick_list, row, space, svg, text, tooltip,
+    Id, Space, button, column, container, mouse_area, pick_list, row, space, svg, text, tooltip,
 };
 use iced::{
     Border, Center, Color, Element, Event, Fill, Font, Point, Size, Subscription, Task, Theme,
@@ -29,7 +31,10 @@ use crate::font::{
     UiFontResolution, UiFontStatus, resolve_terminal_font, resolve_ui_font,
 };
 use crate::i18n::{self, FluentArgs, Locale, Localizer, MessageKey};
-use crate::icons::{ICON_SIZE, activity_icon};
+use crate::icons::{
+    ICON_SIZE, TAB_ADD_ICON_SIZE, TAB_CLOSE_ICON_SIZE, TAB_SCROLL_ICON_SIZE, activity_icon,
+    tab_add_icon, tab_close_icon, tab_scroll_left_icon, tab_scroll_right_icon,
+};
 use crate::settings::{
     ApplicationSettings, LocalePreference, ThemePreference, resolve_application_locale,
     save_settings,
@@ -45,10 +50,13 @@ use crate::workbench::{ActivityItem, SIDE_BAR_DEFAULT_WIDTH, TabId, TabKind, Wor
 const ACTIVITY_BAR_WIDTH: f32 = 48.0;
 const SASH_WIDTH: f32 = 4.0;
 const TAB_STRIP_HEIGHT: f32 = 35.0;
-/// Keeps a long child-provided title from pushing the rest of the tab strip away.
-const TAB_TITLE_MAX_WIDTH: f32 = 240.0;
-const UI_TEXT_SIZE: f32 = 13.0;
+/// Width of every tab in the tab strip.
+const TAB_WIDTH: f32 = 160.0;
 const TAB_CLOSE_WIDTH: f32 = 24.0;
+const TAB_SCROLL_BUTTON_WIDTH: f32 = 24.0;
+const TAB_SCROLLABLE_ID: &str = "workbench_tab_scrollable";
+const SCROLL_EPSILON: f32 = 1.0;
+const UI_TEXT_SIZE: f32 = 13.0;
 
 /// A terminal event tagged with the tab whose session produced it.
 type TabTerminalEvent = (TabId, TerminalEvent);
@@ -136,6 +144,12 @@ pub enum Message {
     NewTerminalTab,
     /// The close button of one tab.
     TabClosed(TabId),
+    /// Viewport event emitted when the tab strip scrollable scrolls.
+    TabStripScrolled(scrollable::Viewport),
+    /// Scroll tabs to the left by one tab width.
+    ScrollTabsLeft,
+    /// Scroll tabs to the right by one tab width.
+    ScrollTabsRight,
     SashPressed,
     SashDragged(f32),
     SashReleased,
@@ -213,6 +227,18 @@ pub struct Kegon {
     active_theme: &'static KegonTheme,
     /// Where settings are saved. `None` means the OS configuration directory.
     settings_path: Option<std::path::PathBuf>,
+    /// Horizontal scroll offset of the tab strip in pixels.
+    tab_scroll_offset_x: f32,
+    /// Viewport width of the tab strip scrollable in pixels.
+    tab_viewport_width: f32,
+    /// Pending scroll command to execute in run_update.
+    pending_tab_scroll_task: Option<TabScrollTask>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TabScrollTask {
+    SnapToEnd,
+    ScrollTo(f32),
 }
 
 impl std::fmt::Debug for Kegon {
@@ -302,6 +328,9 @@ impl Kegon {
             window_size: initial_window_size,
             active_theme,
             settings_path: None,
+            tab_scroll_offset_x: 0.0,
+            tab_viewport_width: 0.0,
+            pending_tab_scroll_task: None,
         };
 
         app.apply_ui_font_preference();
@@ -491,6 +520,12 @@ impl Kegon {
         }
         self.workbench.select_tab(tab);
         self.focus_active_terminal();
+        self.pending_tab_scroll_task = Some(TabScrollTask::SnapToEnd);
+        let total_tabs = self.workbench.tabs().len();
+        let base_width = self.tab_strip_base_width();
+        let geometry =
+            calculate_tab_strip_geometry(total_tabs, base_width, self.tab_scroll_offset_x);
+        self.tab_scroll_offset_x = geometry.max_scroll;
         Some(tab)
     }
 
@@ -507,6 +542,7 @@ impl Kegon {
         if was_active {
             self.focus_active_terminal();
         }
+        self.clamp_tab_scroll_and_follow_active();
         self.workbench.tabs().is_empty()
     }
 
@@ -604,11 +640,82 @@ impl Kegon {
         self.modal.is_some() || self.font_picker.is_some()
     }
 
+    /// Available width for tab buttons without any scroll navigation triangles or new tab button.
+    fn tab_strip_base_width(&self) -> f32 {
+        (self.window_size.width
+            - ACTIVITY_BAR_WIDTH
+            - SASH_WIDTH
+            - self.workbench.side_bar_width()
+            - TAB_STRIP_HEIGHT)
+            .max(0.0)
+    }
+
+    /// Ensures that the tab at `index` is within the visible tab strip viewport, scrolling if needed.
+    fn ensure_tab_visible(&mut self, index: usize) {
+        let total_tabs = self.workbench.tabs().len();
+        let base_width = self.tab_strip_base_width();
+        if let Some(target_x) =
+            tab_scroll_target_for_index(index, total_tabs, base_width, self.tab_scroll_offset_x)
+        {
+            self.tab_scroll_offset_x = target_x;
+            self.pending_tab_scroll_task = Some(TabScrollTask::ScrollTo(target_x));
+        }
+    }
+
+    /// Clamps current scroll offset to valid bounds and keeps the active tab visible on resize.
+    fn clamp_tab_scroll_and_follow_active(&mut self) {
+        let total_tabs = self.workbench.tabs().len();
+        if total_tabs == 0 {
+            return;
+        }
+        let base_width = self.tab_strip_base_width();
+        let active_index = self
+            .workbench
+            .tabs()
+            .active()
+            .and_then(|active| self.workbench.tabs().iter().position(|t| t.id == active.id));
+
+        if let Some(index) = active_index {
+            if let Some(target_x) =
+                tab_scroll_target_for_index(index, total_tabs, base_width, self.tab_scroll_offset_x)
+            {
+                self.tab_scroll_offset_x = target_x;
+                self.pending_tab_scroll_task = Some(TabScrollTask::ScrollTo(target_x));
+            }
+        } else {
+            let geometry =
+                calculate_tab_strip_geometry(total_tabs, base_width, self.tab_scroll_offset_x);
+            let clamped_x = self.tab_scroll_offset_x.min(geometry.max_scroll);
+            if (clamped_x - self.tab_scroll_offset_x).abs() > SCROLL_EPSILON {
+                self.tab_scroll_offset_x = clamped_x;
+                self.pending_tab_scroll_task = Some(TabScrollTask::ScrollTo(clamped_x));
+            }
+        }
+    }
+
+    /// Takes the pending tab scroll task for execution in [`run_update`].
+    fn take_tab_scroll_task(&mut self) -> Option<Task<Message>> {
+        let action = self.pending_tab_scroll_task.take()?;
+        let id = Id::new(TAB_SCROLLABLE_ID);
+        match action {
+            TabScrollTask::SnapToEnd => Some(operation::snap_to_end(id)),
+            TabScrollTask::ScrollTo(x) => Some(operation::scroll_to(
+                id,
+                AbsoluteOffset {
+                    x: Some(x),
+                    y: None,
+                },
+            )),
+        }
+    }
+
     /// The update function handed to iced: [`Self::update`] plus the exit request it may leave.
     pub fn run_update(&mut self, message: Message) -> Task<Message> {
         self.update(message);
         if self.exit_requested {
             iced::exit()
+        } else if let Some(task) = self.take_tab_scroll_task() {
+            task
         } else {
             Task::none()
         }
@@ -629,6 +736,10 @@ impl Kegon {
                 if self.workbench.tabs().active().map(|tab| tab.id) != previous {
                     self.focus_active_terminal();
                 }
+                let tab_index = self.workbench.tabs().iter().position(|t| t.id == id);
+                if let Some(index) = tab_index {
+                    self.ensure_tab_visible(index);
+                }
             }
             Message::NewTerminalTab => {
                 self.open_terminal_tab();
@@ -638,14 +749,40 @@ impl Kegon {
                     self.exit_requested = true;
                 }
             }
+            Message::TabStripScrolled(viewport) => {
+                self.tab_scroll_offset_x = viewport.absolute_offset().x;
+                self.tab_viewport_width = viewport.bounds().width;
+            }
+            Message::ScrollTabsLeft => {
+                let target_x = (self.tab_scroll_offset_x - TAB_WIDTH).max(0.0);
+                if (target_x - self.tab_scroll_offset_x).abs() > SCROLL_EPSILON {
+                    self.tab_scroll_offset_x = target_x;
+                    self.pending_tab_scroll_task = Some(TabScrollTask::ScrollTo(target_x));
+                }
+            }
+            Message::ScrollTabsRight => {
+                let total_tabs = self.workbench.tabs().len();
+                let base_width = self.tab_strip_base_width();
+                let geometry =
+                    calculate_tab_strip_geometry(total_tabs, base_width, self.tab_scroll_offset_x);
+                let target_x = (self.tab_scroll_offset_x + TAB_WIDTH).min(geometry.max_scroll);
+                if (target_x - self.tab_scroll_offset_x).abs() > SCROLL_EPSILON {
+                    self.tab_scroll_offset_x = target_x;
+                    self.pending_tab_scroll_task = Some(TabScrollTask::ScrollTo(target_x));
+                }
+            }
             Message::SashPressed => self.resizing_side_bar = true,
             Message::SashDragged(cursor_x) => {
                 if self.resizing_side_bar {
                     self.workbench
                         .resize_side_bar(cursor_x - ACTIVITY_BAR_WIDTH - SASH_WIDTH / 2.0);
+                    self.clamp_tab_scroll_and_follow_active();
                 }
             }
-            Message::SashReleased => self.resizing_side_bar = false,
+            Message::SashReleased => {
+                self.resizing_side_bar = false;
+                self.clamp_tab_scroll_and_follow_active();
+            }
             // Events from removed sessions are dropped by the registry.
             Message::TerminalEventReceived(tab, event) => {
                 self.terminals.handle_event(tab, event);
@@ -752,6 +889,7 @@ impl Kegon {
             Event::Window(iced::window::Event::Resized(size)) => {
                 self.window_size = size;
                 self.resize_terminal_view();
+                self.clamp_tab_scroll_and_follow_active();
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 physical_key,
@@ -959,15 +1097,54 @@ impl Kegon {
                 }
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                if !self.is_modal_open()
-                    && let Some(session) = self.active_session()
-                {
-                    let lines = match delta {
-                        mouse::ScrollDelta::Lines { y, .. } => (y * 3.0) as i32,
-                        mouse::ScrollDelta::Pixels { y, .. } => (y / 6.0) as i32,
+                let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + self.workbench.side_bar_width();
+                let is_over_tab_strip = self.cursor_position.y >= 0.0
+                    && self.cursor_position.y < TAB_STRIP_HEIGHT
+                    && self.cursor_position.x >= term_x
+                    && self.cursor_position.x <= self.window_size.width;
+
+                if is_over_tab_strip {
+                    // Only convert pure vertical wheel (x == 0) to horizontal scroll for mouse users.
+                    // Touchpads and horizontal wheels emit delta.x directly, which iced's horizontal
+                    // scrollable natively handles; handling x here would cause double-scrolling.
+                    let (has_horizontal, vertical_y) = match delta {
+                        mouse::ScrollDelta::Lines { x, y } => (x.abs() > 0.001, y),
+                        mouse::ScrollDelta::Pixels { x, y } => (x.abs() > 0.001, y / 60.0),
                     };
-                    if lines != 0 {
-                        session.scroll_display(lines);
+
+                    if !has_horizontal && vertical_y.abs() > 0.001 {
+                        let delta_x = -vertical_y * 60.0;
+                        let total_tabs = self.workbench.tabs().len();
+                        let base_width = self.tab_strip_base_width();
+                        let geometry = calculate_tab_strip_geometry(
+                            total_tabs,
+                            base_width,
+                            self.tab_scroll_offset_x,
+                        );
+                        let target_x =
+                            (self.tab_scroll_offset_x + delta_x).clamp(0.0, geometry.max_scroll);
+                        if (target_x - self.tab_scroll_offset_x).abs() > SCROLL_EPSILON {
+                            self.tab_scroll_offset_x = target_x;
+                            self.pending_tab_scroll_task = Some(TabScrollTask::ScrollTo(target_x));
+                        }
+                    }
+                } else {
+                    let is_over_terminal = self.cursor_position.x >= term_x
+                        && self.cursor_position.y >= TAB_STRIP_HEIGHT
+                        && self.cursor_position.x <= self.window_size.width
+                        && self.cursor_position.y <= self.window_size.height;
+
+                    if is_over_terminal
+                        && !self.is_modal_open()
+                        && let Some(session) = self.active_session()
+                    {
+                        let lines = match delta {
+                            mouse::ScrollDelta::Lines { y, .. } => (y * 3.0) as i32,
+                            mouse::ScrollDelta::Pixels { y, .. } => (y / 6.0) as i32,
+                        };
+                        if lines != 0 {
+                            session.scroll_display(lines);
+                        }
                     }
                 }
             }
@@ -1464,6 +1641,10 @@ impl Kegon {
     fn tab_strip(&self) -> Element<'_, Message> {
         let theme = self.active_theme;
         let tabs = self.workbench.tabs();
+        let total_tabs = tabs.len();
+        let base_width = self.tab_strip_base_width();
+        let geometry =
+            calculate_tab_strip_geometry(total_tabs, base_width, self.tab_scroll_offset_x);
 
         let tab_buttons = tabs.iter().map(|tab| {
             let is_active = tabs.is_active(tab.id);
@@ -1478,23 +1659,39 @@ impl Kegon {
                         .font(self.active_ui_font)
                         .wrapping(text::Wrapping::None),
                 )
+                .width(Fill)
                 .height(Fill)
-                .max_width(TAB_TITLE_MAX_WIDTH)
                 .clip(true)
                 .align_y(Center),
             )
+            .width(Fill)
             .height(TAB_STRIP_HEIGHT)
-            .padding(iced::Padding::ZERO.left(16.0).right(8.0))
+            .padding(iced::Padding::ZERO.left(12.0).right(4.0))
             .on_press(Message::TabSelected(tab.id))
             .style(move |_, status| tab_style(theme, is_active, status));
 
             let close = tooltip(
-                button(container(text("×").size(14).font(self.active_ui_font)).center(Fill))
-                    .width(TAB_CLOSE_WIDTH)
-                    .height(TAB_STRIP_HEIGHT)
-                    .padding(0)
-                    .on_press(Message::TabClosed(tab.id))
-                    .style(move |_, status| tab_style(theme, is_active, status)),
+                button(
+                    container(
+                        svg(tab_close_icon())
+                            .width(TAB_CLOSE_ICON_SIZE)
+                            .height(TAB_CLOSE_ICON_SIZE)
+                            .style(move |_, status| {
+                                let color = if matches!(status, svg::Status::Hovered) || is_active {
+                                    theme.icons.active
+                                } else {
+                                    theme.icons.inactive
+                                };
+                                svg::Style { color: Some(color) }
+                            }),
+                    )
+                    .center(Fill),
+                )
+                .width(TAB_CLOSE_WIDTH)
+                .height(TAB_STRIP_HEIGHT)
+                .padding(0)
+                .on_press(Message::TabClosed(tab.id))
+                .style(move |_, status| tab_style(theme, is_active, status)),
                 tooltip_label(
                     self.localizer.text(MessageKey::TerminalCloseTabTooltip),
                     self.active_ui_font,
@@ -1503,19 +1700,41 @@ impl Kegon {
                 tooltip::Position::Bottom,
             );
 
-            row![select, close].into()
+            container(row![select, close].height(TAB_STRIP_HEIGHT).align_y(Center))
+                .width(TAB_WIDTH)
+                .height(TAB_STRIP_HEIGHT)
+                .into()
         });
 
+        let scrollable_tabs = iced::widget::scrollable(row(tab_buttons).height(TAB_STRIP_HEIGHT))
+            .direction(Direction::Horizontal(Scrollbar::hidden()))
+            .id(Id::new(TAB_SCROLLABLE_ID))
+            .on_scroll(Message::TabStripScrolled)
+            .width(Fill)
+            .height(TAB_STRIP_HEIGHT);
+
         let new_tab = tooltip(
-            button(container(text("+").size(16).font(self.active_ui_font)).center(Fill))
-                .width(TAB_STRIP_HEIGHT)
-                .height(TAB_STRIP_HEIGHT)
-                .padding(0)
-                .on_press(Message::NewTerminalTab)
-                .style(move |_, _| button::Style {
-                    text_color: theme.text.muted,
-                    ..button::Style::default()
-                }),
+            button(
+                container(
+                    svg(tab_add_icon())
+                        .width(TAB_ADD_ICON_SIZE)
+                        .height(TAB_ADD_ICON_SIZE)
+                        .style(move |_, status| {
+                            let color = if matches!(status, svg::Status::Hovered) {
+                                theme.icons.active
+                            } else {
+                                theme.icons.inactive
+                            };
+                            svg::Style { color: Some(color) }
+                        }),
+                )
+                .center(Fill),
+            )
+            .width(TAB_STRIP_HEIGHT)
+            .height(TAB_STRIP_HEIGHT)
+            .padding(0)
+            .on_press(Message::NewTerminalTab)
+            .style(move |_, status| tab_icon_button_style(theme, status)),
             tooltip_label(
                 self.localizer.text(MessageKey::TerminalNewTabTooltip),
                 self.active_ui_font,
@@ -1524,7 +1743,63 @@ impl Kegon {
             tooltip::Position::Bottom,
         );
 
-        let strip = row(tab_buttons).push(new_tab).push(space::horizontal());
+        let mut strip = row![].height(TAB_STRIP_HEIGHT).align_y(Center);
+
+        if geometry.show_left_triangle {
+            let left_btn = button(
+                container(
+                    svg(tab_scroll_left_icon())
+                        .width(TAB_SCROLL_ICON_SIZE)
+                        .height(TAB_SCROLL_ICON_SIZE)
+                        .style(move |_, status| {
+                            let color = if matches!(status, svg::Status::Hovered) {
+                                theme.icons.active
+                            } else {
+                                theme.icons.inactive
+                            };
+                            svg::Style { color: Some(color) }
+                        }),
+                )
+                .center(Fill),
+            )
+            .width(TAB_SCROLL_BUTTON_WIDTH)
+            .height(TAB_STRIP_HEIGHT)
+            .padding(0)
+            .on_press(Message::ScrollTabsLeft)
+            .style(move |_, status| tab_icon_button_style(theme, status));
+
+            strip = strip.push(left_btn);
+        }
+
+        strip = strip.push(scrollable_tabs);
+
+        if geometry.show_right_triangle {
+            let right_btn = button(
+                container(
+                    svg(tab_scroll_right_icon())
+                        .width(TAB_SCROLL_ICON_SIZE)
+                        .height(TAB_SCROLL_ICON_SIZE)
+                        .style(move |_, status| {
+                            let color = if matches!(status, svg::Status::Hovered) {
+                                theme.icons.active
+                            } else {
+                                theme.icons.inactive
+                            };
+                            svg::Style { color: Some(color) }
+                        }),
+                )
+                .center(Fill),
+            )
+            .width(TAB_SCROLL_BUTTON_WIDTH)
+            .height(TAB_STRIP_HEIGHT)
+            .padding(0)
+            .on_press(Message::ScrollTabsRight)
+            .style(move |_, status| tab_icon_button_style(theme, status));
+
+            strip = strip.push(right_btn);
+        }
+
+        strip = strip.push(new_tab);
 
         container(strip)
             .width(Fill)
@@ -1594,6 +1869,140 @@ fn tab_style(theme: &KegonTheme, is_active: bool, status: button::Status) -> but
             radius: 0.0.into(),
         },
         ..button::Style::default()
+    }
+}
+
+fn tab_icon_button_style(theme: &KegonTheme, status: button::Status) -> button::Style {
+    let background = if matches!(status, button::Status::Hovered) {
+        theme.interaction.hover
+    } else {
+        theme.workbench.tab_bar_background
+    };
+
+    button::Style {
+        background: Some(background.into()),
+        text_color: theme.text.primary,
+        border: Border {
+            color: theme.workbench.border,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
+/// Geometry and visibility of the tab strip scrollable container and navigation triangles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TabStripGeometry {
+    pub show_left_triangle: bool,
+    pub show_right_triangle: bool,
+    pub effective_viewport_width: f32,
+    pub max_scroll: f32,
+}
+
+impl TabStripGeometry {
+    pub fn is_overflowing(&self) -> bool {
+        self.show_left_triangle || self.show_right_triangle || self.max_scroll > 0.0
+    }
+}
+
+/// Computes visibility of left/right triangle navigation buttons and effective viewport bounds.
+///
+/// Rules (Kegon Issue #53, Section 2):
+/// - Fits without overflow: both triangles hidden.
+/// - Overflow at left edge: left hidden, right shown.
+/// - Overflow in middle: both shown.
+/// - Overflow at right edge: left shown, right hidden.
+pub fn calculate_tab_strip_geometry(
+    total_tabs: usize,
+    base_width: f32,
+    scroll_offset_x: f32,
+) -> TabStripGeometry {
+    let content_width = total_tabs as f32 * TAB_WIDTH;
+    let is_overflowing = content_width > base_width + SCROLL_EPSILON;
+
+    if !is_overflowing {
+        return TabStripGeometry {
+            show_left_triangle: false,
+            show_right_triangle: false,
+            effective_viewport_width: base_width.max(0.0),
+            max_scroll: 0.0,
+        };
+    }
+
+    let available_without_right = (base_width - TAB_SCROLL_BUTTON_WIDTH).max(0.0);
+    let max_scroll = (content_width - available_without_right).max(0.0);
+
+    let can_scroll_left = scroll_offset_x > SCROLL_EPSILON;
+    let can_scroll_right = scroll_offset_x < max_scroll - SCROLL_EPSILON;
+
+    let effective_viewport_width = match (can_scroll_left, can_scroll_right) {
+        (true, true) => (base_width - 2.0 * TAB_SCROLL_BUTTON_WIDTH).max(0.0),
+        (true, false) | (false, true) => (base_width - TAB_SCROLL_BUTTON_WIDTH).max(0.0),
+        (false, false) => base_width.max(0.0),
+    };
+
+    TabStripGeometry {
+        show_left_triangle: can_scroll_left,
+        show_right_triangle: can_scroll_right,
+        effective_viewport_width,
+        max_scroll,
+    }
+}
+
+/// Computes the scroll offset target to make the tab at `index` visible.
+/// Returns `Some(target_x)` if scrolling is necessary, or `None` if already visible.
+pub fn tab_scroll_target_for_index(
+    index: usize,
+    total_tabs: usize,
+    base_width: f32,
+    current_scroll_x: f32,
+) -> Option<f32> {
+    if total_tabs == 0 || index >= total_tabs {
+        return None;
+    }
+    let geometry = calculate_tab_strip_geometry(total_tabs, base_width, current_scroll_x);
+    if !geometry.is_overflowing() {
+        if current_scroll_x.abs() > SCROLL_EPSILON {
+            return Some(0.0);
+        }
+        return None;
+    }
+
+    let tab_start = index as f32 * TAB_WIDTH;
+    let tab_end = tab_start + TAB_WIDTH;
+    let view_start = current_scroll_x;
+    let view_end = current_scroll_x + geometry.effective_viewport_width;
+
+    if tab_start < view_start {
+        let target_x = tab_start.clamp(0.0, geometry.max_scroll);
+        if (target_x - current_scroll_x).abs() > SCROLL_EPSILON {
+            Some(target_x)
+        } else {
+            None
+        }
+    } else if tab_end > view_end {
+        let target_viewport_width = if index == total_tabs - 1 {
+            (base_width - TAB_SCROLL_BUTTON_WIDTH).max(0.0)
+        } else {
+            (base_width - 2.0 * TAB_SCROLL_BUTTON_WIDTH).max(0.0)
+        };
+        let target_x = if index == total_tabs - 1 {
+            geometry.max_scroll
+        } else if TAB_WIDTH > target_viewport_width {
+            tab_start.clamp(0.0, geometry.max_scroll)
+        } else {
+            (tab_end - target_viewport_width).clamp(0.0, geometry.max_scroll)
+        };
+        if (target_x - current_scroll_x).abs() > SCROLL_EPSILON {
+            Some(target_x)
+        } else {
+            None
+        }
+    } else if current_scroll_x > geometry.max_scroll + SCROLL_EPSILON {
+        Some(geometry.max_scroll)
+    } else {
+        None
     }
 }
 
@@ -3004,5 +3413,331 @@ mod tests {
             app.active_session().unwrap().copy_selection().as_deref(),
             Some("Hello")
         );
+    }
+
+    #[test]
+    fn tab_geometry_fits_without_overflow_both_triangles_hidden() {
+        // 2 tabs * 160px = 320px in base_width 500px -> no overflow
+        let geom = calculate_tab_strip_geometry(2, 500.0, 0.0);
+        assert!(!geom.show_left_triangle);
+        assert!(!geom.show_right_triangle);
+        assert!(!geom.is_overflowing());
+        assert_eq!(geom.effective_viewport_width, 500.0);
+        assert_eq!(geom.max_scroll, 0.0);
+    }
+
+    #[test]
+    fn tab_geometry_overflow_left_edge_shows_right_triangle_only() {
+        // 5 tabs * 160px = 800px in base_width 400px, scroll_offset_x = 0.0
+        let geom = calculate_tab_strip_geometry(5, 400.0, 0.0);
+        assert!(!geom.show_left_triangle);
+        assert!(geom.show_right_triangle);
+        assert!(geom.is_overflowing());
+        // base_width - TAB_SCROLL_BUTTON_WIDTH = 400 - 24 = 376
+        assert_eq!(geom.effective_viewport_width, 376.0);
+        // content_width (800) - 376 = 424
+        assert_eq!(geom.max_scroll, 424.0);
+    }
+
+    #[test]
+    fn tab_geometry_overflow_middle_shows_both_triangles() {
+        // 5 tabs in 400px base_width, scroll_offset_x = 160.0
+        let geom = calculate_tab_strip_geometry(5, 400.0, 160.0);
+        assert!(geom.show_left_triangle);
+        assert!(geom.show_right_triangle);
+        assert!(geom.is_overflowing());
+        // base_width - 2 * TAB_SCROLL_BUTTON_WIDTH = 400 - 48 = 352
+        assert_eq!(geom.effective_viewport_width, 352.0);
+        assert_eq!(geom.max_scroll, 424.0);
+    }
+
+    #[test]
+    fn tab_geometry_overflow_right_edge_shows_left_triangle_only() {
+        // 5 tabs in 400px base_width, scroll_offset_x = 424.0 (max_scroll)
+        let geom = calculate_tab_strip_geometry(5, 400.0, 424.0);
+        assert!(geom.show_left_triangle);
+        assert!(!geom.show_right_triangle);
+        assert!(geom.is_overflowing());
+        // base_width - TAB_SCROLL_BUTTON_WIDTH = 400 - 24 = 376
+        assert_eq!(geom.effective_viewport_width, 376.0);
+        assert_eq!(geom.max_scroll, 424.0);
+    }
+
+    #[test]
+    fn tab_geometry_no_oscillation_at_boundaries() {
+        // Test near left edge (0.0, 0.5, 1.0, 1.1)
+        let g0 = calculate_tab_strip_geometry(5, 400.0, 0.0);
+        assert!(!g0.show_left_triangle);
+        assert!(g0.show_right_triangle);
+
+        let g_sub = calculate_tab_strip_geometry(5, 400.0, 0.5);
+        assert!(!g_sub.show_left_triangle);
+        assert!(g_sub.show_right_triangle);
+
+        let g_eps = calculate_tab_strip_geometry(5, 400.0, 1.0);
+        assert!(!g_eps.show_left_triangle);
+        assert!(g_eps.show_right_triangle);
+
+        let g_just_past = calculate_tab_strip_geometry(5, 400.0, 1.1);
+        assert!(g_just_past.show_left_triangle);
+        assert!(g_just_past.show_right_triangle);
+
+        // Test near right edge (max_scroll = 424.0)
+        let g_before_max = calculate_tab_strip_geometry(5, 400.0, 422.9);
+        assert!(g_before_max.show_left_triangle);
+        assert!(g_before_max.show_right_triangle);
+
+        let g_at_max_eps = calculate_tab_strip_geometry(5, 400.0, 423.0);
+        assert!(g_at_max_eps.show_left_triangle);
+        assert!(!g_at_max_eps.show_right_triangle);
+
+        let g_at_max = calculate_tab_strip_geometry(5, 400.0, 424.0);
+        assert!(g_at_max.show_left_triangle);
+        assert!(!g_at_max.show_right_triangle);
+    }
+
+    #[test]
+    fn tab_geometry_extreme_narrow_window() {
+        // base_width = 10.0 or 0.0 should not panic or produce NaN/negatives
+        let g_narrow = calculate_tab_strip_geometry(4, 10.0, 0.0);
+        assert!(g_narrow.is_overflowing());
+        assert!(g_narrow.effective_viewport_width >= 0.0);
+        assert!(g_narrow.max_scroll >= 0.0);
+
+        let g_zero = calculate_tab_strip_geometry(4, 0.0, 0.0);
+        assert!(g_zero.is_overflowing());
+        assert_eq!(g_zero.effective_viewport_width, 0.0);
+        assert_eq!(g_zero.max_scroll, 640.0);
+    }
+
+    #[test]
+    fn tab_scroll_target_follows_active_tab_on_add_select_and_resize() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.window_size = Size::new(600.0, 600.0);
+
+        // Initial state: 1 tab, fits easily
+        assert_eq!(app.workbench.tabs().len(), 1);
+        assert_eq!(app.tab_scroll_offset_x, 0.0);
+
+        // Add 5 more tabs to total 6 tabs (6 * 160 = 960px > base_width ~ 290px)
+        for _ in 0..5 {
+            app.open_terminal_tab();
+        }
+        assert_eq!(app.workbench.tabs().len(), 6);
+        // Newly added tab should be active and snapped to end
+        let geom =
+            calculate_tab_strip_geometry(6, app.tab_strip_base_width(), app.tab_scroll_offset_x);
+        assert_eq!(app.tab_scroll_offset_x, geom.max_scroll);
+        assert!(matches!(
+            app.pending_tab_scroll_task,
+            Some(TabScrollTask::SnapToEnd)
+        ));
+
+        // Select tab 0 (which is hidden far to the left)
+        let tab0_id = app.workbench.tabs().iter().next().unwrap().id;
+        app.update(Message::TabSelected(tab0_id));
+        assert_eq!(app.tab_scroll_offset_x, 0.0);
+        assert!(matches!(
+            app.pending_tab_scroll_task,
+            Some(TabScrollTask::ScrollTo(0.0))
+        ));
+
+        // Select tab 5 (which is hidden to the right)
+        let tab5_id = app.workbench.tabs().iter().last().unwrap().id;
+        app.update(Message::TabSelected(tab5_id));
+        let geom =
+            calculate_tab_strip_geometry(6, app.tab_strip_base_width(), app.tab_scroll_offset_x);
+        assert_eq!(app.tab_scroll_offset_x, geom.max_scroll);
+
+        // Window resize wider: scroll is clamped safely
+        app.update(Message::IcedEventReceived(Event::Window(
+            iced::window::Event::Resized(Size::new(1200.0, 600.0)),
+        )));
+        let new_base = app.tab_strip_base_width();
+        let new_geom = calculate_tab_strip_geometry(6, new_base, app.tab_scroll_offset_x);
+        assert!(app.tab_scroll_offset_x <= new_geom.max_scroll);
+
+        // Window resize narrower: active tab (tab 5) remains followed
+        app.update(Message::IcedEventReceived(Event::Window(
+            iced::window::Event::Resized(Size::new(500.0, 500.0)),
+        )));
+        let narrow_geom =
+            calculate_tab_strip_geometry(6, app.tab_strip_base_width(), app.tab_scroll_offset_x);
+        assert_eq!(app.tab_scroll_offset_x, narrow_geom.max_scroll);
+    }
+
+    #[test]
+    fn tab_strip_close_and_add_buttons_preserved_with_long_titles() {
+        let mut app = new_test_app(Locale::EnUs);
+        let active_id = app.workbench.tabs().active().unwrap().id;
+
+        // Simulate a very long terminal title (200 characters)
+        let long_title = "a".repeat(200);
+        app.terminals
+            .handle_event(active_id, TerminalEvent::Title(long_title.clone()));
+        let rendered_title = app.tab_title(active_id);
+        assert!(rendered_title.ends_with('…'));
+        assert!(rendered_title.len() < long_title.len());
+
+        // Close button width and tab width constants are strictly preserved
+        assert_eq!(TAB_WIDTH, 160.0);
+        assert_eq!(TAB_CLOSE_WIDTH, 24.0);
+        assert_eq!(TAB_SCROLL_BUTTON_WIDTH, 24.0);
+
+        // View renders without panicking
+        let _ = app.view();
+    }
+
+    #[test]
+    fn tab_navigation_messages_scroll_by_tab_width() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.window_size = Size::new(600.0, 600.0);
+        for _ in 0..5 {
+            app.open_terminal_tab();
+        }
+        // Move to start
+        app.tab_scroll_offset_x = 0.0;
+
+        // Scroll right
+        app.update(Message::ScrollTabsRight);
+        assert_eq!(app.tab_scroll_offset_x, TAB_WIDTH);
+        assert!(matches!(
+            app.pending_tab_scroll_task,
+            Some(TabScrollTask::ScrollTo(x)) if (x - TAB_WIDTH).abs() < 0.01
+        ));
+
+        // Scroll left
+        app.update(Message::ScrollTabsLeft);
+        assert_eq!(app.tab_scroll_offset_x, 0.0);
+        assert!(matches!(
+            app.pending_tab_scroll_task,
+            Some(TabScrollTask::ScrollTo(0.0))
+        ));
+    }
+
+    #[test]
+    fn tab_wheel_scroll_audit_scope_and_touchpad_isolation() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.window_size = Size::new(800.0, 600.0);
+        for _ in 0..5 {
+            app.open_terminal_tab();
+        }
+        app.tab_scroll_offset_x = 0.0;
+        app.pending_tab_scroll_task = None;
+
+        let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + app.workbench.side_bar_width();
+
+        // 1. Wheel over Side Bar (x < term_x):
+        // Does NOT scroll tab strip and does NOT scroll terminal
+        app.cursor_position = Point::new(term_x - 10.0, 10.0);
+        app.handle_iced_event(Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+        }));
+        assert_eq!(app.tab_scroll_offset_x, 0.0);
+        assert!(app.pending_tab_scroll_task.is_none());
+
+        // 2. Pure vertical wheel over Tab Strip (x >= term_x, y < TAB_STRIP_HEIGHT):
+        // Converts vertical wheel to horizontal tab scroll
+        app.cursor_position = Point::new(term_x + 50.0, 10.0);
+        app.handle_iced_event(Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+        }));
+        assert_eq!(app.tab_scroll_offset_x, 60.0);
+        assert!(matches!(
+            app.pending_tab_scroll_task,
+            Some(TabScrollTask::ScrollTo(x)) if (x - 60.0).abs() < 0.01
+        ));
+        app.pending_tab_scroll_task = None;
+
+        // 3. Touchpad horizontal scroll over Tab Strip (x != 0):
+        // Handled directly by iced's scrollable widget; handle_iced_event does NOT double-apply it
+        app.cursor_position = Point::new(term_x + 50.0, 10.0);
+        app.handle_iced_event(Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 1.0, y: 0.0 },
+        }));
+        // Scroll offset in app remains 60.0 (not double incremented)
+        assert_eq!(app.tab_scroll_offset_x, 60.0);
+        assert!(app.pending_tab_scroll_task.is_none());
+
+        // 4. Wheel over Terminal Body (y >= TAB_STRIP_HEIGHT):
+        // Does NOT scroll tab strip
+        app.cursor_position = Point::new(term_x + 50.0, TAB_STRIP_HEIGHT + 50.0);
+        app.handle_iced_event(Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+        }));
+        assert_eq!(app.tab_scroll_offset_x, 60.0);
+        assert!(app.pending_tab_scroll_task.is_none());
+    }
+
+    #[test]
+    fn tab_strip_boundary_and_triangle_oscillation_audit() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.window_size = Size::new(600.0, 600.0);
+        for _ in 0..5 {
+            app.open_terminal_tab();
+        }
+        let total_tabs = app.workbench.tabs().len(); // 6 tabs = 960px
+        let content_width = total_tabs as f32 * TAB_WIDTH;
+        let base_width = app.tab_strip_base_width();
+
+        // 1. Left edge: offset = 0.0
+        let g_left = calculate_tab_strip_geometry(total_tabs, base_width, 0.0);
+        assert!(!g_left.show_left_triangle);
+        assert!(g_left.show_right_triangle);
+        assert_eq!(
+            g_left.effective_viewport_width,
+            base_width - TAB_SCROLL_BUTTON_WIDTH
+        );
+
+        // 2. Middle: offset = TAB_WIDTH
+        let g_mid = calculate_tab_strip_geometry(total_tabs, base_width, TAB_WIDTH);
+        assert!(g_mid.show_left_triangle);
+        assert!(g_mid.show_right_triangle);
+        assert_eq!(
+            g_mid.effective_viewport_width,
+            base_width - 2.0 * TAB_SCROLL_BUTTON_WIDTH
+        );
+
+        // 3. Right edge: offset = max_scroll
+        let g_right = calculate_tab_strip_geometry(total_tabs, base_width, g_left.max_scroll);
+        assert!(g_right.show_left_triangle);
+        assert!(!g_right.show_right_triangle);
+        assert_eq!(
+            g_right.effective_viewport_width,
+            base_width - TAB_SCROLL_BUTTON_WIDTH
+        );
+        // Verify perfect coordinate alignment at right edge:
+        assert_eq!(
+            g_left.max_scroll + g_right.effective_viewport_width,
+            content_width
+        );
+
+        // 4. Middle again: offset = TAB_WIDTH
+        let g_mid2 = calculate_tab_strip_geometry(total_tabs, base_width, TAB_WIDTH);
+        assert_eq!(g_mid, g_mid2);
+
+        // 5. Left edge again: offset = 0.0
+        let g_left2 = calculate_tab_strip_geometry(total_tabs, base_width, 0.0);
+        assert_eq!(g_left, g_left2);
+
+        // 6. Sash drag resize audit:
+        app.tab_scroll_offset_x = g_left.max_scroll;
+        // Drag sash to make sidebar wider (shrinking tab strip base width)
+        app.update(Message::SashPressed);
+        app.update(Message::SashDragged(ACTIVITY_BAR_WIDTH + 350.0));
+        app.update(Message::SashReleased);
+        let new_base = app.tab_strip_base_width();
+        let g_sash_wide =
+            calculate_tab_strip_geometry(total_tabs, new_base, app.tab_scroll_offset_x);
+        assert!(app.tab_scroll_offset_x <= g_sash_wide.max_scroll);
+
+        // Drag sash back to default narrow sidebar (expanding tab strip base width)
+        app.update(Message::SashPressed);
+        app.update(Message::SashDragged(ACTIVITY_BAR_WIDTH + 170.0));
+        app.update(Message::SashReleased);
+        let new_base2 = app.tab_strip_base_width();
+        let g_sash_narrow =
+            calculate_tab_strip_geometry(total_tabs, new_base2, app.tab_scroll_offset_x);
+        assert!(app.tab_scroll_offset_x <= g_sash_narrow.max_scroll);
     }
 }

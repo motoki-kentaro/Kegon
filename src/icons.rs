@@ -13,6 +13,15 @@ pub const ICON_SIZE: f32 = 24.0;
 /// Rendered size of a Dialog header icon, in logical pixels.
 pub const DIALOG_ICON_SIZE: f32 = 28.0;
 
+/// Rendered size of the tab close icon, in logical pixels.
+pub const TAB_CLOSE_ICON_SIZE: f32 = 14.0;
+
+/// Rendered size of the tab add icon, in logical pixels.
+pub const TAB_ADD_ICON_SIZE: f32 = 16.0;
+
+/// Rendered size of the tab scroll navigation triangle icons, in logical pixels.
+pub const TAB_SCROLL_ICON_SIZE: f32 = 14.0;
+
 static EXPLORER: LazyLock<svg::Handle> = LazyLock::new(|| {
     svg::Handle::from_memory(include_bytes!(
         "../assets/icons/codicons/activity-bar/files.svg"
@@ -49,6 +58,26 @@ static WARNING: LazyLock<svg::Handle> = LazyLock::new(|| {
     ))
 });
 
+static ADD: LazyLock<svg::Handle> = LazyLock::new(|| {
+    svg::Handle::from_memory(include_bytes!("../assets/icons/codicons/general/add.svg"))
+});
+
+static CLOSE: LazyLock<svg::Handle> = LazyLock::new(|| {
+    svg::Handle::from_memory(include_bytes!("../assets/icons/codicons/general/close.svg"))
+});
+
+static TRIANGLE_LEFT: LazyLock<svg::Handle> = LazyLock::new(|| {
+    svg::Handle::from_memory(include_bytes!(
+        "../assets/icons/codicons/general/triangle-left.svg"
+    ))
+});
+
+static TRIANGLE_RIGHT: LazyLock<svg::Handle> = LazyLock::new(|| {
+    svg::Handle::from_memory(include_bytes!(
+        "../assets/icons/codicons/general/triangle-right.svg"
+    ))
+});
+
 /// Returns the icon for an Activity Bar entry.
 pub fn activity_icon(item: ActivityItem) -> svg::Handle {
     match item {
@@ -65,4 +94,24 @@ pub fn dialog_icon(kind: DialogKind) -> svg::Handle {
         DialogKind::Question => QUESTION.clone(),
         DialogKind::Warning => WARNING.clone(),
     }
+}
+
+/// Returns the icon for adding a tab.
+pub fn tab_add_icon() -> svg::Handle {
+    ADD.clone()
+}
+
+/// Returns the icon for closing a tab.
+pub fn tab_close_icon() -> svg::Handle {
+    CLOSE.clone()
+}
+
+/// Returns the icon for scrolling tabs to the left.
+pub fn tab_scroll_left_icon() -> svg::Handle {
+    TRIANGLE_LEFT.clone()
+}
+
+/// Returns the icon for scrolling tabs to the right.
+pub fn tab_scroll_right_icon() -> svg::Handle {
+    TRIANGLE_RIGHT.clone()
 }
