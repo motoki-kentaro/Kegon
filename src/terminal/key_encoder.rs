@@ -110,7 +110,15 @@ impl TerminalKeyEncoder {
                     }
                 }
                 key::Named::Escape => {
-                    if has_modifiers(event.modifiers) || mode.report_all_keys_as_esc {
+                    if !has_modifiers(event.modifiers)
+                        && event_suffix.is_empty()
+                        && mode.disambiguate_esc_codes
+                        && !mode.report_all_keys_as_esc
+                    {
+                        // Kitty flag 1: a bare Esc is `CSI 27 u` so it cannot be confused with
+                        // the start of an escape sequence.
+                        Some(b"\x1b[27u".to_vec())
+                    } else if has_modifiers(event.modifiers) || mode.report_all_keys_as_esc {
                         Some(format!("\x1b[27;{mod_param}{event_suffix}u").into_bytes())
                     } else {
                         Some(vec![0x1b])
@@ -435,6 +443,55 @@ mod tests {
             TerminalKeyEncoder::encode(&shift_tab, mode),
             Some(b"\x1b[Z".to_vec())
         );
+    }
+
+    #[test]
+    fn kitty_flag1_versus_legacy_key_table() {
+        let legacy = TerminalKeyboardMode::default();
+        let kitty = TerminalKeyboardMode {
+            disambiguate_esc_codes: true,
+            ..Default::default()
+        };
+        let ctrl = |c: &str, code: key::Code| {
+            press_event(
+                key::Key::Character(c.into()),
+                code,
+                Modifiers::COMMAND,
+                Some(c),
+            )
+        };
+        let named = |n: key::Named, code: key::Code| {
+            press_event(key::Key::Named(n), code, Modifiers::NONE, None)
+        };
+        let enc = TerminalKeyEncoder::encode;
+
+        for (c, code, legacy_byte, csi) in [
+            ("c", key::Code::KeyC, 0x03u8, "\x1b[99;5u"),
+            ("d", key::Code::KeyD, 0x04, "\x1b[100;5u"),
+            ("z", key::Code::KeyZ, 0x1a, "\x1b[122;5u"),
+        ] {
+            assert_eq!(enc(&ctrl(c, code), legacy), Some(vec![legacy_byte]));
+            assert_eq!(enc(&ctrl(c, code), kitty), Some(csi.as_bytes().to_vec()));
+        }
+
+        // Flag 1 keeps Enter / Tab / Backspace as their legacy bytes; a bare Esc becomes CSI 27 u.
+        let enter = named(key::Named::Enter, key::Code::Enter);
+        let tab = named(key::Named::Tab, key::Code::Tab);
+        let backspace = named(key::Named::Backspace, key::Code::Backspace);
+        let esc = named(key::Named::Escape, key::Code::Escape);
+        assert_eq!(enc(&enter, kitty), Some(b"\r".to_vec()));
+        assert_eq!(enc(&tab, kitty), Some(b"\t".to_vec()));
+        assert_eq!(enc(&backspace, kitty), Some(vec![0x7f]));
+        assert_eq!(enc(&esc, legacy), Some(vec![0x1b]));
+        assert_eq!(enc(&esc, kitty), Some(b"\x1b[27u".to_vec()));
+
+        // Flag 1 alone does not report releases.
+        let release = TerminalInputEvent::release(
+            key::Key::Character("d".into()),
+            key::Physical::Code(key::Code::KeyD),
+            Modifiers::COMMAND,
+        );
+        assert_eq!(enc(&release, kitty), None);
     }
 
     #[test]

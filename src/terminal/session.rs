@@ -242,6 +242,18 @@ impl Dimensions for TermSize {
     }
 }
 
+/// `Term` configuration for real sessions.
+///
+/// `kitty_keyboard` lets programs negotiate the Kitty keyboard protocol (`CSI > Nu`, `CSI ? u`,
+/// `CSI < Nu`). Without it alacritty_terminal ignores those sequences, so `keyboard_mode()` never
+/// leaves legacy and full-screen programs that request it (Issue #35) get bare control bytes.
+fn term_config() -> Config {
+    Config {
+        kitty_keyboard: true,
+        ..Config::default()
+    }
+}
+
 /// A terminal session managing the child process, PTY, and emulator state.
 pub struct TerminalSession {
     term: Arc<FairMutex<Term<EventProxy>>>,
@@ -337,8 +349,7 @@ impl TerminalSession {
             lines: rows.max(1) as usize,
         };
 
-        let config = Config::default();
-        let term = Term::new(config, &term_size, proxy.clone());
+        let term = Term::new(term_config(), &term_size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
         let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)
@@ -1498,6 +1509,38 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kitty keyboard negotiation as AGY performs it: push flag 1, query, pop. The flags are
+    /// independent, so flag 1 alone must not turn on event types or all-keys-as-escape.
+    #[test]
+    fn kitty_keyboard_flags_are_negotiated_and_restored() {
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let (proxy, pty_rx, _) = proxy_with_pty_channel();
+        let size = TermSize {
+            cols: 80,
+            lines: 24,
+        };
+        let term = FairMutex::new(Term::new(term_config(), &size, proxy));
+        let mut parser: Processor = Processor::new();
+        let mut guard = term.lock();
+
+        assert!(!guard.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+
+        parser.advance(&mut *guard, b"\x1b[>1u\x1b[?u");
+        let mode = *guard.mode();
+        assert!(mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(!mode.contains(TermMode::REPORT_EVENT_TYPES));
+        assert!(!mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
+        assert!(!mode.contains(TermMode::REPORT_ALTERNATE_KEYS));
+        assert!(!mode.contains(TermMode::REPORT_ASSOCIATED_TEXT));
+        assert_eq!(drain(&pty_rx), vec![b"\x1b[?1u".to_vec()]);
+
+        parser.advance(&mut *guard, b"\x1b[<1u");
+        assert!(!guard.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        parser.advance(&mut *guard, b"\x1b[?u");
+        assert_eq!(drain(&pty_rx), vec![b"\x1b[?0u".to_vec()]);
     }
 
     /// True once `echo KEGONDONE` has produced its output line, i.e. the marker appears on a line
