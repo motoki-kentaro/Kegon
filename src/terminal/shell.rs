@@ -153,40 +153,14 @@ impl Launch {
     }
 }
 
-/// PowerShell that wraps the current `prompt` so each prompt also reports the working directory.
+/// PowerShell that injects OSC 133 Shell Integration and OSC 7 working directory reporting.
 ///
-/// The original prompt runs first, so `$?` and `$LASTEXITCODE` are what it expects. Everything is
-/// inside `try`/`catch`: any failure (constrained language mode, a broken prompt) leaves the shell
-/// as the profile made it.
+/// The original prompt and readline functions are preserved and invoked so `$?`, `$LASTEXITCODE`,
+/// and custom prompt themes (Oh My Posh, Starship) keep working. Everything is guarded by
+/// `try`/`catch`, language mode checks, and module checks to ensure graceful degradation.
 fn powershell_script(local_host: &str) -> String {
     let host = local_host.replace('\'', "''");
-    let template = r#"try {
-  $global:__KegonPrompt = $function:prompt
-  $global:__KegonHost = '@HOST@'
-  if ($null -ne $global:__KegonPrompt) {
-    function global:prompt {
-      $original = & $global:__KegonPrompt
-      try {
-        $location = $ExecutionContext.SessionState.Path.CurrentLocation
-        if ($location.Provider.Name -eq 'FileSystem') {
-          $builder = New-Object System.Text.StringBuilder
-          foreach ($byte in [System.Text.Encoding]::UTF8.GetBytes($location.ProviderPath.Replace('\', '/'))) {
-            if (($byte -ge 48 -and $byte -le 57) -or ($byte -ge 65 -and $byte -le 90) -or ($byte -ge 97 -and $byte -le 122) -or $byte -in 45, 46, 95, 126, 47, 58) {
-              [void]$builder.Append([char]$byte)
-            } else {
-              [void]$builder.AppendFormat('%{0:X2}', $byte)
-            }
-          }
-          $path = $builder.ToString()
-          if ($path.StartsWith('//')) { $uri = 'file://' + $path } else { $uri = 'file://' + $global:__KegonHost + '/' + $path }
-          $esc = [char]27
-          return ($esc + ']7;' + $uri + $esc + '\') + $original
-        }
-      } catch { }
-      return $original
-    }
-  }
-} catch { }"#;
+    let template = include_str!("../../assets/shell-integration/powershell.ps1");
     template.replace("@HOST@", &host)
 }
 
@@ -322,6 +296,47 @@ mod tests {
     #[test]
     fn script_embeds_the_host_name_safely() {
         assert!(powershell_script("O'Brien-PC").contains("'O''Brien-PC'"));
+    }
+
+    #[test]
+    fn powershell_script_contains_osc133_and_safety_guards() {
+        let script = powershell_script("MY-HOST");
+        // FinalTerm / OSC 133 sequences
+        assert!(
+            script.contains("133;A"),
+            "Must contain prompt start marker (A)"
+        );
+        assert!(
+            script.contains("133;B"),
+            "Must contain input start marker (B)"
+        );
+        assert!(
+            script.contains("133;C"),
+            "Must contain command start marker (C)"
+        );
+        assert!(
+            script.contains("133;D"),
+            "Must contain command finished marker (D)"
+        );
+        // OSC 7 working directory sequence
+        assert!(
+            script.contains("]7;"),
+            "Must contain OSC 7 directory report"
+        );
+        assert!(script.contains("MY-HOST"), "Must embed provided hostname");
+        // Safety guards
+        assert!(
+            script.contains("__KegonState"),
+            "Must have multi-load state guard"
+        );
+        assert!(
+            script.contains("FullLanguage"),
+            "Must check for full language mode"
+        );
+        assert!(
+            script.contains("PSConsoleHostReadLine"),
+            "Must hook PSConsoleHostReadLine for command boundaries"
+        );
     }
 }
 
