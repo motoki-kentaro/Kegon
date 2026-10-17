@@ -61,6 +61,29 @@ const UI_TEXT_SIZE: f32 = 13.0;
 /// Widest the Settings page grows, so lines stay readable on wide windows.
 const SETTINGS_PAGE_MAX_WIDTH: f32 = 560.0;
 
+/// Environment switches for verifying the built-in glyph drawing against the font drawing.
+/// `KEGON_BUILTIN_GLYPHS=0` draws every block element with the font; `KEGON_ALIGN_BACKGROUNDS=1`
+/// also snaps cell backgrounds to physical pixels (on by default whenever the built-in glyphs are
+/// on, so shapes and backgrounds share their edges). Both are temporary and meant to go once the
+/// setting exists.
+const BUILTIN_GLYPHS_ENV: &str = "KEGON_BUILTIN_GLYPHS";
+const ALIGN_BACKGROUNDS_ENV: &str = "KEGON_ALIGN_BACKGROUNDS";
+
+fn env_flag(name: &str, default: bool) -> bool {
+    flag_value(std::env::var(name).ok().as_deref(), default)
+}
+
+/// `0`, `false`, `off` and `no` (any case) mean off, any other value means on, no value is `default`.
+fn flag_value(value: Option<&str>, default: bool) -> bool {
+    match value {
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => default,
+    }
+}
+
 /// Everything one Activity Bar button needs.
 struct ActivityButton {
     icon: iced::widget::svg::Handle,
@@ -267,6 +290,8 @@ pub enum Message {
     /// tab. It does not touch the Side Bar.
     OpenSettingsTab,
     SettingsGearHovered(bool),
+    /// The window scale factor became known or changed.
+    ScaleFactorChanged(f32),
     TabSelected(TabId),
     /// The tab strip's `+` button.
     NewTerminalTab,
@@ -317,6 +342,12 @@ pub struct Kegon {
     settings_gear_hovered: bool,
     /// Drafts of the terminal metric fields while the Settings tab is open.
     metric_drafts: Option<MetricDrafts>,
+    /// Window scale factor (physical pixels per logical pixel); 1.0 until the window reports it.
+    scale_factor: f32,
+    /// Internal verification switch: draw supported block elements as rectangles.
+    builtin_glyphs: bool,
+    /// Internal verification switch: align cell backgrounds to physical pixels as well.
+    align_backgrounds: bool,
     /// Terminal sessions (and their titles) by tab. Only the active tab's session receives
     /// input and is drawn; the others keep running in the background.
     terminals: TerminalRegistry,
@@ -439,6 +470,7 @@ impl Kegon {
 
         let active_theme = resolve_theme(settings.appearance.theme.effective_id());
 
+        let builtin_glyphs = env_flag(BUILTIN_GLYPHS_ENV, true);
         let mut app = Self {
             localizer: Localizer::new(locale),
             workbench,
@@ -446,6 +478,9 @@ impl Kegon {
             hovered_activity: None,
             settings_gear_hovered: false,
             metric_drafts: None,
+            scale_factor: 1.0,
+            builtin_glyphs,
+            align_backgrounds: env_flag(ALIGN_BACKGROUNDS_ENV, builtin_glyphs),
             terminals,
             terminal_event_tx: tx,
             exit_requested: false,
@@ -641,6 +676,21 @@ impl Kegon {
         updated.appearance.set_metric(metric, None);
         self.commit_settings(updated);
         self.apply_terminal_font_preference();
+    }
+
+    /// Records the window scale factor; a value that is not a positive finite number is ignored.
+    fn set_scale_factor(&mut self, factor: f32) {
+        if factor.is_finite() && factor > 0.0 {
+            self.scale_factor = factor;
+        }
+    }
+
+    /// Work to run once at startup: ask the window for its scale factor.
+    pub fn initial_task() -> Task<Message> {
+        iced::window::oldest().then(|id| match id {
+            Some(id) => iced::window::scale_factor(id).map(Message::ScaleFactorChanged),
+            None => Task::none(),
+        })
     }
 
     /// Scrolls the strip to a tab that was just appended and activated.
@@ -931,6 +981,7 @@ impl Kegon {
                 self.open_special_tab(TabKind::Settings);
             }
             Message::SettingsGearHovered(hovered) => self.settings_gear_hovered = hovered,
+            Message::ScaleFactorChanged(factor) => self.set_scale_factor(factor),
             Message::ActivityHovered(item) => self.hovered_activity = Some(item),
             Message::ActivityUnhovered(item) => {
                 if self.hovered_activity == Some(item) {
@@ -1100,6 +1151,7 @@ impl Kegon {
 
     fn handle_iced_event(&mut self, event: Event) {
         match event {
+            Event::Window(iced::window::Event::Rescaled(factor)) => self.set_scale_factor(factor),
             Event::Window(iced::window::Event::Resized(size)) => {
                 self.window_size = size;
                 self.resize_terminal_view();
@@ -1761,6 +1813,9 @@ impl Kegon {
                 is_focused: self.terminal_focused,
                 colors: &theme.terminal,
                 font_config: &self.terminal_font_config,
+                scale_factor: self.scale_factor,
+                builtin_glyphs: self.builtin_glyphs,
+                align_backgrounds: self.align_backgrounds,
             };
 
             let canvas_widget = Canvas::new(canvas_program).width(Fill).height(Fill);
@@ -4029,6 +4084,34 @@ mod tests {
             type_draft(&mut app, TerminalMetric::CellHeight, "1.2");
             app.window_size = Size::new(360.0, 300.0);
             let _ = app.view();
+        }
+    }
+
+    #[test]
+    fn scale_factor_is_taken_from_the_window_and_bad_values_are_ignored() {
+        let mut app = new_test_app(Locale::EnUs);
+        assert_eq!(app.scale_factor, 1.0);
+
+        app.update(Message::ScaleFactorChanged(1.25));
+        assert_eq!(app.scale_factor, 1.25);
+        app.handle_iced_event(Event::Window(iced::window::Event::Rescaled(1.5)));
+        assert_eq!(app.scale_factor, 1.5);
+
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            app.update(Message::ScaleFactorChanged(bad));
+            assert_eq!(app.scale_factor, 1.5, "{bad}");
+        }
+    }
+
+    #[test]
+    fn verification_switch_values_are_parsed() {
+        assert!(flag_value(None, true));
+        assert!(!flag_value(None, false));
+        for off in ["0", "false", "OFF", " no "] {
+            assert!(!flag_value(Some(off), true), "{off}");
+        }
+        for on in ["1", "true", "yes", ""] {
+            assert!(flag_value(Some(on), false), "{on}");
         }
     }
 

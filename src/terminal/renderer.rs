@@ -8,6 +8,7 @@ use iced::widget::canvas::{self, Frame, Geometry, Path, Program, Text};
 use iced::{Color, Font, Point, Rectangle, Size, Theme};
 
 use crate::font::{TerminalCellMetrics, TerminalFontConfig};
+use crate::terminal::glyph::{self, CellGrid};
 use crate::terminal::session::TerminalSession;
 use crate::theme::TerminalColors;
 
@@ -155,6 +156,17 @@ pub fn resolve_cell_font(base_font: Font, flags: Flags) -> Font {
     cell_font
 }
 
+/// Paints the rectangles of a built-in glyph.
+fn fill_glyph_rects(frame: &mut Frame, rects: &[glyph::Rect], color: Color) {
+    for rect in rects {
+        frame.fill_rectangle(
+            Point::new(rect.x0, rect.y0),
+            Size::new(rect.width(), rect.height()),
+            color,
+        );
+    }
+}
+
 /// The iced [`Program`] responsible for rendering the terminal grid and preedit text.
 pub struct TerminalProgram<'a> {
     pub session: &'a TerminalSession,
@@ -164,6 +176,12 @@ pub struct TerminalProgram<'a> {
     pub colors: &'a TerminalColors,
     /// Active terminal font and cell metrics.
     pub font_config: &'a TerminalFontConfig,
+    /// Window scale factor (physical pixels per logical pixel), for physical-pixel alignment.
+    pub scale_factor: f32,
+    /// Draw the supported block elements as rectangles instead of font glyphs.
+    pub builtin_glyphs: bool,
+    /// Experimental: place cell background rectangles on the same physically aligned edges.
+    pub align_backgrounds: bool,
 }
 
 impl<'a, Message> Program<Message> for TerminalProgram<'a> {
@@ -182,6 +200,12 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         let font = self.font_config.font;
 
         let mut frame = Frame::new(renderer, bounds.size());
+        let grid = CellGrid::new(
+            (bounds.x, bounds.y),
+            metrics.cell_width,
+            metrics.cell_height,
+            self.scale_factor,
+        );
 
         // Fill background
         frame.fill_rectangle(Point::ORIGIN, bounds.size(), colors.background);
@@ -193,8 +217,10 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
         // 1. Draw Cell Backgrounds, Characters, and Text Line Attributes
         for cell in content.display_iter {
-            let col = cell.point.column.0 as f32;
-            let line = cell.point.line.0 as f32;
+            let col_index = cell.point.column.0 as i32;
+            let line_index = cell.point.line.0;
+            let col = col_index as f32;
+            let line = line_index as f32;
 
             let cell_pos = Point::new(col * metrics.cell_width, line * metrics.cell_height);
 
@@ -210,7 +236,17 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
             // Draw custom background if non-default
             if bg != colors.background {
-                frame.fill_rectangle(cell_pos, Size::new(cell_width, metrics.cell_height), bg);
+                if self.align_backgrounds {
+                    let left = grid.cell(col_index, line_index);
+                    let right = grid.x_edge(col_index + if is_wide { 2 } else { 1 });
+                    frame.fill_rectangle(
+                        Point::new(left.x0, left.y0),
+                        Size::new(right - left.x0, left.height()),
+                        bg,
+                    );
+                } else {
+                    frame.fill_rectangle(cell_pos, Size::new(cell_width, metrics.cell_height), bg);
+                }
             }
 
             let is_wide_spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
@@ -229,23 +265,34 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
                     cursor_cell_info = Some((content_str.clone(), cell.flags));
                 }
 
-                let cell_font = resolve_cell_font(font, cell.flags);
-
-                let text = Text {
-                    content: content_str,
-                    position: cell_pos,
-                    color: fg,
-                    size: metrics.font_size.into(),
-                    font: cell_font,
-                    align_x: Horizontal::Left.into(),
-                    align_y: Vertical::Top,
-                    line_height: iced::widget::text::LineHeight::Absolute(
-                        metrics.cell_height.into(),
-                    ),
-                    shaping: iced::widget::text::Shaping::Advanced,
-                    max_width: f32::INFINITY,
+                // Built-in shapes are exact to the cell, so bold or italic never changes them. A cell
+                // with combining marks stays with the font.
+                let builtin = if self.builtin_glyphs && cell.zerowidth().is_none() {
+                    glyph::glyph_rects(cell.c, &grid, col_index, line_index)
+                } else {
+                    None
                 };
-                frame.fill_text(text);
+                if let Some(rects) = builtin {
+                    fill_glyph_rects(&mut frame, rects.as_slice(), fg);
+                } else {
+                    let cell_font = resolve_cell_font(font, cell.flags);
+
+                    let text = Text {
+                        content: content_str,
+                        position: cell_pos,
+                        color: fg,
+                        size: metrics.font_size.into(),
+                        font: cell_font,
+                        align_x: Horizontal::Left.into(),
+                        align_y: Vertical::Top,
+                        line_height: iced::widget::text::LineHeight::Absolute(
+                            metrics.cell_height.into(),
+                        ),
+                        shaping: iced::widget::text::Shaping::Advanced,
+                        max_width: f32::INFINITY,
+                    };
+                    frame.fill_text(text);
+                }
             }
 
             // Draw text line attributes (underline, double underline, strikeout)
@@ -304,7 +351,31 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         let cursor_width = metrics.cell_width;
         let cursor_height = metrics.cell_height;
 
-        if self.is_focused {
+        // A built-in shape under the cursor is redrawn from the same aligned edges as the cell.
+        let cursor_col = cursor_point.column.0 as i32;
+        let cursor_line = cursor_point.line.0;
+        let cursor_builtin = if self.builtin_glyphs {
+            cursor_cell_info.as_ref().and_then(|(content, _)| {
+                let mut chars = content.chars();
+                let ch = chars.next()?;
+                chars.next().is_none().then_some(ch)
+            })
+        } else {
+            None
+        }
+        .and_then(|ch| glyph::glyph_rects(ch, &grid, cursor_col, cursor_line));
+
+        if self.is_focused
+            && let Some(rects) = cursor_builtin
+        {
+            let cell = grid.cell(cursor_col, cursor_line);
+            frame.fill_rectangle(
+                Point::new(cell.x0, cell.y0),
+                Size::new(cell.width(), cell.height()),
+                colors.cursor,
+            );
+            fill_glyph_rects(&mut frame, rects.as_slice(), colors.background);
+        } else if self.is_focused {
             frame.fill_rectangle(
                 cursor_pos,
                 Size::new(cursor_width, cursor_height),

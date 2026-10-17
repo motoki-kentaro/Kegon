@@ -43,12 +43,15 @@ fn main() -> iced::Result {
 
     let result = iced::application(
         move || {
-            Kegon::new(
-                locale,
-                settings.clone(),
-                cli_locale_override.clone(),
-                options.smoke_confirmation_dialog,
-                options.smoke_font_picker,
+            (
+                Kegon::new(
+                    locale,
+                    settings.clone(),
+                    cli_locale_override.clone(),
+                    options.smoke_confirmation_dialog,
+                    options.smoke_font_picker,
+                ),
+                Kegon::initial_task(),
             )
         },
         Kegon::run_update,
