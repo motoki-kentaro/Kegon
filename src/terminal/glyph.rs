@@ -113,37 +113,86 @@ impl CellGrid {
         }
     }
 
-    /// Thickness of a line style in logical px: a whole number of physical pixels.
+    /// Thickness of one line of `style` in logical px: a whole number of physical pixels.
     ///
     /// A light line is one sixteenth of the cell height, rounded to physical pixels, and never thinner
     /// than one physical pixel: `max(1, round(cell_height_px / 16))`. So a 13 px cell has 1 px lines, a
     /// 24 px cell 2 px lines, and the line is as thick on a 150% display as the same cell would need
     /// there, not thinner for being measured in logical pixels.
+    ///
+    /// A heavy line is twice as thick as a light one. A double line is two light lines, so this is the
+    /// thickness of each of them (see [`LineStyle::Double`]).
+    #[cfg(test)]
     pub fn stroke(&self, style: LineStyle) -> f32 {
-        match style {
-            LineStyle::None => 0.0,
-            LineStyle::Light => {
-                ((self.cell_height * self.scale / 16.0).round().max(1.0)) / self.scale
-            }
+        let light = self.light_stroke_phys();
+        let physical = match style {
+            LineStyle::None => 0,
+            LineStyle::Light | LineStyle::Double => light,
+            LineStyle::Heavy => 2 * light,
+        };
+        physical as f32 / self.scale
+    }
+
+    /// Thickness of a light line in whole physical pixels (see [`Self::stroke`]).
+    fn light_stroke_phys(&self) -> i32 {
+        (self.cell_height * self.scale / 16.0).round().max(1.0) as i32
+    }
+
+    /// `cell` in whole physical pixels of the window (the surface origin included).
+    fn phys(&self, cell: Rect) -> IRect {
+        let px = |v: f32, origin: f32| ((origin + v) * self.scale).round() as i32;
+        IRect {
+            x0: px(cell.x0, self.origin_x),
+            y0: px(cell.y0, self.origin_y),
+            x1: px(cell.x1, self.origin_x),
+            y1: px(cell.y1, self.origin_y),
         }
     }
 
-    /// The vertical band `[x0, x1]` of a vertical line of thickness `stroke` through `cell`: centred on
-    /// the cell, snapped to a physical pixel, and kept inside the cell. It depends only on the cell's
-    /// column edges, so all cells of a column agree.
-    fn band_x(&self, cell: Rect, stroke: f32) -> (f32, f32) {
-        let start =
-            self.snap_abs(self.origin_x + (cell.x0 + cell.x1) / 2.0 - stroke / 2.0) - self.origin_x;
-        let start = start.min(cell.x1 - stroke).max(cell.x0);
-        (start, (start + stroke).min(cell.x1))
+    /// A physical pixel coordinate back to the surface's logical coordinates. The cell's own edges map
+    /// back to exactly the values `cell` carries, so neighbouring glyphs keep sharing them bit for bit.
+    fn logical(&self, physical: IRect, cell: Rect, rect: IRect) -> Rect {
+        let x = |v: i32, edge: (i32, f32, i32, f32)| {
+            if v == edge.0 {
+                edge.1
+            } else if v == edge.2 {
+                edge.3
+            } else {
+                v as f32 / self.scale - self.origin_x
+            }
+        };
+        let y = |v: i32, edge: (i32, f32, i32, f32)| {
+            if v == edge.0 {
+                edge.1
+            } else if v == edge.2 {
+                edge.3
+            } else {
+                v as f32 / self.scale - self.origin_y
+            }
+        };
+        let ex = (physical.x0, cell.x0, physical.x1, cell.x1);
+        let ey = (physical.y0, cell.y0, physical.y1, cell.y1);
+        Rect {
+            x0: x(rect.x0, ex),
+            y0: y(rect.y0, ey),
+            x1: x(rect.x1, ex),
+            y1: y(rect.y1, ey),
+        }
     }
+}
 
-    /// The horizontal band `[y0, y1]` of a horizontal line; see [`Self::band_x`].
-    fn band_y(&self, cell: Rect, stroke: f32) -> (f32, f32) {
-        let start =
-            self.snap_abs(self.origin_y + (cell.y0 + cell.y1) / 2.0 - stroke / 2.0) - self.origin_y;
-        let start = start.min(cell.y1 - stroke).max(cell.y0);
-        (start, (start + stroke).min(cell.y1))
+/// A rectangle in whole physical pixels of the window; the exact arithmetic of box drawing is done here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IRect {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+}
+
+impl IRect {
+    fn is_empty(&self) -> bool {
+        self.x1 <= self.x0 || self.y1 <= self.y0
     }
 }
 
@@ -154,8 +203,9 @@ pub struct GlyphRects {
     len: usize,
 }
 
-/// Room for the most rectangles any glyph needs: a light junction (┼, ├, ┤, ┬, ┴) is at most three.
-pub const MAX_RECTS: usize = 4;
+/// Room for the most rectangles any glyph needs. The double cross ╬ is four separate corner pieces of
+/// two rectangles each, which is eight; every other supported glyph needs fewer.
+pub const MAX_RECTS: usize = 8;
 
 impl GlyphRects {
     fn empty() -> Self {
@@ -184,18 +234,26 @@ impl GlyphRects {
     }
 }
 
-/// How one side of a box-drawing cell is drawn. Only light lines exist so far; heavy and double lines
-/// become further variants (with their own thickness) without changing the model.
+/// How one side of a box-drawing cell is drawn.
+///
+/// - `Light`: one line of the light thickness ([`CellGrid::stroke`]).
+/// - `Heavy`: one line twice as thick.
+/// - `Double`: two light lines with a gap of one light thickness between them, so the pair is three
+///   light thicknesses wide and centred like a single line. A cell too small for that (see
+///   `double_fits`) draws its double lines as heavy lines instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineStyle {
     None,
     Light,
+    Heavy,
+    Double,
 }
 
 /// The line style that leaves a box-drawing cell through each of its four sides.
 ///
 /// This is the single source of truth for a character's shape: the rectangles are built from it,
-/// never from per-character coordinates.
+/// never from per-character coordinates, and each side can have its own style (a heavy line meeting a
+/// light one, a double line meeting a single one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Connections {
     pub left: LineStyle,
@@ -205,46 +263,174 @@ pub struct Connections {
 }
 
 impl Connections {
-    /// A cell whose listed sides carry a light line.
-    const fn light(left: bool, right: bool, up: bool, down: bool) -> Self {
-        const fn side(on: bool) -> LineStyle {
-            if on {
-                LineStyle::Light
-            } else {
-                LineStyle::None
-            }
-        }
-        Self {
-            left: side(left),
-            right: side(right),
-            up: side(up),
-            down: side(down),
-        }
+    /// Parses a table code: one letter per side in the order left, right, up, down, each `-` (none),
+    /// `l` (light), `h` (heavy) or `d` (double).
+    fn from_code(code: &str) -> Option<Self> {
+        let mut sides = code.chars().map(|c| match c {
+            '-' => Some(LineStyle::None),
+            'l' => Some(LineStyle::Light),
+            'h' => Some(LineStyle::Heavy),
+            'd' => Some(LineStyle::Double),
+            _ => None,
+        });
+        let c = Self {
+            left: sides.next()??,
+            right: sides.next()??,
+            up: sides.next()??,
+            down: sides.next()??,
+        };
+        sides.next().is_none().then_some(c)
     }
 
-    fn has_horizontal(&self) -> bool {
-        self.left != LineStyle::None || self.right != LineStyle::None
+    fn sides(&self) -> [LineStyle; 4] {
+        [self.left, self.right, self.up, self.down]
+    }
+
+    fn any_double(&self) -> bool {
+        self.sides().contains(&LineStyle::Double)
+    }
+
+    /// The same connections with every double side drawn heavy.
+    fn double_as_heavy(&self) -> Self {
+        let map = |s| {
+            if s == LineStyle::Double {
+                LineStyle::Heavy
+            } else {
+                s
+            }
+        };
+        Self {
+            left: map(self.left),
+            right: map(self.right),
+            up: map(self.up),
+            down: map(self.down),
+        }
     }
 }
 
-/// The connections of a supported box-drawing character, from the directions Unicode names:
-/// U+2500 LIGHT HORIZONTAL … U+253C LIGHT VERTICAL AND HORIZONTAL (the light, solid, square subset).
+/// The supported box-drawing characters and their connections, in code point order (the lookup is a
+/// binary search): the solid light, heavy and double lines and their mixtures, and the half lines
+/// U+2574..U+257F. Each code is `left right up down` with `-` none, `l` light, `h` heavy, `d` double
+/// (a light line next to a double one is Unicode's "single").
+///
+/// Not supported and left to the font: dashed lines (U+2504..U+250B, U+254C..U+254F), rounded corners
+/// (U+256D..U+2570) and diagonals (U+2571..U+2573).
+const BOX_TABLE: &[(char, &str)] = &[
+    ('\u{2500}', "ll--"),
+    ('\u{2501}', "hh--"),
+    ('\u{2502}', "--ll"),
+    ('\u{2503}', "--hh"),
+    ('\u{250C}', "-l-l"),
+    ('\u{250D}', "-h-l"),
+    ('\u{250E}', "-l-h"),
+    ('\u{250F}', "-h-h"),
+    ('\u{2510}', "l--l"),
+    ('\u{2511}', "h--l"),
+    ('\u{2512}', "l--h"),
+    ('\u{2513}', "h--h"),
+    ('\u{2514}', "-ll-"),
+    ('\u{2515}', "-hl-"),
+    ('\u{2516}', "-lh-"),
+    ('\u{2517}', "-hh-"),
+    ('\u{2518}', "l-l-"),
+    ('\u{2519}', "h-l-"),
+    ('\u{251A}', "l-h-"),
+    ('\u{251B}', "h-h-"),
+    ('\u{251C}', "-lll"),
+    ('\u{251D}', "-hll"),
+    ('\u{251E}', "-lhl"),
+    ('\u{251F}', "-llh"),
+    ('\u{2520}', "-lhh"),
+    ('\u{2521}', "-hhl"),
+    ('\u{2522}', "-hlh"),
+    ('\u{2523}', "-hhh"),
+    ('\u{2524}', "l-ll"),
+    ('\u{2525}', "h-ll"),
+    ('\u{2526}', "l-hl"),
+    ('\u{2527}', "l-lh"),
+    ('\u{2528}', "l-hh"),
+    ('\u{2529}', "h-hl"),
+    ('\u{252A}', "h-lh"),
+    ('\u{252B}', "h-hh"),
+    ('\u{252C}', "ll-l"),
+    ('\u{252D}', "hl-l"),
+    ('\u{252E}', "lh-l"),
+    ('\u{252F}', "hh-l"),
+    ('\u{2530}', "ll-h"),
+    ('\u{2531}', "hl-h"),
+    ('\u{2532}', "lh-h"),
+    ('\u{2533}', "hh-h"),
+    ('\u{2534}', "lll-"),
+    ('\u{2535}', "hll-"),
+    ('\u{2536}', "lhl-"),
+    ('\u{2537}', "hhl-"),
+    ('\u{2538}', "llh-"),
+    ('\u{2539}', "hlh-"),
+    ('\u{253A}', "lhh-"),
+    ('\u{253B}', "hhh-"),
+    ('\u{253C}', "llll"),
+    ('\u{253D}', "hlll"),
+    ('\u{253E}', "lhll"),
+    ('\u{253F}', "hhll"),
+    ('\u{2540}', "llhl"),
+    ('\u{2541}', "lllh"),
+    ('\u{2542}', "llhh"),
+    ('\u{2543}', "hlhl"),
+    ('\u{2544}', "lhhl"),
+    ('\u{2545}', "hllh"),
+    ('\u{2546}', "lhlh"),
+    ('\u{2547}', "hhhl"),
+    ('\u{2548}', "hhlh"),
+    ('\u{2549}', "hlhh"),
+    ('\u{254A}', "lhhh"),
+    ('\u{254B}', "hhhh"),
+    ('\u{2550}', "dd--"),
+    ('\u{2551}', "--dd"),
+    ('\u{2552}', "-d-l"),
+    ('\u{2553}', "-l-d"),
+    ('\u{2554}', "-d-d"),
+    ('\u{2555}', "d--l"),
+    ('\u{2556}', "l--d"),
+    ('\u{2557}', "d--d"),
+    ('\u{2558}', "-dl-"),
+    ('\u{2559}', "-ld-"),
+    ('\u{255A}', "-dd-"),
+    ('\u{255B}', "d-l-"),
+    ('\u{255C}', "l-d-"),
+    ('\u{255D}', "d-d-"),
+    ('\u{255E}', "-dll"),
+    ('\u{255F}', "-ldd"),
+    ('\u{2560}', "-ddd"),
+    ('\u{2561}', "d-ll"),
+    ('\u{2562}', "l-dd"),
+    ('\u{2563}', "d-dd"),
+    ('\u{2564}', "dd-l"),
+    ('\u{2565}', "ll-d"),
+    ('\u{2566}', "dd-d"),
+    ('\u{2567}', "ddl-"),
+    ('\u{2568}', "lld-"),
+    ('\u{2569}', "ddd-"),
+    ('\u{256A}', "ddll"),
+    ('\u{256B}', "lldd"),
+    ('\u{256C}', "dddd"),
+    ('\u{2574}', "l---"),
+    ('\u{2575}', "--l-"),
+    ('\u{2576}', "-l--"),
+    ('\u{2577}', "---l"),
+    ('\u{2578}', "h---"),
+    ('\u{2579}', "--h-"),
+    ('\u{257A}', "-h--"),
+    ('\u{257B}', "---h"),
+    ('\u{257C}', "lh--"),
+    ('\u{257D}', "--lh"),
+    ('\u{257E}', "hl--"),
+    ('\u{257F}', "--hl"),
+];
+
+/// The connections of a supported box-drawing character, or `None` when the font draws it.
 pub fn box_connections(ch: char) -> Option<Connections> {
-    //                              left   right  up     down
-    Some(match ch {
-        '\u{2500}' => Connections::light(true, true, false, false), // ─
-        '\u{2502}' => Connections::light(false, false, true, true), // │
-        '\u{250C}' => Connections::light(false, true, false, true), // ┌ down and right
-        '\u{2510}' => Connections::light(true, false, false, true), // ┐ down and left
-        '\u{2514}' => Connections::light(false, true, true, false), // └ up and right
-        '\u{2518}' => Connections::light(true, false, true, false), // ┘ up and left
-        '\u{251C}' => Connections::light(false, true, true, true),  // ├ vertical and right
-        '\u{2524}' => Connections::light(true, false, true, true),  // ┤ vertical and left
-        '\u{252C}' => Connections::light(true, true, false, true),  // ┬ down and horizontal
-        '\u{2534}' => Connections::light(true, true, true, false),  // ┴ up and horizontal
-        '\u{253C}' => Connections::light(true, true, true, true),   // ┼
-        _ => return None,
-    })
+    let index = BOX_TABLE.binary_search_by_key(&ch, |entry| entry.0).ok()?;
+    Connections::from_code(BOX_TABLE[index].1)
 }
 
 /// Whether `ch` is drawn by this module.
@@ -390,54 +576,396 @@ pub fn glyph_rects(ch: char, grid: &CellGrid, col: i32, line: i32) -> Option<Gly
 
 /// Builds the rectangles of a box-drawing cell from its connections.
 ///
-/// The horizontal band depends only on the cell's row edges and the vertical band only on its column
-/// edges. Every cell of a row therefore draws its horizontal line at exactly the same height, and every
-/// cell of a column its vertical line at exactly the same x, however the individual cells were rounded;
-/// and lines run to the cell edges, which a neighbour computes from the same edge index. That is what
-/// keeps a line unbroken across cell boundaries.
+/// All arithmetic is in whole physical pixels. Lines are centred on the cell with
+/// `start = round_half_up((lo + hi - thickness) / 2)`, which depends only on the cell's own edges: every
+/// cell of a row puts its horizontal lines at exactly the same height and every cell of a column its
+/// vertical lines at exactly the same x, however the individual cells were rounded, and lines run to the
+/// cell edges, which a neighbour computes from the same edge index. That is what keeps a line unbroken
+/// across cell boundaries.
 ///
-/// The rectangles never overlap: a horizontal run covers the junction, the vertical arms stop at it.
+/// Two builders produce a set of possibly overlapping rectangles, which [`normalize`] turns into a few
+/// non-overlapping ones:
+/// - [`line_parts`] for light and heavy lines: the four arms plus a hub where they meet.
+/// - [`double_parts`] for anything with a double side: each line of each arm is run to a join chosen by
+///   how the arms meet (corner, T, cross).
 fn box_rects(connections: &Connections, grid: &CellGrid, cell: Rect) -> GlyphRects {
-    let stroke = grid.stroke(LineStyle::Light);
-    let (vx0, vx1) = grid.band_x(cell, stroke);
-    let (hy0, hy1) = grid.band_y(cell, stroke);
-    let on = |style: LineStyle| style != LineStyle::None;
-    let (left, right) = (on(connections.left), on(connections.right));
-    let (up, down) = (on(connections.up), on(connections.down));
+    let physical = grid.phys(cell);
+    let light = grid.light_stroke_phys();
+    let mut connections = *connections;
+    if connections.any_double() && !double_fits(&physical, light) {
+        connections = connections.double_as_heavy();
+    }
+    let mut parts = Parts::default();
+    if connections.any_double() {
+        double_parts(&connections, &physical, light, &mut parts);
+    } else {
+        line_parts(&connections, &physical, light, &mut parts);
+    }
 
     let mut rects = GlyphRects::empty();
-    if connections.has_horizontal() {
-        rects.push(Rect {
-            x0: if left { cell.x0 } else { vx0 },
-            y0: hy0,
-            x1: if right { cell.x1 } else { vx1 },
-            y1: hy1,
-        });
-        if up {
-            rects.push(Rect {
-                x0: vx0,
-                y0: cell.y0,
-                x1: vx1,
-                y1: hy0,
-            });
-        }
-        if down {
-            rects.push(Rect {
-                x0: vx0,
-                y0: hy1,
-                x1: vx1,
-                y1: cell.y1,
-            });
-        }
-    } else if up || down {
-        rects.push(Rect {
-            x0: vx0,
-            y0: if up { cell.y0 } else { hy0 },
-            x1: vx1,
-            y1: if down { cell.y1 } else { hy1 },
-        });
+    for r in normalize(&parts.as_slice()).as_slice() {
+        rects.push(grid.logical(physical, cell, *r));
     }
     rects
+}
+
+/// A small fixed list of rectangles under construction.
+#[derive(Default)]
+struct Parts {
+    rects: [Option<IRect>; 16],
+    len: usize,
+}
+
+impl Parts {
+    fn push(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
+        let r = IRect { x0, y0, x1, y1 };
+        if !r.is_empty() && self.len < self.rects.len() {
+            self.rects[self.len] = Some(r);
+            self.len += 1;
+        }
+    }
+
+    fn as_slice(&self) -> Vec<IRect> {
+        self.rects[..self.len].iter().flatten().copied().collect()
+    }
+}
+
+/// A line of thickness `t` centred in `lo..hi`, kept inside it.
+fn band(lo: i32, hi: i32, t: i32) -> (i32, i32) {
+    let start = (lo + hi - t + 1).div_euclid(2).clamp(lo, (hi - t).max(lo));
+    (start, (start + t).min(hi))
+}
+
+/// The two lines of a double line centred in `lo..hi`: each `t` thick with a gap of `t` between.
+fn double_bands(lo: i32, hi: i32, t: i32) -> [(i32, i32); 2] {
+    let start = (lo + hi - 3 * t + 1)
+        .div_euclid(2)
+        .clamp(lo, (hi - 3 * t).max(lo));
+    [(start, start + t), (start + 2 * t, start + 3 * t)]
+}
+
+/// Whether a double line (three light thicknesses wide) fits the cell in both directions with at least
+/// one free pixel on each side. If not, the cell draws it as a heavy line.
+fn double_fits(cell: &IRect, light: i32) -> bool {
+    cell.x1 - cell.x0 >= 3 * light + 2 && cell.y1 - cell.y0 >= 3 * light + 2
+}
+
+fn style_thickness(style: LineStyle, light: i32) -> i32 {
+    match style {
+        LineStyle::None => 0,
+        LineStyle::Light | LineStyle::Double => light,
+        LineStyle::Heavy => 2 * light,
+    }
+}
+
+/// Light and heavy lines. Each arm is a bar from its cell edge to the hub; the hub is the rectangle
+/// spanned by the widest horizontal and vertical arms, so a thin line meeting a thick one ends flush
+/// with it and no notch is left at the junction. Without arms on the other axis there is no hub and the
+/// two arms meet at the centre of the cell.
+fn line_parts(c: &Connections, p: &IRect, light: i32, out: &mut Parts) {
+    let on = |s: LineStyle| s != LineStyle::None;
+    let rows = |s: LineStyle| on(s).then(|| band(p.y0, p.y1, style_thickness(s, light)));
+    let cols = |s: LineStyle| on(s).then(|| band(p.x0, p.x1, style_thickness(s, light)));
+    let (left, right) = (rows(c.left), rows(c.right));
+    let (up, down) = (cols(c.up), cols(c.down));
+    let has_h = left.is_some() || right.is_some();
+    let has_v = up.is_some() || down.is_some();
+
+    if has_h && has_v {
+        let hub_x0 = [up, down]
+            .iter()
+            .flatten()
+            .map(|b| b.0)
+            .min()
+            .unwrap_or(p.x0);
+        let hub_x1 = [up, down]
+            .iter()
+            .flatten()
+            .map(|b| b.1)
+            .max()
+            .unwrap_or(p.x1);
+        let hub_y0 = [left, right]
+            .iter()
+            .flatten()
+            .map(|b| b.0)
+            .min()
+            .unwrap_or(p.y0);
+        let hub_y1 = [left, right]
+            .iter()
+            .flatten()
+            .map(|b| b.1)
+            .max()
+            .unwrap_or(p.y1);
+        out.push(hub_x0, hub_y0, hub_x1, hub_y1);
+        if let Some(b) = left {
+            out.push(p.x0, b.0, hub_x0, b.1);
+        }
+        if let Some(b) = right {
+            out.push(hub_x1, b.0, p.x1, b.1);
+        }
+        if let Some(b) = up {
+            out.push(b.0, p.y0, b.1, hub_y0);
+        }
+        if let Some(b) = down {
+            out.push(b.0, hub_y1, b.1, p.y1);
+        }
+    } else if has_h {
+        // Two arms meet at the centre. A lone arm is a stub that also covers the centre square of its
+        // own thickness, so a stub and its mirror image are mirror images of each other.
+        let centre = (p.x0 + p.x1 + 1).div_euclid(2);
+        let (stub_end, stub_start) = (
+            band(p.x0, p.x1, style_thickness(c.left, light)).1,
+            band(p.x0, p.x1, style_thickness(c.right, light)).0,
+        );
+        if let Some(b) = left {
+            out.push(
+                p.x0,
+                b.0,
+                if right.is_some() { centre } else { stub_end },
+                b.1,
+            );
+        }
+        if let Some(b) = right {
+            out.push(
+                if left.is_some() { centre } else { stub_start },
+                b.0,
+                p.x1,
+                b.1,
+            );
+        }
+    } else if has_v {
+        let centre = (p.y0 + p.y1 + 1).div_euclid(2);
+        let (stub_end, stub_start) = (
+            band(p.y0, p.y1, style_thickness(c.up, light)).1,
+            band(p.y0, p.y1, style_thickness(c.down, light)).0,
+        );
+        if let Some(b) = up {
+            out.push(
+                b.0,
+                p.y0,
+                b.1,
+                if down.is_some() { centre } else { stub_end },
+            );
+        }
+        if let Some(b) = down {
+            out.push(
+                b.0,
+                if up.is_some() { centre } else { stub_start },
+                b.1,
+                p.y1,
+            );
+        }
+    }
+}
+
+/// One axis of a box-drawing cell as the double-line builder sees it: whether an arm leaves through the
+/// low side (left / up) and the high side (right / down), and whether the lines are double (otherwise a
+/// single light line).
+#[derive(Clone, Copy)]
+struct Axis {
+    lo: bool,
+    hi: bool,
+    double: bool,
+}
+
+/// Lines with a double side. Per axis, [`axis_lines`] runs each line of each arm to its join; the
+/// horizontal lines are built directly and the vertical ones with the two axes swapped, then every
+/// rectangle goes through [`normalize`], which also removes the overlap where two lines cover the same
+/// pixels.
+fn double_parts(c: &Connections, p: &IRect, light: i32, out: &mut Parts) {
+    let on = |s: LineStyle| s != LineStyle::None;
+    let dbl = |a: LineStyle, b: LineStyle| a == LineStyle::Double || b == LineStyle::Double;
+    let h = Axis {
+        lo: on(c.left),
+        hi: on(c.right),
+        double: dbl(c.left, c.right),
+    };
+    let v = Axis {
+        lo: on(c.up),
+        hi: on(c.down),
+        double: dbl(c.up, c.down),
+    };
+    let mut lines = Vec::with_capacity(8);
+    // Horizontal lines: p-axis = x, s-axis = y.
+    axis_lines((p.x0, p.x1), (p.y0, p.y1), light, h, v, &mut lines);
+    for (p0, s0, p1, s1) in lines.drain(..) {
+        out.push(p0, s0, p1, s1);
+    }
+    // Vertical lines: p-axis = y, s-axis = x; swap back when emitting.
+    axis_lines((p.y0, p.y1), (p.x0, p.x1), light, v, h, &mut lines);
+    for (p0, s0, p1, s1) in lines.drain(..) {
+        out.push(s0, p0, s1, p1);
+    }
+}
+
+/// Emits the lines of axis `me` (running along the "p" direction, `p` is the cell's extent that way and
+/// `s` its extent across) as `(p0, s0, p1, s1)` rectangles, given the perpendicular axis `other`.
+///
+/// Rules, read off the shapes of the Unicode double / single box characters:
+/// - A line with nothing crossing it runs the whole cell.
+/// - A through line (arms on both sides) is continuous, except that a double line crossed by double
+///   lines is cut at the crossing on the side where the crossing arm lies (╦ cuts its lower line, ╬
+///   cuts both) and each piece ends flush with the crossing's inner edge.
+/// - A single arm ends where it joins: a double arm meeting a single line stops against it (╒, ╞); a
+///   single arm meeting a double line stops against the nearer line of a through pair (╟) or runs to the
+///   far line of a corner (╓); two double lines at a corner pair up inner-to-inner and outer-to-outer
+///   (╔), and at a T the arm runs to the line of the through pair nearer to it (╠).
+fn axis_lines(
+    p: (i32, i32),
+    s: (i32, i32),
+    t: i32,
+    me: Axis,
+    other: Axis,
+    out: &mut Vec<(i32, i32, i32, i32)>,
+) {
+    if !me.lo && !me.hi {
+        // No arm on this axis: there is nothing to draw (the other axis' lines are handled by its call).
+        return;
+    }
+    let rows: Vec<(i32, i32)> = if me.double {
+        double_bands(s.0, s.1, t).to_vec()
+    } else {
+        vec![band(s.0, s.1, t)]
+    };
+    let cols: Vec<(i32, i32)> = if other.double {
+        double_bands(p.0, p.1, t).to_vec()
+    } else {
+        vec![band(p.0, p.1, t)]
+    };
+    let (n, m) = (rows.len(), cols.len());
+    let has_other = other.lo || other.hi;
+    let through = me.lo && me.hi;
+    let other_through = other.lo && other.hi;
+
+    for (i, &(s0, s1)) in rows.iter().enumerate() {
+        if !has_other {
+            // Nothing crosses: the line runs from the edge to the edge, or to the centre from one side.
+            let centre = (p.0 + p.1 + 1).div_euclid(2);
+            let (a, b) = (
+                if me.lo { p.0 } else { centre },
+                if me.hi { p.1 } else { centre },
+            );
+            out.push((a, s0, b, s1));
+        } else if through {
+            let cut = n == 2 && m == 2 && ((i == 0 && other.lo) || (i == 1 && other.hi));
+            if cut {
+                out.push((p.0, s0, cols[0].1, s1));
+                out.push((cols[1].0, s0, p.1, s1));
+            } else {
+                out.push((p.0, s0, p.1, s1));
+            }
+        } else {
+            let at_hi = me.hi;
+            let end = match (n, m) {
+                (2, 2) if other_through => {
+                    if at_hi {
+                        cols[1].0
+                    } else {
+                        cols[0].1
+                    }
+                }
+                (2, 2) => {
+                    // Corner: the line on the side the other arm lies pairs with the nearer line.
+                    let inner = (i == 0) == other.lo;
+                    match (at_hi, inner) {
+                        (true, true) => cols[1].0,
+                        (true, false) => cols[0].0,
+                        (false, true) => cols[0].1,
+                        (false, false) => cols[1].1,
+                    }
+                }
+                (1, 2) if other_through => {
+                    if at_hi {
+                        cols[1].1
+                    } else {
+                        cols[0].0
+                    }
+                }
+                (1, 2) => {
+                    if at_hi {
+                        cols[0].0
+                    } else {
+                        cols[1].1
+                    }
+                }
+                _ => {
+                    if at_hi {
+                        cols[0].1
+                    } else {
+                        cols[0].0
+                    }
+                }
+            };
+            if at_hi {
+                out.push((end, s0, p.1, s1));
+            } else {
+                out.push((p.0, s0, end, s1));
+            }
+        }
+    }
+}
+
+/// Turns overlapping rectangles into the union as a few non-overlapping ones: the plane is cut along
+/// every rectangle edge, covered cells are collected row by row into runs, and a run directly above one
+/// with the same extent is merged into it.
+fn normalize(input: &[IRect]) -> NormalizedRects {
+    let mut xs: Vec<i32> = input.iter().flat_map(|r| [r.x0, r.x1]).collect();
+    let mut ys: Vec<i32> = input.iter().flat_map(|r| [r.y0, r.y1]).collect();
+    xs.sort_unstable();
+    xs.dedup();
+    ys.sort_unstable();
+    ys.dedup();
+    let covered = |i: usize, j: usize| {
+        input
+            .iter()
+            .any(|r| r.x0 <= xs[i] && xs[i + 1] <= r.x1 && r.y0 <= ys[j] && ys[j + 1] <= r.y1)
+    };
+    let mut out = NormalizedRects::default();
+    for j in 0..ys.len().saturating_sub(1) {
+        let mut i = 0;
+        while i + 1 < xs.len() {
+            if !covered(i, j) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i + 1 < xs.len() && covered(i, j) {
+                i += 1;
+            }
+            let run = IRect {
+                x0: xs[start],
+                y0: ys[j],
+                x1: xs[i],
+                y1: ys[j + 1],
+            };
+            out.add_run(run);
+        }
+    }
+    out
+}
+
+/// The result of [`normalize`].
+#[derive(Default)]
+struct NormalizedRects {
+    rects: Vec<IRect>,
+}
+
+impl NormalizedRects {
+    fn add_run(&mut self, run: IRect) {
+        if let Some(above) = self
+            .rects
+            .iter_mut()
+            .find(|r| r.x0 == run.x0 && r.x1 == run.x1 && r.y1 == run.y0)
+        {
+            above.y1 = run.y1;
+        } else {
+            self.rects.push(run);
+        }
+    }
+
+    fn as_slice(&self) -> &[IRect] {
+        &self.rects
+    }
 }
 
 #[cfg(test)]
@@ -489,9 +1017,9 @@ mod tests {
         // Everything else keeps using the font: other blocks, shades, heavy / double / dashed /
         // rounded / diagonal lines, mixed-weight lines, Powerline and ordinary text.
         for ch in [
-            'a', ' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{25A0}', '\u{25FE}', '\u{2501}',
-            '\u{2503}', '\u{250F}', '\u{2550}', '\u{2551}', '\u{2504}', '\u{254C}', '\u{256D}',
-            '\u{2571}', '\u{253D}', '\u{2574}', '\u{E0B0}', '\u{3042}', '\0',
+            'a', ' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{25A0}', '\u{25FE}', '\u{2504}',
+            '\u{250B}', '\u{254C}', '\u{254F}', '\u{256D}', '\u{2570}', '\u{2571}', '\u{2573}',
+            '\u{E0B0}', '\u{3042}', '\0',
         ] {
             assert!(!is_builtin(ch), "{ch:?}");
             assert!(
@@ -698,11 +1226,11 @@ mod tests {
             let c = box_connections(ch).unwrap_or_else(|| panic!("{ch:?} unsupported"));
             assert_eq!(sides(c), expected, "{ch:?}");
             for side in [c.left, c.right, c.up, c.down] {
-                assert!(matches!(side, LineStyle::None | LineStyle::Light));
+                assert!(matches!(side, LineStyle::None | LineStyle::Light), "{ch:?}");
             }
         }
         for ch in [
-            'a', '\u{2501}', '\u{2550}', '\u{250F}', '\u{2591}', '\u{2588}',
+            'a', '\u{2504}', '\u{256D}', '\u{2571}', '\u{2591}', '\u{2588}',
         ] {
             assert!(box_connections(ch).is_none(), "{ch:?}");
         }
@@ -918,17 +1446,19 @@ mod tests {
             let t = (g.stroke(LineStyle::Light) * s).round() as i64;
             let total_w = (g.x_edge(FRAME[0].chars().count() as i32) * s).round() as i64;
             let total_h = (g.y_edge(FRAME.len() as i32) * s).round() as i64;
-            let centre_band = |lo: f32, hi: f32, origin: f32| -> i64 {
-                let c = (lo + hi) / 2.0 - g.stroke(LineStyle::Light) / 2.0;
-                (((origin + c) * s).round() - origin * s) as i64
+            // A line is centred on its cell: start = round_half_up((lo + hi - t) / 2) in whole
+            // physical pixels, written here from the specification rather than from the code.
+            let centre_band = |lo: f32, hi: f32| -> i64 {
+                let (lo, hi) = ((lo * s).round() as i64, (hi * s).round() as i64);
+                (lo + hi - t + 1).div_euclid(2)
             };
             let row_bands: Vec<i64> = [0, 2, 4]
                 .iter()
-                .map(|&r| centre_band(g.y_edge(r), g.y_edge(r + 1), g.origin_y))
+                .map(|&r| centre_band(g.y_edge(r), g.y_edge(r + 1)))
                 .collect();
             let col_bands: Vec<i64> = [0, 15, 30]
                 .iter()
-                .map(|&c| centre_band(g.x_edge(c), g.x_edge(c + 1), g.origin_x))
+                .map(|&c| centre_band(g.x_edge(c), g.x_edge(c + 1)))
                 .collect();
             // Horizontal lines are unbroken over the whole frame width on every one of their rows.
             for &y0 in &row_bands {
@@ -1478,6 +2008,907 @@ mod tests {
                 table.contains(cp) || quads.contains(cp),
                 "{cp:04X} has no expectation"
             );
+        }
+    }
+
+    // ---- heavy, double and mixed box-drawing lines ----
+
+    /// Unicode names of every supported box-drawing character. This is independent data: the table in
+    /// the code is checked against it through a parser of the names, not against itself.
+    const NAMES: [(char, &str); 109] = [
+        ('\u{2500}', "BOX DRAWINGS LIGHT HORIZONTAL"),
+        ('\u{2501}', "BOX DRAWINGS HEAVY HORIZONTAL"),
+        ('\u{2502}', "BOX DRAWINGS LIGHT VERTICAL"),
+        ('\u{2503}', "BOX DRAWINGS HEAVY VERTICAL"),
+        ('\u{250C}', "BOX DRAWINGS LIGHT DOWN AND RIGHT"),
+        ('\u{250D}', "BOX DRAWINGS DOWN LIGHT AND RIGHT HEAVY"),
+        ('\u{250E}', "BOX DRAWINGS DOWN HEAVY AND RIGHT LIGHT"),
+        ('\u{250F}', "BOX DRAWINGS HEAVY DOWN AND RIGHT"),
+        ('\u{2510}', "BOX DRAWINGS LIGHT DOWN AND LEFT"),
+        ('\u{2511}', "BOX DRAWINGS DOWN LIGHT AND LEFT HEAVY"),
+        ('\u{2512}', "BOX DRAWINGS DOWN HEAVY AND LEFT LIGHT"),
+        ('\u{2513}', "BOX DRAWINGS HEAVY DOWN AND LEFT"),
+        ('\u{2514}', "BOX DRAWINGS LIGHT UP AND RIGHT"),
+        ('\u{2515}', "BOX DRAWINGS UP LIGHT AND RIGHT HEAVY"),
+        ('\u{2516}', "BOX DRAWINGS UP HEAVY AND RIGHT LIGHT"),
+        ('\u{2517}', "BOX DRAWINGS HEAVY UP AND RIGHT"),
+        ('\u{2518}', "BOX DRAWINGS LIGHT UP AND LEFT"),
+        ('\u{2519}', "BOX DRAWINGS UP LIGHT AND LEFT HEAVY"),
+        ('\u{251A}', "BOX DRAWINGS UP HEAVY AND LEFT LIGHT"),
+        ('\u{251B}', "BOX DRAWINGS HEAVY UP AND LEFT"),
+        ('\u{251C}', "BOX DRAWINGS LIGHT VERTICAL AND RIGHT"),
+        ('\u{251D}', "BOX DRAWINGS VERTICAL LIGHT AND RIGHT HEAVY"),
+        ('\u{251E}', "BOX DRAWINGS UP HEAVY AND RIGHT DOWN LIGHT"),
+        ('\u{251F}', "BOX DRAWINGS DOWN HEAVY AND RIGHT UP LIGHT"),
+        ('\u{2520}', "BOX DRAWINGS VERTICAL HEAVY AND RIGHT LIGHT"),
+        ('\u{2521}', "BOX DRAWINGS DOWN LIGHT AND RIGHT UP HEAVY"),
+        ('\u{2522}', "BOX DRAWINGS UP LIGHT AND RIGHT DOWN HEAVY"),
+        ('\u{2523}', "BOX DRAWINGS HEAVY VERTICAL AND RIGHT"),
+        ('\u{2524}', "BOX DRAWINGS LIGHT VERTICAL AND LEFT"),
+        ('\u{2525}', "BOX DRAWINGS VERTICAL LIGHT AND LEFT HEAVY"),
+        ('\u{2526}', "BOX DRAWINGS UP HEAVY AND LEFT DOWN LIGHT"),
+        ('\u{2527}', "BOX DRAWINGS DOWN HEAVY AND LEFT UP LIGHT"),
+        ('\u{2528}', "BOX DRAWINGS VERTICAL HEAVY AND LEFT LIGHT"),
+        ('\u{2529}', "BOX DRAWINGS DOWN LIGHT AND LEFT UP HEAVY"),
+        ('\u{252A}', "BOX DRAWINGS UP LIGHT AND LEFT DOWN HEAVY"),
+        ('\u{252B}', "BOX DRAWINGS HEAVY VERTICAL AND LEFT"),
+        ('\u{252C}', "BOX DRAWINGS LIGHT DOWN AND HORIZONTAL"),
+        ('\u{252D}', "BOX DRAWINGS LEFT HEAVY AND RIGHT DOWN LIGHT"),
+        ('\u{252E}', "BOX DRAWINGS RIGHT HEAVY AND LEFT DOWN LIGHT"),
+        ('\u{252F}', "BOX DRAWINGS DOWN LIGHT AND HORIZONTAL HEAVY"),
+        ('\u{2530}', "BOX DRAWINGS DOWN HEAVY AND HORIZONTAL LIGHT"),
+        ('\u{2531}', "BOX DRAWINGS RIGHT LIGHT AND LEFT DOWN HEAVY"),
+        ('\u{2532}', "BOX DRAWINGS LEFT LIGHT AND RIGHT DOWN HEAVY"),
+        ('\u{2533}', "BOX DRAWINGS HEAVY DOWN AND HORIZONTAL"),
+        ('\u{2534}', "BOX DRAWINGS LIGHT UP AND HORIZONTAL"),
+        ('\u{2535}', "BOX DRAWINGS LEFT HEAVY AND RIGHT UP LIGHT"),
+        ('\u{2536}', "BOX DRAWINGS RIGHT HEAVY AND LEFT UP LIGHT"),
+        ('\u{2537}', "BOX DRAWINGS UP LIGHT AND HORIZONTAL HEAVY"),
+        ('\u{2538}', "BOX DRAWINGS UP HEAVY AND HORIZONTAL LIGHT"),
+        ('\u{2539}', "BOX DRAWINGS RIGHT LIGHT AND LEFT UP HEAVY"),
+        ('\u{253A}', "BOX DRAWINGS LEFT LIGHT AND RIGHT UP HEAVY"),
+        ('\u{253B}', "BOX DRAWINGS HEAVY UP AND HORIZONTAL"),
+        ('\u{253C}', "BOX DRAWINGS LIGHT VERTICAL AND HORIZONTAL"),
+        (
+            '\u{253D}',
+            "BOX DRAWINGS LEFT HEAVY AND RIGHT VERTICAL LIGHT",
+        ),
+        (
+            '\u{253E}',
+            "BOX DRAWINGS RIGHT HEAVY AND LEFT VERTICAL LIGHT",
+        ),
+        (
+            '\u{253F}',
+            "BOX DRAWINGS VERTICAL LIGHT AND HORIZONTAL HEAVY",
+        ),
+        (
+            '\u{2540}',
+            "BOX DRAWINGS UP HEAVY AND DOWN HORIZONTAL LIGHT",
+        ),
+        (
+            '\u{2541}',
+            "BOX DRAWINGS DOWN HEAVY AND UP HORIZONTAL LIGHT",
+        ),
+        (
+            '\u{2542}',
+            "BOX DRAWINGS VERTICAL HEAVY AND HORIZONTAL LIGHT",
+        ),
+        (
+            '\u{2543}',
+            "BOX DRAWINGS LEFT UP HEAVY AND RIGHT DOWN LIGHT",
+        ),
+        (
+            '\u{2544}',
+            "BOX DRAWINGS RIGHT UP HEAVY AND LEFT DOWN LIGHT",
+        ),
+        (
+            '\u{2545}',
+            "BOX DRAWINGS LEFT DOWN HEAVY AND RIGHT UP LIGHT",
+        ),
+        (
+            '\u{2546}',
+            "BOX DRAWINGS RIGHT DOWN HEAVY AND LEFT UP LIGHT",
+        ),
+        (
+            '\u{2547}',
+            "BOX DRAWINGS DOWN LIGHT AND UP HORIZONTAL HEAVY",
+        ),
+        (
+            '\u{2548}',
+            "BOX DRAWINGS UP LIGHT AND DOWN HORIZONTAL HEAVY",
+        ),
+        (
+            '\u{2549}',
+            "BOX DRAWINGS RIGHT LIGHT AND LEFT VERTICAL HEAVY",
+        ),
+        (
+            '\u{254A}',
+            "BOX DRAWINGS LEFT LIGHT AND RIGHT VERTICAL HEAVY",
+        ),
+        ('\u{254B}', "BOX DRAWINGS HEAVY VERTICAL AND HORIZONTAL"),
+        ('\u{2550}', "BOX DRAWINGS DOUBLE HORIZONTAL"),
+        ('\u{2551}', "BOX DRAWINGS DOUBLE VERTICAL"),
+        ('\u{2552}', "BOX DRAWINGS DOWN SINGLE AND RIGHT DOUBLE"),
+        ('\u{2553}', "BOX DRAWINGS DOWN DOUBLE AND RIGHT SINGLE"),
+        ('\u{2554}', "BOX DRAWINGS DOUBLE DOWN AND RIGHT"),
+        ('\u{2555}', "BOX DRAWINGS DOWN SINGLE AND LEFT DOUBLE"),
+        ('\u{2556}', "BOX DRAWINGS DOWN DOUBLE AND LEFT SINGLE"),
+        ('\u{2557}', "BOX DRAWINGS DOUBLE DOWN AND LEFT"),
+        ('\u{2558}', "BOX DRAWINGS UP SINGLE AND RIGHT DOUBLE"),
+        ('\u{2559}', "BOX DRAWINGS UP DOUBLE AND RIGHT SINGLE"),
+        ('\u{255A}', "BOX DRAWINGS DOUBLE UP AND RIGHT"),
+        ('\u{255B}', "BOX DRAWINGS UP SINGLE AND LEFT DOUBLE"),
+        ('\u{255C}', "BOX DRAWINGS UP DOUBLE AND LEFT SINGLE"),
+        ('\u{255D}', "BOX DRAWINGS DOUBLE UP AND LEFT"),
+        ('\u{255E}', "BOX DRAWINGS VERTICAL SINGLE AND RIGHT DOUBLE"),
+        ('\u{255F}', "BOX DRAWINGS VERTICAL DOUBLE AND RIGHT SINGLE"),
+        ('\u{2560}', "BOX DRAWINGS DOUBLE VERTICAL AND RIGHT"),
+        ('\u{2561}', "BOX DRAWINGS VERTICAL SINGLE AND LEFT DOUBLE"),
+        ('\u{2562}', "BOX DRAWINGS VERTICAL DOUBLE AND LEFT SINGLE"),
+        ('\u{2563}', "BOX DRAWINGS DOUBLE VERTICAL AND LEFT"),
+        ('\u{2564}', "BOX DRAWINGS DOWN SINGLE AND HORIZONTAL DOUBLE"),
+        ('\u{2565}', "BOX DRAWINGS DOWN DOUBLE AND HORIZONTAL SINGLE"),
+        ('\u{2566}', "BOX DRAWINGS DOUBLE DOWN AND HORIZONTAL"),
+        ('\u{2567}', "BOX DRAWINGS UP SINGLE AND HORIZONTAL DOUBLE"),
+        ('\u{2568}', "BOX DRAWINGS UP DOUBLE AND HORIZONTAL SINGLE"),
+        ('\u{2569}', "BOX DRAWINGS DOUBLE UP AND HORIZONTAL"),
+        (
+            '\u{256A}',
+            "BOX DRAWINGS VERTICAL SINGLE AND HORIZONTAL DOUBLE",
+        ),
+        (
+            '\u{256B}',
+            "BOX DRAWINGS VERTICAL DOUBLE AND HORIZONTAL SINGLE",
+        ),
+        ('\u{256C}', "BOX DRAWINGS DOUBLE VERTICAL AND HORIZONTAL"),
+        ('\u{2574}', "BOX DRAWINGS LIGHT LEFT"),
+        ('\u{2575}', "BOX DRAWINGS LIGHT UP"),
+        ('\u{2576}', "BOX DRAWINGS LIGHT RIGHT"),
+        ('\u{2577}', "BOX DRAWINGS LIGHT DOWN"),
+        ('\u{2578}', "BOX DRAWINGS HEAVY LEFT"),
+        ('\u{2579}', "BOX DRAWINGS HEAVY UP"),
+        ('\u{257A}', "BOX DRAWINGS HEAVY RIGHT"),
+        ('\u{257B}', "BOX DRAWINGS HEAVY DOWN"),
+        ('\u{257C}', "BOX DRAWINGS LIGHT LEFT AND HEAVY RIGHT"),
+        ('\u{257D}', "BOX DRAWINGS LIGHT UP AND HEAVY DOWN"),
+        ('\u{257E}', "BOX DRAWINGS HEAVY LEFT AND LIGHT RIGHT"),
+        ('\u{257F}', "BOX DRAWINGS HEAVY UP AND LIGHT DOWN"),
+    ];
+
+    /// Reads a Unicode box-drawing name into (left, right, up, down).
+    ///
+    /// A name is one or two phrases joined by AND; a phrase names directions (HORIZONTAL is left and
+    /// right, VERTICAL is up and down) and may name a style (SINGLE means light). A style given in only
+    /// one phrase applies to all of them ("LIGHT DOWN AND RIGHT").
+    fn parse_name(name: &str) -> [LineStyle; 4] {
+        let rest = name.strip_prefix("BOX DRAWINGS ").expect("prefix");
+        let phrases: Vec<&str> = rest.split(" AND ").collect();
+        let parsed: Vec<(Option<LineStyle>, Vec<usize>)> = phrases
+            .iter()
+            .map(|phrase| {
+                let mut style = None;
+                let mut dirs = Vec::new();
+                for word in phrase.split(' ') {
+                    match word {
+                        "LIGHT" | "SINGLE" => style = Some(LineStyle::Light),
+                        "HEAVY" => style = Some(LineStyle::Heavy),
+                        "DOUBLE" => style = Some(LineStyle::Double),
+                        "LEFT" => dirs.push(0),
+                        "RIGHT" => dirs.push(1),
+                        "UP" => dirs.push(2),
+                        "DOWN" => dirs.push(3),
+                        "HORIZONTAL" => dirs.extend([0, 1]),
+                        "VERTICAL" => dirs.extend([2, 3]),
+                        other => panic!("unknown word {other:?} in {name:?}"),
+                    }
+                }
+                (style, dirs)
+            })
+            .collect();
+        let styled: Vec<LineStyle> = parsed.iter().filter_map(|(s, _)| *s).collect();
+        let mut out = [LineStyle::None; 4];
+        for (style, dirs) in &parsed {
+            let style = style
+                .or_else(|| (styled.len() == 1).then(|| styled[0]))
+                .expect("style");
+            for &d in dirs {
+                out[d] = style;
+            }
+        }
+        out
+    }
+
+    fn sides4(c: Connections) -> [LineStyle; 4] {
+        [c.left, c.right, c.up, c.down]
+    }
+
+    #[test]
+    fn every_table_entry_matches_its_unicode_name() {
+        assert_eq!(NAMES.len(), 109);
+        assert_eq!(BOX_TABLE.len(), 109);
+        for (ch, name) in NAMES {
+            let c = box_connections(ch).unwrap_or_else(|| panic!("{ch:?} {name} unsupported"));
+            assert_eq!(sides4(c), parse_name(name), "{:04X} {name}", ch as u32);
+        }
+        // The table is sorted (the lookup is a binary search) and holds nothing else.
+        let mut previous = '\0';
+        for &(ch, _) in BOX_TABLE {
+            assert!(ch > previous, "{ch:?} out of order");
+            previous = ch;
+            assert!(
+                NAMES.iter().any(|&(n, _)| n == ch),
+                "{ch:?} not in the name list"
+            );
+        }
+    }
+
+    #[test]
+    fn the_name_parser_reads_the_tricky_names_correctly() {
+        use LineStyle::{Double as D, Heavy as H, Light as L, None as N};
+        assert_eq!(
+            parse_name("BOX DRAWINGS LIGHT DOWN AND RIGHT"),
+            [N, L, N, L]
+        );
+        assert_eq!(
+            parse_name("BOX DRAWINGS DOWN LIGHT AND RIGHT HEAVY"),
+            [N, H, N, L]
+        );
+        assert_eq!(
+            parse_name("BOX DRAWINGS LEFT UP HEAVY AND RIGHT DOWN LIGHT"),
+            [H, L, H, L]
+        );
+        assert_eq!(
+            parse_name("BOX DRAWINGS UP HEAVY AND DOWN HORIZONTAL LIGHT"),
+            [L, L, H, L]
+        );
+        assert_eq!(
+            parse_name("BOX DRAWINGS RIGHT LIGHT AND LEFT VERTICAL HEAVY"),
+            [H, L, H, H]
+        );
+        assert_eq!(
+            parse_name("BOX DRAWINGS DOWN SINGLE AND RIGHT DOUBLE"),
+            [N, D, N, L]
+        );
+        assert_eq!(
+            parse_name("BOX DRAWINGS DOUBLE VERTICAL AND HORIZONTAL"),
+            [D, D, D, D]
+        );
+        assert_eq!(parse_name("BOX DRAWINGS HEAVY LEFT"), [H, N, N, N]);
+    }
+
+    #[test]
+    fn the_unsupported_ranges_stay_with_the_font() {
+        let supported: Vec<char> = NAMES.iter().map(|&(c, _)| c).collect();
+        let mut unsupported = 0;
+        for cp in 0x2500u32..=0x257F {
+            let ch = char::from_u32(cp).unwrap();
+            if supported.contains(&ch) {
+                assert!(is_builtin(ch));
+            } else {
+                unsupported += 1;
+                assert!(box_connections(ch).is_none() && !is_builtin(ch), "{cp:04X}");
+            }
+        }
+        // 8 dashes + 4 dashes + 4 arcs + 3 diagonals.
+        assert_eq!(unsupported, 19);
+        assert_eq!(unsupported + supported.len(), 128);
+    }
+
+    /// Cells for the box-drawing tests: odd and even physical sizes, fractional logical sizes, scales.
+    const BOX_CASES: [(f32, f32, f32); 14] = [
+        (8.0, 16.0, 1.0),
+        (9.0, 17.0, 1.0),
+        (11.0, 15.0, 1.0),
+        (10.0, 19.0, 1.0),
+        (6.5, 13.0, 1.0),
+        (6.5, 13.0, 1.25),
+        (6.5, 13.0, 1.5),
+        (9.6, 19.2, 1.0),
+        (9.6, 19.2, 1.25),
+        (9.6, 19.2, 1.5),
+        (10.0, 19.0, 1.25),
+        (7.617, 15.107, 1.0),
+        (7.147, 15.222, 1.25),
+        (12.0, 24.0, 1.0),
+    ];
+
+    /// The pixels of a glyph in cell (1, 1), as a raster of the 3×3 cells around it.
+    fn glyph_raster(ch: char, g: &CellGrid) -> (Raster, [i32; 4]) {
+        let mut raster = Raster::new(
+            (g.x_edge(3) * g.scale).round() as usize + 1,
+            (g.y_edge(3) * g.scale).round() as usize + 1,
+        );
+        raster_of(ch, g, 1, 1, &mut raster);
+        let c = g.cell(1, 1);
+        let p = |v: f32| (v * g.scale).round() as i32;
+        (raster, [p(c.x0), p(c.y0), p(c.x1), p(c.y1)])
+    }
+
+    /// Lines of a style centred in `lo..hi`, written from the specification: start =
+    /// round_half_up((lo + hi - width) / 2), a double line is two light lines with a light gap.
+    fn expected_bands(
+        style: LineStyle,
+        lo: i32,
+        hi: i32,
+        light: i32,
+        double_fits: bool,
+    ) -> Vec<(i32, i32)> {
+        let centred = |width: i32| {
+            let start = (lo + hi - width + 1).div_euclid(2);
+            (start, start + width)
+        };
+        match style {
+            LineStyle::None => vec![],
+            LineStyle::Light => vec![centred(light)],
+            LineStyle::Heavy => vec![centred(2 * light)],
+            LineStyle::Double if double_fits => {
+                let (start, _) = centred(3 * light);
+                vec![
+                    (start, start + light),
+                    (start + 2 * light, start + 3 * light),
+                ]
+            }
+            LineStyle::Double => vec![centred(2 * light)],
+        }
+    }
+
+    fn covered_set(values: impl Iterator<Item = (i32, bool)>) -> Vec<i32> {
+        values.filter(|&(_, on)| on).map(|(v, _)| v).collect()
+    }
+
+    fn band_set(bands: &[(i32, i32)]) -> Vec<i32> {
+        bands.iter().flat_map(|&(a, b)| a..b).collect()
+    }
+
+    /// One cell side under test: its name, style, the lit pixels along the edge, and the side's extent.
+    type EdgeCase = (&'static str, LineStyle, Vec<i32>, (i32, i32));
+
+    #[test]
+    fn every_arm_reaches_its_cell_edge_with_exactly_the_lines_of_its_style() {
+        for (w, h, s) in BOX_CASES {
+            let g = grid(w, h, s);
+            let light = g.light_stroke_phys();
+            for (ch, _) in NAMES {
+                let c = box_connections(ch).unwrap();
+                let (r, [x0, y0, x1, y1]) = glyph_raster(ch, &g);
+                let fits = x1 - x0 >= 3 * light + 2 && y1 - y0 >= 3 * light + 2;
+                let at = |x: i32, y: i32| r.at(x as usize, y as usize) > 0;
+                // Left edge column: rows lit must be the left arm's lines.
+                let cases: [EdgeCase; 4] = [
+                    (
+                        "left",
+                        c.left,
+                        covered_set((y0..y1).map(|y| (y, at(x0, y)))),
+                        (y0, y1),
+                    ),
+                    (
+                        "right",
+                        c.right,
+                        covered_set((y0..y1).map(|y| (y, at(x1 - 1, y)))),
+                        (y0, y1),
+                    ),
+                    (
+                        "up",
+                        c.up,
+                        covered_set((x0..x1).map(|x| (x, at(x, y0)))),
+                        (x0, x1),
+                    ),
+                    (
+                        "down",
+                        c.down,
+                        covered_set((x0..x1).map(|x| (x, at(x, y1 - 1)))),
+                        (x0, x1),
+                    ),
+                ];
+                for (side, style, lit, (lo, hi)) in cases {
+                    let expected = band_set(&expected_bands(style, lo, hi, light, fits));
+                    assert_eq!(
+                        lit, expected,
+                        "{:04X} {side} {style:?} {w}x{h}@{s}",
+                        ch as u32
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn glyphs_stay_inside_the_cell_never_overlap_and_fit_the_rectangle_budget() {
+        let mut most = 0;
+        for (w, h, s) in BOX_CASES {
+            let g = grid(w, h, s);
+            let cell = g.cell(1, 1);
+            for (ch, _) in NAMES {
+                let rects = glyph_rects(ch, &g, 1, 1).unwrap();
+                let list = rects.as_slice();
+                assert!(
+                    !list.is_empty() && list.len() <= MAX_RECTS,
+                    "{:04X}",
+                    ch as u32
+                );
+                most = most.max(list.len());
+                let mut raster = Raster::new(
+                    (g.x_edge(3) * s).round() as usize + 1,
+                    (g.y_edge(3) * s).round() as usize + 1,
+                );
+                for r in list {
+                    assert!(r.width() > 0.0 && r.height() > 0.0);
+                    assert!(
+                        r.x0 >= cell.x0 && r.x1 <= cell.x1 && r.y0 >= cell.y0 && r.y1 <= cell.y1,
+                        "{:04X} {w}x{h}@{s}: {r:?} outside {cell:?}",
+                        ch as u32
+                    );
+                    raster.paint(r, s);
+                }
+                assert!(
+                    raster.px.iter().all(|&n| n <= 1),
+                    "{:04X} {w}x{h}@{s}: overlap",
+                    ch as u32
+                );
+            }
+        }
+        // The double cross is four separate two-rectangle corners: it is what sets the budget.
+        assert_eq!(most, MAX_RECTS);
+        assert_eq!(
+            glyph_rects('\u{256C}', &grid(11.0, 15.0, 1.0), 1, 1)
+                .unwrap()
+                .as_slice()
+                .len(),
+            8
+        );
+    }
+
+    #[test]
+    fn heavy_is_twice_light_and_each_double_line_is_light() {
+        for (w, h, s) in BOX_CASES {
+            let g = grid(w, h, s);
+            let light = g.stroke(LineStyle::Light);
+            assert_eq!(g.stroke(LineStyle::Heavy), 2.0 * light, "{w}x{h}@{s}");
+            assert_eq!(g.stroke(LineStyle::Double), light);
+            assert_eq!(g.stroke(LineStyle::None), 0.0);
+        }
+    }
+
+    #[test]
+    fn heavy_light_and_double_lines_are_visibly_different() {
+        // Same cell: light is t thick, heavy 2t, double two t-lines with a t gap (3t overall).
+        let g = grid(11.0, 15.0, 1.0);
+        let thickness = |ch: char| {
+            let (r, [x0, y0, _x1, y1]) = glyph_raster(ch, &g);
+            let col = x0 + 1;
+            (y0..y1)
+                .filter(|&y| r.at(col as usize, y as usize) > 0)
+                .count()
+        };
+        assert_eq!(thickness('\u{2500}'), 1);
+        assert_eq!(thickness('\u{2501}'), 2);
+        assert_eq!(thickness('\u{2550}'), 2); // two 1 px lines, 1 px apart
+        let (r, [x0, y0, _, y1]) = glyph_raster('\u{2550}', &g);
+        let rows: Vec<bool> = (y0..y1)
+            .map(|y| r.at((x0 + 1) as usize, y as usize) > 0)
+            .collect();
+        let first = rows.iter().position(|&b| b).unwrap();
+        assert_eq!(&rows[first..first + 3], &[true, false, true]);
+    }
+
+    #[test]
+    fn neighbouring_cells_of_every_style_connect_across_the_boundary() {
+        for (w, h, s) in BOX_CASES {
+            let g = grid(w, h, s);
+            let all: Vec<char> = NAMES.iter().map(|&(c, _)| c).collect();
+            for style in [LineStyle::Light, LineStyle::Heavy, LineStyle::Double] {
+                let rights: Vec<char> = all
+                    .iter()
+                    .copied()
+                    .filter(|&c| box_connections(c).unwrap().right == style)
+                    .collect();
+                let lefts: Vec<char> = all
+                    .iter()
+                    .copied()
+                    .filter(|&c| box_connections(c).unwrap().left == style)
+                    .collect();
+                let downs: Vec<char> = all
+                    .iter()
+                    .copied()
+                    .filter(|&c| box_connections(c).unwrap().down == style)
+                    .collect();
+                let ups: Vec<char> = all
+                    .iter()
+                    .copied()
+                    .filter(|&c| box_connections(c).unwrap().up == style)
+                    .collect();
+                assert!(
+                    !rights.is_empty() && !lefts.is_empty() && !downs.is_empty() && !ups.is_empty()
+                );
+                // Horizontal neighbours: A at column 0, B at column 1, same row.
+                for &a in &rights {
+                    for &b in lefts.iter().take(6) {
+                        let mut r = Raster::new(
+                            (g.x_edge(3) * s).round() as usize + 1,
+                            (g.y_edge(3) * s).round() as usize + 1,
+                        );
+                        raster_of(a, &g, 0, 1, &mut r);
+                        raster_of(b, &g, 1, 1, &mut r);
+                        let cell_a = g.cell(0, 1);
+                        let boundary = (cell_a.x1 * s).round() as usize;
+                        let (y0, y1) = (
+                            (cell_a.y0 * s).round() as usize,
+                            (cell_a.y1 * s).round() as usize,
+                        );
+                        for y in y0..y1 {
+                            // A's last column and B's first column carry the same rows: no step.
+                            assert_eq!(
+                                r.at(boundary - 1, y) > 0,
+                                r.at(boundary, y) > 0,
+                                "{:04X}|{:04X} {style:?} {w}x{h}@{s} row {y}",
+                                a as u32,
+                                b as u32
+                            );
+                        }
+                    }
+                }
+                // Vertical neighbours: A above B.
+                for &a in &downs {
+                    for &b in ups.iter().take(6) {
+                        let mut r = Raster::new(
+                            (g.x_edge(3) * s).round() as usize + 1,
+                            (g.y_edge(3) * s).round() as usize + 1,
+                        );
+                        raster_of(a, &g, 1, 0, &mut r);
+                        raster_of(b, &g, 1, 1, &mut r);
+                        let cell_a = g.cell(1, 0);
+                        let boundary = (cell_a.y1 * s).round() as usize;
+                        let (x0, x1) = (
+                            (cell_a.x0 * s).round() as usize,
+                            (cell_a.x1 * s).round() as usize,
+                        );
+                        for x in x0..x1 {
+                            assert_eq!(
+                                r.at(x, boundary - 1) > 0,
+                                r.at(x, boundary) > 0,
+                                "{:04X}/{:04X} {style:?} {w}x{h}@{s} col {x}",
+                                a as u32,
+                                b as u32
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mirrored_glyphs_are_mirror_images_when_the_cell_parity_allows() {
+        // A line of odd thickness (light 1, double 3) centres exactly in a cell of odd size, so there the
+        // left/right and up/down mirror of a glyph must be the mirror image of its pixels.
+        for (w, h, s) in [(9.0, 17.0, 1.0), (11.0, 15.0, 1.0), (7.0, 15.0, 1.0)] {
+            let g = grid(w, h, s);
+            for (ch, _) in NAMES {
+                let c = box_connections(ch).unwrap();
+                if c.sides().contains(&LineStyle::Heavy) {
+                    continue;
+                }
+                let mirror_h = Connections {
+                    left: c.right,
+                    right: c.left,
+                    ..c
+                };
+                let mirror_v = Connections {
+                    up: c.down,
+                    down: c.up,
+                    ..c
+                };
+                let (a, [x0, y0, x1, y1]) = glyph_raster(ch, &g);
+                for (m, flip_x) in [(mirror_h, true), (mirror_v, false)] {
+                    let Some(&(other, _)) =
+                        NAMES.iter().find(|&&(n, _)| box_connections(n) == Some(m))
+                    else {
+                        continue;
+                    };
+                    let (b, _) = glyph_raster(other, &g);
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let (mx, my) = if flip_x {
+                                (x0 + x1 - 1 - x, y)
+                            } else {
+                                (x, y0 + y1 - 1 - y)
+                            };
+                            assert_eq!(
+                                a.at(x as usize, y as usize) > 0,
+                                b.at(mx as usize, my as usize) > 0,
+                                "{:04X} vs {:04X} {w}x{h} at ({x},{y})",
+                                ch as u32,
+                                other as u32
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pixels of `ch` in an 11×15 cell at 100% (light line 1 px, double bands 3 wide) as text.
+    fn ascii(ch: char) -> Vec<String> {
+        let g = grid(11.0, 15.0, 1.0);
+        let mut raster = Raster::new(11, 15);
+        let rects = glyph_rects(ch, &g, 0, 0).unwrap();
+        for r in rects.as_slice() {
+            raster.paint(r, 1.0);
+        }
+        (0..15)
+            .map(|y| {
+                (0..11)
+                    .map(|x| if raster.at(x, y) > 0 { '#' } else { '.' })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Expands `(rows, pattern)` pairs into the 15 rows of a glyph.
+    fn rows(spec: &[(std::ops::Range<usize>, &str)]) -> Vec<String> {
+        spec.iter()
+            .flat_map(|(range, pattern)| range.clone().map(move |_| pattern.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn double_line_shapes_match_the_reference_drawings() {
+        // Double lines are 1 px with a 1 px gap here: bands at x = 4, 6 and y = 6, 8 (single line: 5, 7).
+        let cases: [(char, Vec<String>); 9] = [
+            // ╬: four separate corners around an empty centre.
+            (
+                '\u{256C}',
+                rows(&[
+                    (0..6, "....#.#...."),
+                    (6..7, "#####.#####"),
+                    (7..8, "..........."),
+                    (8..9, "#####.#####"),
+                    (9..15, "....#.#...."),
+                ]),
+            ),
+            // ╔: outer corner at the upper left, inner corner one line inside.
+            (
+                '\u{2554}',
+                rows(&[
+                    (0..6, "..........."),
+                    (6..7, "....#######"),
+                    (7..8, "....#......"),
+                    (8..9, "....#.#####"),
+                    (9..15, "....#.#...."),
+                ]),
+            ),
+            // ╠: the left line runs through, the right one is cut where the branch leaves.
+            (
+                '\u{2560}',
+                rows(&[
+                    (0..6, "....#.#...."),
+                    (6..7, "....#.#####"),
+                    (7..8, "....#......"),
+                    (8..9, "....#.#####"),
+                    (9..15, "....#.#...."),
+                ]),
+            ),
+            // ╒: a single line down joins the upper of two double lines going right.
+            (
+                '\u{2552}',
+                rows(&[
+                    (0..6, "..........."),
+                    (6..7, ".....######"),
+                    (7..8, ".....#....."),
+                    (8..9, ".....######"),
+                    (9..15, ".....#....."),
+                ]),
+            ),
+            // ╓: a double line down meets one single line going right.
+            (
+                '\u{2553}',
+                rows(&[
+                    (0..7, "..........."),
+                    (7..8, "....#######"),
+                    (8..15, "....#.#...."),
+                ]),
+            ),
+            // ╪: a single vertical crosses two double horizontals.
+            (
+                '\u{256A}',
+                rows(&[
+                    (0..6, ".....#....."),
+                    (6..7, "###########"),
+                    (7..8, ".....#....."),
+                    (8..9, "###########"),
+                    (9..15, ".....#....."),
+                ]),
+            ),
+            // ╫: two double verticals cross one single horizontal.
+            (
+                '\u{256B}',
+                rows(&[
+                    (0..7, "....#.#...."),
+                    (7..8, "###########"),
+                    (8..15, "....#.#...."),
+                ]),
+            ),
+            // ╤: a single line hangs below two double horizontals.
+            (
+                '\u{2564}',
+                rows(&[
+                    (0..6, "..........."),
+                    (6..7, "###########"),
+                    (7..8, "..........."),
+                    (8..9, "###########"),
+                    (9..15, ".....#....."),
+                ]),
+            ),
+            // ╥: a double line hangs below one single horizontal.
+            (
+                '\u{2565}',
+                rows(&[
+                    (0..7, "..........."),
+                    (7..8, "###########"),
+                    (8..15, "....#.#...."),
+                ]),
+            ),
+        ];
+        for (ch, expected) in cases {
+            assert_eq!(ascii(ch), expected, "{:04X}", ch as u32);
+        }
+    }
+
+    #[test]
+    fn heavy_and_mixed_shapes_match_the_reference_drawings() {
+        // Light line 1 px, heavy 2 px, in an 11×15 cell: light band x = 5, y = 7; heavy x = 5..7, y = 7..9?
+        // (heavy starts at round_half_up((0 + 15 - 2) / 2) = 7 and (0 + 11 - 2) / 2 = 5).
+        let cases: [(char, Vec<String>); 4] = [
+            // ┏: heavy corner.
+            (
+                '\u{250F}',
+                rows(&[
+                    (0..7, "..........."),
+                    (7..9, ".....######"),
+                    (9..15, ".....##...."),
+                ]),
+            ),
+            // ┍: light line down, heavy line right: the heavy bar covers the hub, the light one stops at it.
+            (
+                '\u{250D}',
+                rows(&[
+                    (0..7, "..........."),
+                    (7..9, ".....######"),
+                    (9..15, ".....#....."),
+                ]),
+            ),
+            // ╋: heavy cross.
+            (
+                '\u{254B}',
+                rows(&[
+                    (0..7, ".....##...."),
+                    (7..9, "###########"),
+                    (9..15, ".....##...."),
+                ]),
+            ),
+            // ┿: light vertical crossed by a heavy horizontal.
+            (
+                '\u{253F}',
+                rows(&[
+                    (0..7, ".....#....."),
+                    (7..9, "###########"),
+                    (9..15, ".....#....."),
+                ]),
+            ),
+        ];
+        for (ch, expected) in cases {
+            assert_eq!(ascii(ch), expected, "{:04X}", ch as u32);
+        }
+    }
+
+    #[test]
+    fn double_lines_degrade_to_heavy_when_the_cell_is_too_small() {
+        // A double line needs 3 light thicknesses plus a free pixel each side (5 px at 1 px lines).
+        for (w, h) in [(4.0, 8.0), (8.0, 4.0), (3.0, 3.0)] {
+            let g = grid(w, h, 1.0);
+            for (double, heavy) in [
+                ('\u{2550}', '\u{2501}'),
+                ('\u{2551}', '\u{2503}'),
+                ('\u{2554}', '\u{250F}'),
+                ('\u{2557}', '\u{2513}'),
+                ('\u{256C}', '\u{254B}'),
+                ('\u{2566}', '\u{2533}'),
+                ('\u{2552}', '\u{250D}'), // down single, right double → down light, right heavy
+            ] {
+                let a = glyph_rects(double, &g, 1, 1).unwrap();
+                let b = glyph_rects(heavy, &g, 1, 1).unwrap();
+                assert_eq!(a, b, "{double:?} vs {heavy:?} in {w}x{h}");
+            }
+        }
+        // A cell that fits keeps the double line.
+        let g = grid(11.0, 15.0, 1.0);
+        assert_ne!(
+            glyph_rects('\u{2550}', &g, 1, 1),
+            glyph_rects('\u{2501}', &g, 1, 1)
+        );
+    }
+
+    #[test]
+    fn all_supported_box_glyphs_stay_finite_in_tiny_cells() {
+        for (w, h, s) in [
+            (1.0, 1.0, 1.0),
+            (2.0, 2.0, 1.0),
+            (3.0, 5.0, 1.5),
+            (0.5, 0.7, 1.0),
+        ] {
+            let g = grid(w, h, s);
+            let cell = g.cell(2, 2);
+            for (ch, _) in NAMES {
+                for r in glyph_rects(ch, &g, 2, 2).unwrap().as_slice() {
+                    assert!(
+                        r.x0.is_finite()
+                            && r.x1.is_finite()
+                            && r.y0.is_finite()
+                            && r.y1.is_finite()
+                    );
+                    assert!(r.x1 > r.x0 && r.y1 > r.y0);
+                    assert!(
+                        r.x0 >= cell.x0 && r.x1 <= cell.x1 && r.y0 >= cell.y0 && r.y1 <= cell.y1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_heavy_frame_is_one_connected_figure_of_the_expected_area() {
+        const HEAVY_FRAME: [&str; 5] = [
+            "┏━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┓",
+            "┃              ┃              ┃",
+            "┣━━━━━━━━━━━━━━╋━━━━━━━━━━━━━━┫",
+            "┃              ┃              ┃",
+            "┗━━━━━━━━━━━━━━┻━━━━━━━━━━━━━━┛",
+        ];
+        for (w, h, s) in BOX_CASES {
+            let g = grid(w, h, s);
+            let raster = draw(&HEAVY_FRAME, &g);
+            assert!(raster.px.iter().all(|&n| n <= 1), "{w}x{h}@{s}: overlap");
+            let t = 2 * g.light_stroke_phys() as i64;
+            let band = |lo: f32, hi: f32| -> i64 {
+                let (lo, hi) = ((lo * s).round() as i64, (hi * s).round() as i64);
+                (lo + hi - t + 1).div_euclid(2)
+            };
+            let rows: Vec<i64> = [0, 2, 4]
+                .iter()
+                .map(|&r| band(g.y_edge(r), g.y_edge(r + 1)))
+                .collect();
+            let cols: Vec<i64> = [0, 15, 30]
+                .iter()
+                .map(|&c| band(g.x_edge(c), g.x_edge(c + 1)))
+                .collect();
+            for &y0 in &rows {
+                for dy in 0..t {
+                    for x in cols[0]..cols[2] + t {
+                        assert_eq!(
+                            raster.at(x as usize, (y0 + dy) as usize),
+                            1,
+                            "{w}x{h}@{s}: hole ({x},{})",
+                            y0 + dy
+                        );
+                    }
+                }
+            }
+            for &x0 in &cols {
+                for dx in 0..t {
+                    for y in rows[0]..rows[2] + t {
+                        assert_eq!(
+                            raster.at((x0 + dx) as usize, y as usize),
+                            1,
+                            "{w}x{h}@{s}: hole ({},{y})",
+                            x0 + dx
+                        );
+                    }
+                }
+            }
+            let drawn: i64 = raster.px.iter().map(|&n| n as i64).sum();
+            let horiz = 3 * t * (cols[2] + t - cols[0]);
+            let vert = 3 * t * (rows[2] + t - rows[0]);
+            assert_eq!(drawn, horiz + vert - 9 * t * t, "{w}x{h}@{s}: area");
         }
     }
 }
