@@ -72,6 +72,13 @@ Every direct dependency uses a permissive license. Crates offered under a choice
 - **Copyright**: Copyright (c) 2018 Matthew D. Steele
 - **Source**: <https://github.com/mdsteele/rust-ico>
 
+### kira
+
+- **Version**: 0.12.5
+- **License**: MIT OR Apache-2.0
+- **Copyright**: Copyright (c) 2020 Andrew Minnich
+- **Source**: <https://github.com/tesselode/kira>
+
 ### serde
 
 - **Version**: 1.0.229

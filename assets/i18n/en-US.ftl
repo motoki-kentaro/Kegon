@@ -71,6 +71,16 @@ settings-metric-stored-invalid = The value in settings.toml ({ $value }) is not 
 settings-builtin-glyphs-label = Built-in Glyphs
 settings-builtin-glyphs-description = When on, Unicode box-drawing and block characters are drawn as dedicated shapes instead of with the font, so they join the cell grid without gaps. Applies at once.
 settings-builtin-glyphs-stored-invalid = The value in settings.toml ({ $value }) is not true or false and is treated as on. Changing the setting replaces it.
+settings-category-dopamine-title = Dopamine Mode
+settings-category-dopamine-description = Dynamic visual effects and sound feedback for typing and actions.
+settings-dopamine-enabled-label = Enable Dopamine Mode
+settings-dopamine-enabled-description = When on, typing triggers responsive audio and particle effects in the terminal. Applies at once.
+settings-dopamine-enabled-stored-invalid = The value in settings.toml ({ $value }) is not true or false and is treated as off. Changing the setting replaces it.
+settings-dopamine-sound-label = Sound Profile
+settings-dopamine-sound-zap = Electric Zap
+settings-dopamine-sound-crack = Metal Crack
+settings-dopamine-sound-burst = Neon Burst
+settings-dopamine-sound-preview = Preview
 settings-tab-close-tooltip = Close Settings
 
 ## Main area

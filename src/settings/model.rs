@@ -5,6 +5,7 @@ use std::ops::RangeInclusive;
 use serde::{Deserialize, Serialize};
 
 use super::numeric::{BoolSetting, ExtraKeys, NumericSetting};
+use crate::terminal::dopamine::DopamineSoundKind;
 use crate::theme::ThemeId;
 
 /// Supported user preferences for application UI language.
@@ -277,6 +278,94 @@ impl AppearanceSettings {
     }
 }
 
+/// Dopamine Mode settings model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DopamineSettings {
+    /// Whether Dopamine Mode is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<BoolSetting>,
+    /// Sound profile choice ("zap", "crack", "burst"); anything else, including the removed recorded profiles, means the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound: Option<String>,
+    /// Keys in [dopamine] this build does not recognize; written back untouched.
+    #[serde(flatten)]
+    pub extra: ExtraKeys,
+}
+
+impl DopamineSettings {
+    pub const DEFAULT_ENABLED: bool = false;
+    pub const DEFAULT_SOUND: DopamineSoundKind = DopamineSoundKind::Zap;
+
+    /// Whether Dopamine Mode is effectively enabled (unset defaults to false).
+    pub fn enabled(&self) -> bool {
+        self.enabled
+            .as_ref()
+            .and_then(BoolSetting::effective)
+            .unwrap_or(Self::DEFAULT_ENABLED)
+    }
+
+    /// Sets the enabled state explicitly.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = Some(BoolSetting::Value(enabled));
+    }
+
+    /// Clears the explicit setting, reverting to default.
+    pub fn clear_enabled(&mut self) {
+        self.enabled = None;
+    }
+
+    /// Whether the settings file explicitly contains the key.
+    pub fn has_enabled_key(&self) -> bool {
+        self.enabled.is_some()
+    }
+
+    /// The active sound profile (defaults to Zap if unset or unrecognized).
+    pub fn sound(&self) -> DopamineSoundKind {
+        self.sound
+            .as_deref()
+            .and_then(DopamineSoundKind::from_str)
+            .unwrap_or(Self::DEFAULT_SOUND)
+    }
+
+    /// Explicitly sets the sound profile.
+    pub fn set_sound(&mut self, kind: DopamineSoundKind) {
+        self.sound = Some(kind.as_str().to_string());
+    }
+
+    /// Clears the explicit sound setting, reverting to default.
+    pub fn clear_sound(&mut self) {
+        self.sound = None;
+    }
+
+    /// Whether the settings file explicitly contains the sound key.
+    pub fn has_sound_key(&self) -> bool {
+        self.sound.is_some()
+    }
+
+    /// The stored value when it is not a boolean and is therefore ignored.
+    pub fn invalid_enabled_text(&self) -> Option<String> {
+        self.enabled
+            .as_ref()
+            .filter(|setting| setting.effective().is_none())
+            .map(BoolSetting::describe)
+    }
+
+    /// Diagnostic warning for an invalid enabled value in settings.toml.
+    pub fn diagnostic(&self) -> Option<String> {
+        self.invalid_enabled_text().map(|raw| {
+            format!(
+                "invalid enabled = {raw} in [dopamine] settings (expected true or false); \
+                 treating it as false (the setting is kept as is)"
+            )
+        })
+    }
+
+    /// Whether this table has any keys (or extra keys) to serialize.
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none() && self.sound.is_none() && self.extra.0.is_empty()
+    }
+}
+
 /// Typed model holding Kegon application-level configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ApplicationSettings {
@@ -286,6 +375,9 @@ pub struct ApplicationSettings {
     /// Preferred visual appearance.
     #[serde(default)]
     pub appearance: AppearanceSettings,
+    /// Dopamine Mode settings.
+    #[serde(default, skip_serializing_if = "DopamineSettings::is_empty")]
+    pub dopamine: DopamineSettings,
     /// Top-level keys this build does not know; written back untouched.
     #[serde(flatten)]
     pub extra: ExtraKeys,

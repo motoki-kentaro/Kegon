@@ -70,6 +70,16 @@ settings-metric-stored-invalid = settings.toml の値({ $value })は無効なた
 settings-builtin-glyphs-label = 組み込みグリフ
 settings-builtin-glyphs-description = 有効にすると、Unicode の罫線・ブロック文字をフォントではなく専用の図形で描画し、すき間なくセルに接続します。変更はすぐに反映されます。
 settings-builtin-glyphs-stored-invalid = settings.toml の値({ $value })は true / false ではないため、有効として扱われます。設定を変更すると置き換えられます。
+settings-category-dopamine-title = ドーパミンモード
+settings-category-dopamine-description = タイピングや操作に応じたダイナミックな視覚エフェクトと効果音です。
+settings-dopamine-enabled-label = ドーパミンモードを有効にする
+settings-dopamine-enabled-description = 有効にすると、ターミナルでの入力時に効果音とパーティクルエフェクトが発生します。変更はすぐに反映されます。
+settings-dopamine-enabled-stored-invalid = settings.toml の値({ $value })は true / false ではないため、無効として扱われます。設定を変更すると置き換えられます。
+settings-dopamine-sound-label = 効果音プロファイル
+settings-dopamine-sound-zap = 電撃 (Zap)
+settings-dopamine-sound-crack = 金属破砕 (Crack)
+settings-dopamine-sound-burst = ネオン破裂 (Burst)
+settings-dopamine-sound-preview = 試聴
 settings-tab-close-tooltip = 設定を閉じる
 
 ## Main area
