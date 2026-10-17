@@ -167,6 +167,52 @@ fn fill_glyph_rects(frame: &mut Frame, rects: &[glyph::Rect], color: Color) {
     }
 }
 
+/// Paints the curves and diagonals of a built-in glyph.
+///
+/// Every piece lies inside its cell (see `glyph::glyph_paths`), so nothing is clipped. Curves are
+/// stroked with flat ends and diagonals are filled polygons; both are antialiased like any canvas path.
+fn fill_glyph_paths(frame: &mut Frame, paths: &glyph::GlyphPaths, color: Color) {
+    let point = |(x, y): glyph::Point2| Point::new(x, y);
+    for shape in paths.as_slice() {
+        match shape {
+            glyph::PathShape::Curve {
+                from,
+                ctrl1,
+                ctrl2,
+                to,
+                width,
+            } => {
+                let path = Path::new(|builder| {
+                    builder.move_to(point(*from));
+                    builder.bezier_curve_to(point(*ctrl1), point(*ctrl2), point(*to));
+                });
+                frame.stroke(
+                    &path,
+                    canvas::Stroke::default()
+                        .with_width(*width)
+                        .with_color(color)
+                        .with_line_cap(canvas::LineCap::Butt),
+                );
+            }
+            glyph::PathShape::Polygon { .. } => {
+                let points = shape.polygon_points();
+                if let Some((first, rest)) = points.split_first()
+                    && rest.len() >= 2
+                {
+                    let path = Path::new(|builder| {
+                        builder.move_to(point(*first));
+                        for p in rest {
+                            builder.line_to(point(*p));
+                        }
+                        builder.close();
+                    });
+                    frame.fill(&path, color);
+                }
+            }
+        }
+    }
+}
+
 /// The iced [`Program`] responsible for rendering the terminal grid and preedit text.
 pub struct TerminalProgram<'a> {
     pub session: &'a TerminalSession,
@@ -272,8 +318,16 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
                 } else {
                     None
                 };
+                let builtin_paths =
+                    if builtin.is_none() && self.builtin_glyphs && cell.zerowidth().is_none() {
+                        glyph::glyph_paths(cell.c, &grid, col_index, line_index)
+                    } else {
+                        None
+                    };
                 if let Some(rects) = builtin {
                     fill_glyph_rects(&mut frame, rects.as_slice(), fg);
+                } else if let Some(paths) = builtin_paths {
+                    fill_glyph_paths(&mut frame, &paths, fg);
                 } else {
                     let cell_font = resolve_cell_font(font, cell.flags);
 
@@ -354,7 +408,7 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         // A built-in shape under the cursor is redrawn from the same aligned edges as the cell.
         let cursor_col = cursor_point.column.0 as i32;
         let cursor_line = cursor_point.line.0;
-        let cursor_builtin = if self.builtin_glyphs {
+        let cursor_char = if self.builtin_glyphs {
             cursor_cell_info.as_ref().and_then(|(content, _)| {
                 let mut chars = content.chars();
                 let ch = chars.next()?;
@@ -362,19 +416,27 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
             })
         } else {
             None
-        }
-        .and_then(|ch| glyph::glyph_rects(ch, &grid, cursor_col, cursor_line));
+        };
+        let cursor_builtin =
+            cursor_char.and_then(|ch| glyph::glyph_rects(ch, &grid, cursor_col, cursor_line));
+        let cursor_paths = if cursor_builtin.is_none() {
+            cursor_char.and_then(|ch| glyph::glyph_paths(ch, &grid, cursor_col, cursor_line))
+        } else {
+            None
+        };
 
-        if self.is_focused
-            && let Some(rects) = cursor_builtin
-        {
+        if self.is_focused && (cursor_builtin.is_some() || cursor_paths.is_some()) {
             let cell = grid.cell(cursor_col, cursor_line);
             frame.fill_rectangle(
                 Point::new(cell.x0, cell.y0),
                 Size::new(cell.width(), cell.height()),
                 colors.cursor,
             );
-            fill_glyph_rects(&mut frame, rects.as_slice(), colors.background);
+            if let Some(rects) = cursor_builtin {
+                fill_glyph_rects(&mut frame, rects.as_slice(), colors.background);
+            } else if let Some(paths) = cursor_paths {
+                fill_glyph_paths(&mut frame, &paths, colors.background);
+            }
         } else if self.is_focused {
             frame.fill_rectangle(
                 cursor_pos,

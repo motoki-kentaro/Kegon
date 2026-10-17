@@ -313,8 +313,8 @@ impl Connections {
 /// U+2574..U+257F. Each code is `left right up down` with `-` none, `l` light, `h` heavy, `d` double
 /// (a light line next to a double one is Unicode's "single").
 ///
-/// Not supported and left to the font: dashed lines (U+2504..U+250B, U+254C..U+254F), rounded corners
-/// (U+256D..U+2570) and diagonals (U+2571..U+2573).
+/// Dashed lines have their own table ([`DASH_TABLE`]), and the rounded corners and diagonals
+/// (U+256D..U+2573) are paths ([`PATH_TABLE`], [`glyph_paths`]).
 const BOX_TABLE: &[(char, &str)] = &[
     ('\u{2500}', "ll--"),
     ('\u{2501}', "hh--"),
@@ -433,9 +433,130 @@ pub fn box_connections(ch: char) -> Option<Connections> {
     Connections::from_code(BOX_TABLE[index].1)
 }
 
+/// A dashed box-drawing line: a straight line cut into `count` dashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dashed {
+    /// Runs top to bottom (otherwise left to right).
+    pub vertical: bool,
+    /// How many dashes the cell holds: 2 (double dash), 3 (triple) or 4 (quadruple).
+    pub count: i32,
+    /// Drawn with the heavy thickness (otherwise light).
+    pub heavy: bool,
+}
+
+impl Dashed {
+    /// Parses a table code: direction `h` / `v`, the dash count digit, weight `l` / `h`.
+    fn from_code(code: &str) -> Option<Self> {
+        let mut chars = code.chars();
+        let vertical = match chars.next()? {
+            'h' => false,
+            'v' => true,
+            _ => return None,
+        };
+        let count = chars.next()?.to_digit(10)? as i32;
+        let heavy = match chars.next()? {
+            'l' => false,
+            'h' => true,
+            _ => return None,
+        };
+        (chars.next().is_none() && (2..=4).contains(&count)).then_some(Self {
+            vertical,
+            count,
+            heavy,
+        })
+    }
+}
+
+/// The dashed lines, in code point order: `h`orizontal / `v`ertical, number of dashes, `l`ight / `h`eavy.
+const DASH_TABLE: &[(char, &str)] = &[
+    ('\u{2504}', "h3l"), // LIGHT TRIPLE DASH HORIZONTAL
+    ('\u{2505}', "h3h"), // HEAVY TRIPLE DASH HORIZONTAL
+    ('\u{2506}', "v3l"), // LIGHT TRIPLE DASH VERTICAL
+    ('\u{2507}', "v3h"), // HEAVY TRIPLE DASH VERTICAL
+    ('\u{2508}', "h4l"), // LIGHT QUADRUPLE DASH HORIZONTAL
+    ('\u{2509}', "h4h"), // HEAVY QUADRUPLE DASH HORIZONTAL
+    ('\u{250A}', "v4l"), // LIGHT QUADRUPLE DASH VERTICAL
+    ('\u{250B}', "v4h"), // HEAVY QUADRUPLE DASH VERTICAL
+    ('\u{254C}', "h2l"), // LIGHT DOUBLE DASH HORIZONTAL
+    ('\u{254D}', "h2h"), // HEAVY DOUBLE DASH HORIZONTAL
+    ('\u{254E}', "v2l"), // LIGHT DOUBLE DASH VERTICAL
+    ('\u{254F}', "v2h"), // HEAVY DOUBLE DASH VERTICAL
+];
+
+/// The dash layout of a dashed box-drawing character, or `None` for any other character.
+pub fn dashed(ch: char) -> Option<Dashed> {
+    let index = DASH_TABLE.binary_search_by_key(&ch, |entry| entry.0).ok()?;
+    Dashed::from_code(DASH_TABLE[index].1)
+}
+
+/// A box-drawing character drawn as a curve or a diagonal (paths, not rectangles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathGlyph {
+    /// A quarter-circle corner joining a vertical and a horizontal line: the arm directions.
+    Arc { right: bool, down: bool },
+    /// A diagonal across the whole cell: rising (lower left to upper right) and / or falling (upper left
+    /// to lower right).
+    Diagonal { rising: bool, falling: bool },
+}
+
+impl PathGlyph {
+    /// Parses a table code: `a` + `r`/`l` + `d`/`u` for an arc, `x` + two `0`/`1` digits (rising,
+    /// falling) for a diagonal.
+    fn from_code(code: &str) -> Option<Self> {
+        let mut chars = code.chars();
+        let parts = (chars.next(), chars.next(), chars.next(), chars.next());
+        match parts {
+            (Some('a'), Some(h), Some(v), None) => Some(Self::Arc {
+                right: match h {
+                    'r' => true,
+                    'l' => false,
+                    _ => return None,
+                },
+                down: match v {
+                    'd' => true,
+                    'u' => false,
+                    _ => return None,
+                },
+            }),
+            (Some('x'), Some(r), Some(f), None) => {
+                let bit = |c: char| match c {
+                    '0' => Some(false),
+                    '1' => Some(true),
+                    _ => None,
+                };
+                Some(Self::Diagonal {
+                    rising: bit(r)?,
+                    falling: bit(f)?,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The curves and diagonals, in code point order.
+const PATH_TABLE: &[(char, &str)] = &[
+    ('\u{256D}', "ard"), // LIGHT ARC DOWN AND RIGHT
+    ('\u{256E}', "ald"), // LIGHT ARC DOWN AND LEFT
+    ('\u{256F}', "alu"), // LIGHT ARC UP AND LEFT
+    ('\u{2570}', "aru"), // LIGHT ARC UP AND RIGHT
+    ('\u{2571}', "x10"), // LIGHT DIAGONAL UPPER RIGHT TO LOWER LEFT
+    ('\u{2572}', "x01"), // LIGHT DIAGONAL UPPER LEFT TO LOWER RIGHT
+    ('\u{2573}', "x11"), // LIGHT DIAGONAL CROSS
+];
+
+/// The path layout of an arc or diagonal character, or `None` for any other character.
+pub fn path_glyph(ch: char) -> Option<PathGlyph> {
+    let index = PATH_TABLE.binary_search_by_key(&ch, |entry| entry.0).ok()?;
+    PathGlyph::from_code(PATH_TABLE[index].1)
+}
+
 /// Whether `ch` is drawn by this module.
 pub fn is_builtin(ch: char) -> bool {
-    block_regions(ch).is_some() || box_connections(ch).is_some()
+    block_regions(ch).is_some()
+        || box_connections(ch).is_some()
+        || dashed(ch).is_some()
+        || path_glyph(ch).is_some()
 }
 
 /// A rectangle in eighths of the cell: `(x0, y0, x1, y1)`, each in `0..=8`, left/top first.
@@ -559,6 +680,28 @@ pub fn glyph_rects(ch: char, grid: &CellGrid, col: i32, line: i32) -> Option<Gly
     if let Some(connections) = box_connections(ch) {
         return Some(box_rects(&connections, grid, cell));
     }
+    if let Some(dashes) = dashed(ch) {
+        return Some(dash_rects(&dashes, grid, cell));
+    }
+    if let Some(PathGlyph::Arc { right, down }) = path_glyph(ch)
+        && arc_too_small(&grid.phys(cell))
+    {
+        // A cell this small has no room for a curve: the plain light corner stands in for it.
+        let side = |on| {
+            if on {
+                LineStyle::Light
+            } else {
+                LineStyle::None
+            }
+        };
+        let corner = Connections {
+            left: side(!right),
+            right: side(right),
+            up: side(!down),
+            down: side(down),
+        };
+        return Some(box_rects(&corner, grid, cell));
+    }
     let regions = block_regions(ch)?;
     let mut rects = GlyphRects::empty();
     for r in regions.as_slice() {
@@ -603,16 +746,292 @@ fn box_rects(connections: &Connections, grid: &CellGrid, cell: Rect) -> GlyphRec
     }
 
     let mut rects = GlyphRects::empty();
-    for r in normalize(&parts.as_slice()).as_slice() {
+    let (parts, len) = parts.as_slice();
+    for r in normalize(&parts[..len]).as_slice() {
         rects.push(grid.logical(physical, cell, *r));
     }
     rects
 }
 
+/// Room for the overlapping rectangles a glyph is built from before they are merged.
+const PARTS_CAP: usize = 16;
+
+/// Builds the dashes of a dashed line.
+///
+/// Along the line the cell's `length` physical pixels are cut into `count` equal segments at
+/// `round(length × i / count)`. Each segment holds one dash and a gap of `max(1, round(segment / 3))`
+/// pixels, split between its two ends (the smaller half first). A gap is therefore the same inside the
+/// cell and across the boundary to the next cell, so a row of the same character is one regular pattern.
+/// The line is centred across with the light or heavy thickness, like a solid line.
+///
+/// A cell too short for `count` dashes with a pixel gap each (`length < 2 × count`) cannot show the
+/// pattern and draws the solid line instead.
+fn dash_rects(dashes: &Dashed, grid: &CellGrid, cell: Rect) -> GlyphRects {
+    let physical = grid.phys(cell);
+    let light = grid.light_stroke_phys();
+    let thickness = if dashes.heavy { 2 * light } else { light };
+    let ((lo, hi), (across_lo, across_hi)) = if dashes.vertical {
+        ((physical.y0, physical.y1), (physical.x0, physical.x1))
+    } else {
+        ((physical.x0, physical.x1), (physical.y0, physical.y1))
+    };
+    let (s0, s1) = band(across_lo, across_hi, thickness);
+    let length = hi - lo;
+    let n = dashes.count;
+    let mut spans = [(0, 0); 4];
+    let mut len = 0;
+    if length < 2 * n {
+        spans[0] = (lo, hi);
+        len = 1;
+    } else {
+        let boundary = |i: i32| lo + (2 * length * i + n).div_euclid(2 * n);
+        for i in 0..n {
+            let (b0, b1) = (boundary(i), boundary(i + 1));
+            let gap = ((b1 - b0 + 1) / 3).max(1);
+            spans[len] = (b0 + gap / 2, b1 - (gap - gap / 2));
+            len += 1;
+        }
+    }
+    let mut rects = GlyphRects::empty();
+    for &(a, b) in &spans[..len] {
+        let r = if dashes.vertical {
+            IRect {
+                x0: s0,
+                y0: a,
+                x1: s1,
+                y1: b,
+            }
+        } else {
+            IRect {
+                x0: a,
+                y0: s0,
+                x1: b,
+                y1: s1,
+            }
+        };
+        rects.push(grid.logical(physical, cell, r));
+    }
+    rects
+}
+
+/// A point in the renderer's logical coordinates.
+pub type Point2 = (f32, f32);
+
+/// Room for the corners of a clipped diagonal band (a parallelogram cut by a rectangle).
+pub const MAX_POLYGON_POINTS: usize = 8;
+
+/// One piece of a curve or diagonal glyph, in logical coordinates relative to the surface origin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PathShape {
+    /// A cubic Bézier curve to be stroked with `width` and flat (butt) ends.
+    Curve {
+        from: Point2,
+        ctrl1: Point2,
+        ctrl2: Point2,
+        to: Point2,
+        width: f32,
+    },
+    /// A closed polygon to be filled.
+    Polygon {
+        points: [Point2; MAX_POLYGON_POINTS],
+        len: usize,
+    },
+}
+
+impl PathShape {
+    /// The corners of a [`PathShape::Polygon`] (empty for a curve).
+    pub fn polygon_points(&self) -> &[Point2] {
+        match self {
+            Self::Polygon { points, len } => &points[..*len],
+            Self::Curve { .. } => &[],
+        }
+    }
+}
+
+/// The path pieces of a glyph (at most two: a cross is two diagonals).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GlyphPaths {
+    shapes: [PathShape; 2],
+    len: usize,
+}
+
+impl GlyphPaths {
+    pub fn as_slice(&self) -> &[PathShape] {
+        &self.shapes[..self.len]
+    }
+}
+
+/// Whether a cell is too small for a curve: with fewer than 6 physical pixels in a direction the arc is a
+/// couple of pixels and the corner of straight lines reads better.
+fn arc_too_small(p: &IRect) -> bool {
+    p.x1 - p.x0 < 6 || p.y1 - p.y0 < 6
+}
+
+/// The paths of an arc or diagonal character in the cell at (`col`, `line`), or `None` for any other
+/// character (and for an arc in a cell too small to curve, which [`glyph_rects`] draws as a corner).
+///
+/// Every piece stays inside the cell by construction, so the renderer needs no clipping:
+/// - An arc is a cubic Bézier from the middle of one line's band at the cell edge to the middle of the
+///   other's, starting and ending along the lines (the same bands the straight lines use, so it joins them
+///   without a step). Seen from the stroke, its flat ends lie on the cell edge and the curve bulges only
+///   toward the cell's corner side, never past an edge.
+/// - A diagonal is the band of one light thickness around the line between two opposite cell corners,
+///   already cut by the cell's rectangle, so it ends flush with the cell edges and meets the diagonal of
+///   the neighbouring cell exactly at the corner.
+pub fn glyph_paths(ch: char, grid: &CellGrid, col: i32, line: i32) -> Option<GlyphPaths> {
+    let glyph = path_glyph(ch)?;
+    let cell = grid.cell(col, line);
+    let p = grid.phys(cell);
+    let width = grid.light_stroke_phys() as f32;
+    let to_logical = |x: f32, y: f32| {
+        // Edges of the cell map back to exactly the cell's own values.
+        let lx = if x == p.x0 as f32 {
+            cell.x0
+        } else if x == p.x1 as f32 {
+            cell.x1
+        } else {
+            x / grid.scale - grid.origin_x
+        };
+        let ly = if y == p.y0 as f32 {
+            cell.y0
+        } else if y == p.y1 as f32 {
+            cell.y1
+        } else {
+            y / grid.scale - grid.origin_y
+        };
+        (lx, ly)
+    };
+    let empty = PathShape::Polygon {
+        points: [(0.0, 0.0); MAX_POLYGON_POINTS],
+        len: 0,
+    };
+    let mut out = GlyphPaths {
+        shapes: [empty; 2],
+        len: 0,
+    };
+    match glyph {
+        PathGlyph::Arc { right, down } => {
+            if arc_too_small(&p) {
+                return None;
+            }
+            let t = width as i32;
+            let vertical = band(p.x0, p.x1, t);
+            let horizontal = band(p.y0, p.y1, t);
+            let xc = (vertical.0 + vertical.1) as f32 / 2.0;
+            let yc = (horizontal.0 + horizontal.1) as f32 / 2.0;
+            let edge_x = if right { p.x1 } else { p.x0 } as f32;
+            let edge_y = if down { p.y1 } else { p.y0 } as f32;
+            // Control points at the circle constant 4/3·(√2 − 1) of the way: a quarter ellipse.
+            const K: f32 = 0.552_284_8;
+            out.shapes[0] = PathShape::Curve {
+                from: to_logical(xc, edge_y),
+                ctrl1: to_logical(xc, edge_y + (yc - edge_y) * K),
+                ctrl2: to_logical(edge_x + (xc - edge_x) * K, yc),
+                to: to_logical(edge_x, yc),
+                width: width / grid.scale,
+            };
+            out.len = 1;
+        }
+        PathGlyph::Diagonal { rising, falling } => {
+            let (x0, y0, x1, y1) = (p.x0 as f32, p.y0 as f32, p.x1 as f32, p.y1 as f32);
+            let mut push = |a: Point2, b: Point2| {
+                let (points, len) = diagonal_band(a, b, width, (x0, y0, x1, y1));
+                let mut logical = [(0.0, 0.0); MAX_POLYGON_POINTS];
+                for (slot, &(x, y)) in logical.iter_mut().zip(&points[..len]) {
+                    *slot = to_logical(x, y);
+                }
+                out.shapes[out.len] = PathShape::Polygon {
+                    points: logical,
+                    len,
+                };
+                out.len += 1;
+            };
+            if rising {
+                push((x0, y1), (x1, y0));
+            }
+            if falling {
+                push((x0, y0), (x1, y1));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The band of thickness `width` around the line `a`–`b`, cut to `rect` `(x0, y0, x1, y1)`
+/// (Sutherland–Hodgman against the four edges). Points on an edge of `rect` carry its exact value.
+fn diagonal_band(
+    a: Point2,
+    b: Point2,
+    width: f32,
+    rect: (f32, f32, f32, f32),
+) -> ([Point2; MAX_POLYGON_POINTS], usize) {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let length = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+    let (ux, uy) = (dx / length, dy / length);
+    let (nx, ny) = (-uy * width / 2.0, ux * width / 2.0);
+    // Extended past both ends so the cut, not the line's end, shapes it.
+    let (ax, ay) = (a.0 - ux * length, a.1 - uy * length);
+    let (bx, by) = (b.0 + ux * length, b.1 + uy * length);
+    let mut poly = [(0.0f32, 0.0f32); 2 * MAX_POLYGON_POINTS];
+    poly[..4].copy_from_slice(&[
+        (ax - nx, ay - ny),
+        (bx - nx, by - ny),
+        (bx + nx, by + ny),
+        (ax + nx, ay + ny),
+    ]);
+    let mut len = 4;
+    // Each pass keeps the part of the polygon on the inner side of one rectangle edge.
+    for edge in 0..4 {
+        let inside = |q: Point2| match edge {
+            0 => q.0 >= rect.0,
+            1 => q.0 <= rect.2,
+            2 => q.1 >= rect.1,
+            _ => q.1 <= rect.3,
+        };
+        let cut = |p: Point2, q: Point2| -> Point2 {
+            match edge {
+                0 | 1 => {
+                    let x = if edge == 0 { rect.0 } else { rect.2 };
+                    (x, p.1 + (q.1 - p.1) * (x - p.0) / (q.0 - p.0))
+                }
+                _ => {
+                    let y = if edge == 2 { rect.1 } else { rect.3 };
+                    (p.0 + (q.0 - p.0) * (y - p.1) / (q.1 - p.1), y)
+                }
+            }
+        };
+        let mut next = [(0.0f32, 0.0f32); 2 * MAX_POLYGON_POINTS];
+        let mut n = 0;
+        for i in 0..len {
+            let (cur, prev) = (poly[i], poly[(i + len - 1) % len]);
+            if inside(cur) {
+                if !inside(prev) {
+                    next[n] = cut(prev, cur);
+                    n += 1;
+                }
+                next[n] = cur;
+                n += 1;
+            } else if inside(prev) {
+                next[n] = cut(prev, cur);
+                n += 1;
+            }
+        }
+        poly = next;
+        len = n;
+        if len == 0 {
+            break;
+        }
+    }
+    let mut out = [(0.0f32, 0.0f32); MAX_POLYGON_POINTS];
+    let len = len.min(MAX_POLYGON_POINTS);
+    out[..len].copy_from_slice(&poly[..len]);
+    (out, len)
+}
+
 /// A small fixed list of rectangles under construction.
 #[derive(Default)]
 struct Parts {
-    rects: [Option<IRect>; 16],
+    rects: [Option<IRect>; PARTS_CAP],
     len: usize,
 }
 
@@ -625,8 +1044,17 @@ impl Parts {
         }
     }
 
-    fn as_slice(&self) -> Vec<IRect> {
-        self.rects[..self.len].iter().flatten().copied().collect()
+    fn as_slice(&self) -> ([IRect; PARTS_CAP], usize) {
+        let mut out = [IRect {
+            x0: 0,
+            y0: 0,
+            x1: 0,
+            y1: 0,
+        }; PARTS_CAP];
+        for (slot, part) in out.iter_mut().zip(self.rects[..self.len].iter().flatten()) {
+            *slot = *part;
+        }
+        (out, self.len)
     }
 }
 
@@ -785,16 +1213,64 @@ fn double_parts(c: &Connections, p: &IRect, light: i32, out: &mut Parts) {
         hi: on(c.down),
         double: dbl(c.up, c.down),
     };
-    let mut lines = Vec::with_capacity(8);
     // Horizontal lines: p-axis = x, s-axis = y.
+    let mut lines = Lines::default();
     axis_lines((p.x0, p.x1), (p.y0, p.y1), light, h, v, &mut lines);
-    for (p0, s0, p1, s1) in lines.drain(..) {
+    for &(p0, s0, p1, s1) in lines.as_slice() {
         out.push(p0, s0, p1, s1);
     }
     // Vertical lines: p-axis = y, s-axis = x; swap back when emitting.
+    let mut lines = Lines::default();
     axis_lines((p.y0, p.y1), (p.x0, p.x1), light, v, h, &mut lines);
-    for (p0, s0, p1, s1) in lines.drain(..) {
+    for &(p0, s0, p1, s1) in lines.as_slice() {
         out.push(s0, p0, s1, p1);
+    }
+}
+
+/// The lines of one axis as `(p0, s0, p1, s1)`: at most two lines, each in at most two pieces.
+#[derive(Default)]
+struct Lines {
+    items: [(i32, i32, i32, i32); 4],
+    len: usize,
+}
+
+impl Lines {
+    fn push(&mut self, line: (i32, i32, i32, i32)) {
+        debug_assert!(self.len < self.items.len());
+        if self.len < self.items.len() {
+            self.items[self.len] = line;
+            self.len += 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[(i32, i32, i32, i32)] {
+        &self.items[..self.len]
+    }
+}
+
+/// One line, or the two lines of a double line, as `(start, end)` bands across an axis.
+struct Bands {
+    items: [(i32, i32); 2],
+    len: usize,
+}
+
+impl Bands {
+    fn new(lo: i32, hi: i32, t: i32, double: bool) -> Self {
+        if double {
+            Self {
+                items: double_bands(lo, hi, t),
+                len: 2,
+            }
+        } else {
+            Self {
+                items: [band(lo, hi, t); 2],
+                len: 1,
+            }
+        }
+    }
+
+    fn as_slice(&self) -> &[(i32, i32)] {
+        &self.items[..self.len]
     }
 }
 
@@ -810,28 +1286,14 @@ fn double_parts(c: &Connections, p: &IRect, light: i32, out: &mut Parts) {
 ///   single arm meeting a double line stops against the nearer line of a through pair (╟) or runs to the
 ///   far line of a corner (╓); two double lines at a corner pair up inner-to-inner and outer-to-outer
 ///   (╔), and at a T the arm runs to the line of the through pair nearer to it (╠).
-fn axis_lines(
-    p: (i32, i32),
-    s: (i32, i32),
-    t: i32,
-    me: Axis,
-    other: Axis,
-    out: &mut Vec<(i32, i32, i32, i32)>,
-) {
+fn axis_lines(p: (i32, i32), s: (i32, i32), t: i32, me: Axis, other: Axis, out: &mut Lines) {
     if !me.lo && !me.hi {
         // No arm on this axis: there is nothing to draw (the other axis' lines are handled by its call).
         return;
     }
-    let rows: Vec<(i32, i32)> = if me.double {
-        double_bands(s.0, s.1, t).to_vec()
-    } else {
-        vec![band(s.0, s.1, t)]
-    };
-    let cols: Vec<(i32, i32)> = if other.double {
-        double_bands(p.0, p.1, t).to_vec()
-    } else {
-        vec![band(p.0, p.1, t)]
-    };
+    let rows = Bands::new(s.0, s.1, t, me.double);
+    let cols = Bands::new(p.0, p.1, t, other.double);
+    let (rows, cols) = (rows.as_slice(), cols.as_slice());
     let (n, m) = (rows.len(), cols.len());
     let has_other = other.lo || other.hi;
     let through = me.lo && me.hi;
@@ -909,12 +1371,15 @@ fn axis_lines(
 /// every rectangle edge, covered cells are collected row by row into runs, and a run directly above one
 /// with the same extent is merged into it.
 fn normalize(input: &[IRect]) -> NormalizedRects {
-    let mut xs: Vec<i32> = input.iter().flat_map(|r| [r.x0, r.x1]).collect();
-    let mut ys: Vec<i32> = input.iter().flat_map(|r| [r.y0, r.y1]).collect();
-    xs.sort_unstable();
-    xs.dedup();
-    ys.sort_unstable();
-    ys.dedup();
+    let mut xs = Coordinates::default();
+    let mut ys = Coordinates::default();
+    for r in input {
+        xs.insert(r.x0);
+        xs.insert(r.x1);
+        ys.insert(r.y0);
+        ys.insert(r.y1);
+    }
+    let (xs, ys) = (xs.as_slice(), ys.as_slice());
     let covered = |i: usize, j: usize| {
         input
             .iter()
@@ -944,27 +1409,69 @@ fn normalize(input: &[IRect]) -> NormalizedRects {
     out
 }
 
-/// The result of [`normalize`].
+/// The distinct coordinates of one axis, kept sorted, in a fixed array (two per rectangle at most).
 #[derive(Default)]
+struct Coordinates {
+    values: [i32; 2 * PARTS_CAP],
+    len: usize,
+}
+
+impl Coordinates {
+    fn insert(&mut self, value: i32) {
+        match self.values[..self.len].binary_search(&value) {
+            Ok(_) => {}
+            Err(at) if self.len < self.values.len() => {
+                self.values.copy_within(at..self.len, at + 1);
+                self.values[at] = value;
+                self.len += 1;
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn as_slice(&self) -> &[i32] {
+        &self.values[..self.len]
+    }
+}
+
+/// The result of [`normalize`]: at most [`MAX_RECTS`] rectangles on the stack.
 struct NormalizedRects {
-    rects: Vec<IRect>,
+    rects: [IRect; MAX_RECTS],
+    len: usize,
+}
+
+impl Default for NormalizedRects {
+    fn default() -> Self {
+        Self {
+            rects: [IRect {
+                x0: 0,
+                y0: 0,
+                x1: 0,
+                y1: 0,
+            }; MAX_RECTS],
+            len: 0,
+        }
+    }
 }
 
 impl NormalizedRects {
     fn add_run(&mut self, run: IRect) {
-        if let Some(above) = self
-            .rects
+        if let Some(above) = self.rects[..self.len]
             .iter_mut()
             .find(|r| r.x0 == run.x0 && r.x1 == run.x1 && r.y1 == run.y0)
         {
             above.y1 = run.y1;
         } else {
-            self.rects.push(run);
+            debug_assert!(self.len < MAX_RECTS);
+            if self.len < MAX_RECTS {
+                self.rects[self.len] = run;
+                self.len += 1;
+            }
         }
     }
 
     fn as_slice(&self) -> &[IRect] {
-        &self.rects
+        &self.rects[..self.len]
     }
 }
 
@@ -1014,12 +1521,11 @@ mod tests {
             assert!(is_builtin(ch), "{ch:?}");
             assert!(glyph_rects(ch, &grid(8.0, 16.0, 1.0), 0, 0).is_some());
         }
-        // Everything else keeps using the font: other blocks, shades, heavy / double / dashed /
-        // rounded / diagonal lines, mixed-weight lines, Powerline and ordinary text.
+        // Everything else keeps using the font: shades, Powerline and
+        // ordinary text.
         for ch in [
-            'a', ' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{25A0}', '\u{25FE}', '\u{2504}',
-            '\u{250B}', '\u{254C}', '\u{254F}', '\u{256D}', '\u{2570}', '\u{2571}', '\u{2573}',
-            '\u{E0B0}', '\u{3042}', '\0',
+            'a', ' ', '\u{2591}', '\u{2592}', '\u{2593}', '\u{25A0}', '\u{25FE}', '\u{E0B0}',
+            '\u{3042}', '\0',
         ] {
             assert!(!is_builtin(ch), "{ch:?}");
             assert!(
@@ -2278,7 +2784,12 @@ mod tests {
 
     #[test]
     fn the_unsupported_ranges_stay_with_the_font() {
-        let supported: Vec<char> = NAMES.iter().map(|&(c, _)| c).collect();
+        let supported: Vec<char> = NAMES
+            .iter()
+            .map(|&(c, _)| c)
+            .chain(DASH_NAMES.iter().map(|&(c, _)| c))
+            .chain(PATH_NAMES.iter().map(|&(c, _)| c))
+            .collect();
         let mut unsupported = 0;
         for cp in 0x2500u32..=0x257F {
             let ch = char::from_u32(cp).unwrap();
@@ -2289,8 +2800,8 @@ mod tests {
                 assert!(box_connections(ch).is_none() && !is_builtin(ch), "{cp:04X}");
             }
         }
-        // 8 dashes + 4 dashes + 4 arcs + 3 diagonals.
-        assert_eq!(unsupported, 19);
+        // Every code point of the block is drawn here now.
+        assert_eq!(unsupported, 0);
         assert_eq!(unsupported + supported.len(), 128);
     }
 
@@ -2909,6 +3420,846 @@ mod tests {
             let horiz = 3 * t * (cols[2] + t - cols[0]);
             let vert = 3 * t * (rows[2] + t - rows[0]);
             assert_eq!(drawn, horiz + vert - 9 * t * t, "{w}x{h}@{s}: area");
+        }
+    }
+
+    /// The Unicode names of the twelve dashed lines, written out independently of `DASH_TABLE`.
+    const DASH_NAMES: [(char, &str); 12] = [
+        ('\u{2504}', "BOX DRAWINGS LIGHT TRIPLE DASH HORIZONTAL"),
+        ('\u{2505}', "BOX DRAWINGS HEAVY TRIPLE DASH HORIZONTAL"),
+        ('\u{2506}', "BOX DRAWINGS LIGHT TRIPLE DASH VERTICAL"),
+        ('\u{2507}', "BOX DRAWINGS HEAVY TRIPLE DASH VERTICAL"),
+        ('\u{2508}', "BOX DRAWINGS LIGHT QUADRUPLE DASH HORIZONTAL"),
+        ('\u{2509}', "BOX DRAWINGS HEAVY QUADRUPLE DASH HORIZONTAL"),
+        ('\u{250A}', "BOX DRAWINGS LIGHT QUADRUPLE DASH VERTICAL"),
+        ('\u{250B}', "BOX DRAWINGS HEAVY QUADRUPLE DASH VERTICAL"),
+        ('\u{254C}', "BOX DRAWINGS LIGHT DOUBLE DASH HORIZONTAL"),
+        ('\u{254D}', "BOX DRAWINGS HEAVY DOUBLE DASH HORIZONTAL"),
+        ('\u{254E}', "BOX DRAWINGS LIGHT DOUBLE DASH VERTICAL"),
+        ('\u{254F}', "BOX DRAWINGS HEAVY DOUBLE DASH VERTICAL"),
+    ];
+
+    /// Reads a dashed line's name: weight, dash count word and direction.
+    fn parse_dash_name(name: &str) -> Dashed {
+        let words: Vec<&str> = name.split(' ').collect();
+        assert_eq!(&words[..2], ["BOX", "DRAWINGS"], "{name}");
+        assert_eq!(words[4], "DASH", "{name}");
+        Dashed {
+            heavy: match words[2] {
+                "LIGHT" => false,
+                "HEAVY" => true,
+                other => panic!("{name}: {other}"),
+            },
+            count: match words[3] {
+                "DOUBLE" => 2,
+                "TRIPLE" => 3,
+                "QUADRUPLE" => 4,
+                other => panic!("{name}: {other}"),
+            },
+            vertical: match words[5] {
+                "HORIZONTAL" => false,
+                "VERTICAL" => true,
+                other => panic!("{name}: {other}"),
+            },
+        }
+    }
+
+    #[test]
+    fn every_dash_entry_matches_its_unicode_name() {
+        assert_eq!(DASH_TABLE.len(), 12);
+        assert!(DASH_TABLE.windows(2).all(|w| w[0].0 < w[1].0), "sorted");
+        for (ch, name) in DASH_NAMES {
+            assert_eq!(dashed(ch), Some(parse_dash_name(name)), "{ch:?} {name}");
+            assert!(is_builtin(ch), "{ch:?}");
+            assert!(box_connections(ch).is_none(), "{ch:?}");
+        }
+        // Neighbours of the two ranges are not dashes.
+        for ch in ['\u{2503}', '\u{250C}', '\u{254B}', '\u{2550}', 'a', '-'] {
+            assert!(dashed(ch).is_none(), "{ch:?}");
+        }
+        assert!(Dashed::from_code("h5l").is_none() && Dashed::from_code("x3l").is_none());
+    }
+
+    /// The lit pixels along the line of `ch` repeated over `cells` cells, as one run of booleans, and the
+    /// cross-axis pixels of the line.
+    fn dash_pattern(ch: char, g: &CellGrid, cells: i32) -> (Vec<bool>, Vec<usize>) {
+        let vertical =
+            matches!(ch, '\u{2502}' | '\u{2503}') || dashed(ch).is_some_and(|d| d.vertical);
+        let text: Vec<String> = if vertical {
+            (0..cells).map(|_| ch.to_string()).collect()
+        } else {
+            vec![ch.to_string().repeat(cells as usize)]
+        };
+        let rows: Vec<&str> = text.iter().map(String::as_str).collect();
+        let raster = draw(&rows, g);
+        let (along, across) = if vertical {
+            (raster.h, raster.w)
+        } else {
+            (raster.w, raster.h)
+        };
+        let lit = |a: usize, c: usize| {
+            if vertical {
+                raster.at(c, a) > 0
+            } else {
+                raster.at(a, c) > 0
+            }
+        };
+        let cross: Vec<usize> = (0..across)
+            .filter(|&c| (0..along).any(|a| lit(a, c)))
+            .collect();
+        let first = cross[0];
+        let end = if vertical {
+            (g.y_edge(cells) * g.scale).round() as usize
+        } else {
+            (g.x_edge(cells) * g.scale).round() as usize
+        };
+        ((0..end).map(|a| lit(a, first)).collect(), cross)
+    }
+
+    /// The pattern as `#` and `.` for a golden comparison.
+    fn dash_text(bits: &[bool]) -> String {
+        bits.iter().map(|&b| if b { '#' } else { '.' }).collect()
+    }
+
+    #[test]
+    fn dashed_lines_match_the_reference_drawings() {
+        // An 11 × 15 pixel cell: light lines are 1 px, heavy ones 2 px, centred at x = 5 / y = 7.
+        let g = grid(11.0, 15.0, 1.0);
+        let (bits, cross) = dash_pattern('\u{2504}', &g, 1);
+        assert_eq!(dash_text(&bits), "###.##.###."); // triple: segments 4, 3, 4; gaps of 1
+        assert_eq!(cross, [7]);
+        let (bits, _) = dash_pattern('\u{2508}', &g, 1);
+        assert_eq!(dash_text(&bits), "##.##.#.##."); // quadruple: segments 3, 3, 2, 3
+        let (bits, _) = dash_pattern('\u{254C}', &g, 1);
+        assert_eq!(dash_text(&bits), ".####..###."); // double: segments 6, 5; gaps of 2
+        let (bits, cross) = dash_pattern('\u{2505}', &g, 1);
+        assert_eq!(dash_text(&bits), "###.##.###.");
+        assert_eq!(cross, [7, 8]);
+        // Vertical, 15 px tall: triple is three segments of 5 with gaps of 2; the line is at x = 5.
+        let (bits, cross) = dash_pattern('\u{2506}', &g, 1);
+        assert_eq!(dash_text(&bits), ".###..###..###.");
+        assert_eq!(cross, [5]);
+        let (bits, cross) = dash_pattern('\u{2507}', &g, 1);
+        assert_eq!(dash_text(&bits), ".###..###..###.");
+        assert_eq!(cross, [5, 6]);
+        // Quadruple: segments 4, 4, 3, 4 (round(15 i / 4) = 4, 8, 11, 15), gaps of 1.
+        let (bits, _) = dash_pattern('\u{250A}', &g, 1);
+        assert_eq!(dash_text(&bits), "###.###.##.###.");
+        // Double: segments 8 and 7 with gaps of 3 and 2 px, split smaller half first.
+        let (bits, _) = dash_pattern('\u{254E}', &g, 1);
+        assert_eq!(dash_text(&bits), ".#####...#####.");
+    }
+
+    #[test]
+    fn a_dashed_line_has_its_count_of_dashes_and_gaps_in_every_cell_size() {
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            for (ch, name) in DASH_NAMES {
+                let spec = parse_dash_name(name);
+                let (bits, cross) = dash_pattern(ch, &g, 4);
+                let light = g.light_stroke_phys() as usize;
+                let thickness = if spec.heavy { 2 * light } else { light };
+                assert_eq!(cross.len(), thickness, "{w}x{h}@{s} {ch:?}: thickness");
+                // The same centre as the solid line of the same direction and weight.
+                let solid = if spec.vertical {
+                    if spec.heavy { '\u{2503}' } else { '\u{2502}' }
+                } else if spec.heavy {
+                    '\u{2501}'
+                } else {
+                    '\u{2500}'
+                };
+                let (solid_bits, solid_across) = dash_pattern(solid, &g, 4);
+                assert!(solid_bits.iter().all(|&b| b), "solid line is unbroken");
+                assert_eq!(cross, solid_across, "{w}x{h}@{s} {ch:?}: centre");
+
+                // Runs of lit pixels, per cell.
+                let cell_edges: Vec<usize> = (0..=4)
+                    .map(|i| {
+                        let e = if spec.vertical {
+                            g.y_edge(i)
+                        } else {
+                            g.x_edge(i)
+                        };
+                        (e * g.scale).round() as usize
+                    })
+                    .collect();
+                let mut runs = Vec::new();
+                let mut i = 0;
+                while i < bits.len() {
+                    if bits[i] {
+                        let start = i;
+                        while i < bits.len() && bits[i] {
+                            i += 1;
+                        }
+                        runs.push((start, i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                // A cell shorter than its dashes need is solid, and merges with a dashed neighbour.
+                let needed = (2 * spec.count) as usize;
+                let lengths: Vec<usize> =
+                    (0..4).map(|i| cell_edges[i + 1] - cell_edges[i]).collect();
+                let dashed_cell = |i: usize| lengths[i] >= needed;
+                for cell in 0..4 {
+                    let solid_neighbour = (cell > 0 && !dashed_cell(cell - 1))
+                        || (cell < 3 && !dashed_cell(cell + 1));
+                    if !dashed_cell(cell) || solid_neighbour {
+                        continue;
+                    }
+                    let inside: Vec<_> = runs
+                        .iter()
+                        .filter(|r| r.0 >= cell_edges[cell] && r.1 <= cell_edges[cell + 1])
+                        .collect();
+                    assert_eq!(
+                        inside.len() as i32,
+                        spec.count,
+                        "{w}x{h}@{s} {ch:?}: dashes in cell {cell}"
+                    );
+                }
+                if (0..4).all(dashed_cell) {
+                    // Gaps (including the one across each cell boundary) are at least one pixel,
+                    // and the dashes cover most of the line.
+                    for pair in runs.windows(2) {
+                        assert!(pair[1].0 > pair[0].1, "{w}x{h}@{s} {ch:?}: touching dashes");
+                    }
+                    let lit = bits.iter().filter(|&&b| b).count() as f32;
+                    let share = lit / (cell_edges[4] - cell_edges[0]) as f32;
+                    if lengths.iter().all(|&l| l >= 10) {
+                        assert!(
+                            (0.5..=0.9).contains(&share),
+                            "{w}x{h}@{s} {ch:?}: lit share {share}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn identical_dashed_cells_form_one_regular_pattern_across_the_boundary() {
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            for (ch, _) in DASH_NAMES {
+                let (bits, _) = dash_pattern(ch, &g, 6);
+                let edge_of = |i: i32| {
+                    let spec = dashed(ch).unwrap();
+                    let e = if spec.vertical {
+                        g.y_edge(i)
+                    } else {
+                        g.x_edge(i)
+                    };
+                    (e * g.scale).round() as usize
+                };
+                for cell in 1..5 {
+                    let b = edge_of(cell);
+                    // Gap that straddles the boundary: the unlit pixels around it.
+                    let mut gap = 0;
+                    let mut at = b;
+                    while at > 0 && !bits[at - 1] {
+                        at -= 1;
+                        gap += 1;
+                    }
+                    let mut at = b;
+                    while at < bits.len() && !bits[at] {
+                        at += 1;
+                        gap += 1;
+                    }
+                    let length = edge_of(cell + 1) - b;
+                    let previous = b - edge_of(cell - 1);
+                    let needed = 2 * dashed(ch).unwrap().count as usize;
+                    if length >= needed && previous >= needed {
+                        assert!((1..=length).contains(&gap), "{w}x{h}@{s} {ch:?}: gap {gap}");
+                        assert!(gap <= length / 2 + 1, "{w}x{h}@{s} {ch:?}: gap {gap}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cell_too_short_for_its_dashes_draws_the_solid_line() {
+        // Four dashes need at least 8 px, three need 6 and two need 4.
+        for (ch, length_ok, length_short) in [
+            ('\u{2508}', 8.0, 7.0),
+            ('\u{2504}', 6.0, 5.0),
+            ('\u{254C}', 4.0, 3.0),
+        ] {
+            let ok = glyph_rects(ch, &grid(length_ok, 15.0, 1.0), 0, 0).unwrap();
+            let short = glyph_rects(ch, &grid(length_short, 15.0, 1.0), 0, 0).unwrap();
+            assert_eq!(
+                ok.as_slice().len() as i32,
+                dashed(ch).unwrap().count,
+                "{ch:?}"
+            );
+            assert_eq!(short.as_slice().len(), 1, "{ch:?}");
+            assert_eq!(
+                short.as_slice()[0].width(),
+                length_short,
+                "{ch:?}: whole width"
+            );
+        }
+        // The vertical ones follow the height.
+        let short = glyph_rects('\u{2506}', &grid(8.0, 5.0, 1.0), 0, 0).unwrap();
+        assert_eq!(short.as_slice().len(), 1);
+        assert_eq!(short.as_slice()[0].height(), 5.0);
+        let ok = glyph_rects('\u{2506}', &grid(8.0, 6.0, 1.0), 0, 0).unwrap();
+        assert_eq!(ok.as_slice().len(), 3);
+    }
+
+    #[test]
+    fn dashed_lines_stay_on_the_pixel_grid_inside_the_cell_in_every_size() {
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            for (ch, _) in DASH_NAMES {
+                for (col, line) in [(0, 0), (5, 3), (20, 11)] {
+                    let cell = g.cell(col, line);
+                    let rects = glyph_rects(ch, &g, col, line).unwrap();
+                    assert!(rects.as_slice().len() <= 4);
+                    let mut raster = Raster::new(
+                        (g.x_edge(col + 1) * s).round() as usize + 2,
+                        (g.y_edge(line + 1) * s).round() as usize + 2,
+                    );
+                    for r in rects.as_slice() {
+                        assert!(r.x0 >= cell.x0 && r.x1 <= cell.x1, "{ch:?}");
+                        assert!(r.y0 >= cell.y0 && r.y1 <= cell.y1, "{ch:?}");
+                        for v in [
+                            r.x0 + g.origin_x,
+                            r.x1 + g.origin_x,
+                            r.y0 + g.origin_y,
+                            r.y1 + g.origin_y,
+                        ] {
+                            let phys = v * s;
+                            assert!((phys - phys.round()).abs() < 1e-3, "{ch:?}: {v}");
+                        }
+                        raster.paint(r, s);
+                    }
+                    assert!(raster.px.iter().all(|&n| n <= 1), "{ch:?}: overlap");
+                }
+            }
+        }
+    }
+
+    /// The Unicode names of the seven curve and diagonal characters, independent of `PATH_TABLE`.
+    const PATH_NAMES: [(char, &str); 7] = [
+        ('\u{256D}', "BOX DRAWINGS LIGHT ARC DOWN AND RIGHT"),
+        ('\u{256E}', "BOX DRAWINGS LIGHT ARC DOWN AND LEFT"),
+        ('\u{256F}', "BOX DRAWINGS LIGHT ARC UP AND LEFT"),
+        ('\u{2570}', "BOX DRAWINGS LIGHT ARC UP AND RIGHT"),
+        (
+            '\u{2571}',
+            "BOX DRAWINGS LIGHT DIAGONAL UPPER RIGHT TO LOWER LEFT",
+        ),
+        (
+            '\u{2572}',
+            "BOX DRAWINGS LIGHT DIAGONAL UPPER LEFT TO LOWER RIGHT",
+        ),
+        ('\u{2573}', "BOX DRAWINGS LIGHT DIAGONAL CROSS"),
+    ];
+
+    fn parse_path_name(name: &str) -> PathGlyph {
+        if name.contains(" ARC ") {
+            let words: Vec<&str> = name.split(' ').collect();
+            // "... ARC <vertical> AND <horizontal>"
+            let at = words.iter().position(|w| *w == "ARC").unwrap();
+            PathGlyph::Arc {
+                down: words[at + 1] == "DOWN",
+                right: words[at + 4 - 1] == "RIGHT",
+            }
+        } else if name.ends_with("CROSS") {
+            PathGlyph::Diagonal {
+                rising: true,
+                falling: true,
+            }
+        } else {
+            // "DIAGONAL UPPER RIGHT TO LOWER LEFT" rises; "UPPER LEFT TO LOWER RIGHT" falls.
+            let rising = name.ends_with("UPPER RIGHT TO LOWER LEFT");
+            assert!(
+                rising || name.ends_with("UPPER LEFT TO LOWER RIGHT"),
+                "{name}"
+            );
+            PathGlyph::Diagonal {
+                rising,
+                falling: !rising,
+            }
+        }
+    }
+
+    #[test]
+    fn every_path_entry_matches_its_unicode_name() {
+        assert_eq!(PATH_TABLE.len(), 7);
+        assert!(PATH_TABLE.windows(2).all(|w| w[0].0 < w[1].0), "sorted");
+        for (ch, name) in PATH_NAMES {
+            assert_eq!(path_glyph(ch), Some(parse_path_name(name)), "{ch:?} {name}");
+            assert!(is_builtin(ch), "{ch:?}");
+            assert!(
+                box_connections(ch).is_none() && dashed(ch).is_none(),
+                "{ch:?}"
+            );
+        }
+        for ch in ['\u{256C}', '\u{2574}', '\u{2591}', 'a', '/'] {
+            assert!(path_glyph(ch).is_none(), "{ch:?}");
+        }
+        assert!(PathGlyph::from_code("aru").is_some());
+        assert!(PathGlyph::from_code("azu").is_none() && PathGlyph::from_code("x12").is_none());
+    }
+
+    #[test]
+    fn all_128_box_drawing_code_points_are_now_built_in() {
+        let (mut solid, mut dashes, mut paths_n) = (0, 0, 0);
+        for cp in 0x2500u32..=0x257F {
+            let ch = char::from_u32(cp).unwrap();
+            assert!(is_builtin(ch), "{cp:04X}");
+            let rects = glyph_rects(ch, &grid(11.0, 15.0, 1.0), 0, 0).is_some();
+            let paths = glyph_paths(ch, &grid(11.0, 15.0, 1.0), 0, 0).is_some();
+            assert!(rects != paths, "{cp:04X}: drawn as rectangles xor paths");
+            if paths {
+                paths_n += 1;
+            } else if dashed(ch).is_some() {
+                dashes += 1;
+            } else {
+                solid += 1;
+            }
+        }
+        // 109 solid + 12 dashed + 7 paths.
+        assert_eq!((solid, dashes, paths_n), (109, 12, 7));
+    }
+
+    fn physical(p: Point2, g: &CellGrid) -> (f32, f32) {
+        ((p.0 + g.origin_x) * g.scale, (p.1 + g.origin_y) * g.scale)
+    }
+
+    /// A point of a cubic Bézier curve.
+    fn bezier(from: Point2, c1: Point2, c2: Point2, to: Point2, t: f32) -> Point2 {
+        let u = 1.0 - t;
+        let f = |a: f32, b: f32, c: f32, d: f32| {
+            u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+        };
+        (f(from.0, c1.0, c2.0, to.0), f(from.1, c1.1, c2.1, to.1))
+    }
+
+    fn the_curve(
+        ch: char,
+        g: &CellGrid,
+        col: i32,
+        line: i32,
+    ) -> (Point2, Point2, Point2, Point2, f32) {
+        match glyph_paths(ch, g, col, line).unwrap().as_slice() {
+            [
+                PathShape::Curve {
+                    from,
+                    ctrl1,
+                    ctrl2,
+                    to,
+                    width,
+                },
+            ] => (*from, *ctrl1, *ctrl2, *to, *width),
+            other => panic!("{ch:?}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_arc_joins_the_straight_lines_at_the_middle_of_their_bands() {
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            for (ch, name) in &PATH_NAMES[..4] {
+                let PathGlyph::Arc { right, down } = parse_path_name(name) else {
+                    unreachable!()
+                };
+                let cell = g.cell(3, 4);
+                let p = g.phys(cell);
+                if arc_too_small(&p) {
+                    continue;
+                }
+                let (from, c1, c2, to, width) = the_curve(*ch, &g, 3, 4);
+                // The straight lines the arc continues, in this same cell and column / row.
+                let vertical = glyph_rects('\u{2502}', &g, 3, 4).unwrap().as_slice()[0];
+                let horizontal = glyph_rects('\u{2500}', &g, 3, 4).unwrap().as_slice()[0];
+                let (vx, hy) = (
+                    (vertical.x0 + vertical.x1) / 2.0,
+                    (horizontal.y0 + horizontal.y1) / 2.0,
+                );
+                let edge_y = if down { cell.y1 } else { cell.y0 };
+                let edge_x = if right { cell.x1 } else { cell.x0 };
+                let eps = 1e-3;
+                assert_eq!(
+                    from.1, edge_y,
+                    "{w}x{h}@{s} {ch:?}: starts on the cell edge"
+                );
+                assert_eq!(to.0, edge_x, "{w}x{h}@{s} {ch:?}: ends on the cell edge");
+                assert!(
+                    (from.0 - vx).abs() < eps,
+                    "{w}x{h}@{s} {ch:?}: x of the vertical band"
+                );
+                assert!(
+                    (to.1 - hy).abs() < eps,
+                    "{w}x{h}@{s} {ch:?}: y of the horizontal band"
+                );
+                // Leaves along the lines: vertical tangent at the start, horizontal at the end.
+                assert_eq!(c1.0, from.0, "{ch:?}");
+                assert_eq!(c2.1, to.1, "{ch:?}");
+                let light = g.light_stroke_phys() as f32 / s;
+                assert!(
+                    (width - light).abs() < eps,
+                    "{w}x{h}@{s} {ch:?}: width {width} vs {light}"
+                );
+                assert_eq!(g.stroke(LineStyle::Light), width, "{ch:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_arc_and_its_stroke_never_leave_the_cell() {
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            for (ch, _) in &PATH_NAMES[..4] {
+                for (col, line) in [(0, 0), (5, 3), (20, 11)] {
+                    if arc_too_small(&g.phys(g.cell(col, line))) {
+                        continue;
+                    }
+                    let cell = g.cell(col, line);
+                    let (from, c1, c2, to, width) = the_curve(*ch, &g, col, line);
+                    for i in 0..=64 {
+                        let t = i as f32 / 64.0;
+                        let (x, y) = bezier(from, c1, c2, to, t);
+                        // The stroke is `width` wide across the centreline: the points half a width to
+                        // either side along the normal must stay in the cell (the ends are flat).
+                        let (ahead, behind) = (
+                            bezier(from, c1, c2, to, (t + 1e-3).min(1.0)),
+                            bezier(from, c1, c2, to, (t - 1e-3).max(0.0)),
+                        );
+                        let (dx, dy) = (ahead.0 - behind.0, ahead.1 - behind.1);
+                        let norm = (dx * dx + dy * dy).sqrt();
+                        let half = width / 2.0;
+                        let (nx, ny) = (-dy / norm * half, dx / norm * half);
+                        // The normal comes from a finite difference: allow a hundredth of a pixel.
+                        let tol = 0.01 / s;
+                        for sign in [-1.0, 1.0] {
+                            let (qx, qy) = (x + sign * nx, y + sign * ny);
+                            assert!(
+                                qx >= cell.x0 - tol && qx <= cell.x1 + tol,
+                                "{w}x{h}@{s} {ch:?} t={t}: x {qx} vs {}..{}",
+                                cell.x0,
+                                cell.x1
+                            );
+                            assert!(
+                                qy >= cell.y0 - tol && qy <= cell.y1 + tol,
+                                "{w}x{h}@{s} {ch:?} t={t}: y {qy} vs {}..{}",
+                                cell.y0,
+                                cell.y1
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_four_arcs_are_reflections_of_each_other() {
+        // On an even cell with even strokes the bands are symmetric, so ╭ mirrored across the vertical
+        // axis is ╮ and across the horizontal axis ╰ (within a physical pixel in general).
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            let cell = g.cell(2, 2);
+            if arc_too_small(&g.phys(cell)) {
+                continue;
+            }
+            let (cx, cy) = ((cell.x0 + cell.x1) / 2.0, (cell.y0 + cell.y1) / 2.0);
+            let tl = the_curve('\u{256D}', &g, 2, 2);
+            let tr = the_curve('\u{256E}', &g, 2, 2);
+            let bl = the_curve('\u{2570}', &g, 2, 2);
+            let br = the_curve('\u{256F}', &g, 2, 2);
+            let one_pixel = 1.0 / s + 1e-3;
+            for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let at = |c: (Point2, Point2, Point2, Point2, f32)| bezier(c.0, c.1, c.2, c.3, t);
+                let (a, b, c, d) = (at(tl), at(tr), at(bl), at(br));
+                assert!(
+                    ((a.0 - cx) + (b.0 - cx)).abs() <= one_pixel,
+                    "{w}x{h}@{s}: ╭╮ x"
+                );
+                assert!((a.1 - b.1).abs() <= one_pixel, "{w}x{h}@{s}: ╭╮ y");
+                assert!(
+                    ((a.1 - cy) + (c.1 - cy)).abs() <= one_pixel,
+                    "{w}x{h}@{s}: ╭╰ y"
+                );
+                assert!((a.0 - c.0).abs() <= one_pixel, "{w}x{h}@{s}: ╭╰ x");
+                assert!(
+                    ((d.0 - cx) + (c.0 - cx)).abs() <= one_pixel,
+                    "{w}x{h}@{s}: ╯╰ x"
+                );
+                assert!((d.1 - c.1).abs() <= one_pixel, "{w}x{h}@{s}: ╯╰ y");
+            }
+        }
+    }
+
+    #[test]
+    fn an_arc_bulges_toward_the_outside_of_its_corner() {
+        let g = grid(12.0, 24.0, 1.0);
+        let cell = g.cell(0, 0);
+        let (from, c1, c2, to, _) = the_curve('\u{256D}', &g, 0, 0);
+        // ╭ has its arms to the right and down: the mid point is up and left of the straight corner's
+        // inner side, i.e. closer to the cell corner than the chord from start to end.
+        let mid = bezier(from, c1, c2, to, 0.5);
+        let chord = ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0);
+        assert!(
+            mid.0 < chord.0 && mid.1 < chord.1,
+            "{mid:?} vs chord {chord:?}"
+        );
+        let _ = cell;
+        let (rx, ry) = (to.0 - from.0, from.1 - to.1);
+        // On a quarter ellipse about the corner side the mid point lies at normalised radius 1.
+        let centre = (to.0, from.1); // centre of curvature: the cell corner side
+        let radius_at_mid =
+            (((mid.0 - centre.0) / rx).powi(2) + ((mid.1 - centre.1) / ry).powi(2)).sqrt();
+        assert!(
+            (radius_at_mid - 1.0).abs() < 0.01,
+            "ellipse radius at the mid point: {radius_at_mid}"
+        );
+    }
+
+    /// Area of a polygon (shoelace).
+    fn polygon_area(points: &[Point2]) -> f32 {
+        let mut sum = 0.0;
+        for i in 0..points.len() {
+            let (a, b) = (points[i], points[(i + 1) % points.len()]);
+            sum += a.0 * b.1 - b.0 * a.1;
+        }
+        sum.abs() / 2.0
+    }
+
+    /// Whether `q` is inside or on the edge of the convex polygon `points`.
+    fn inside_convex(points: &[Point2], q: Point2) -> bool {
+        let mut sign = 0.0f32;
+        for i in 0..points.len() {
+            let (a, b) = (points[i], points[(i + 1) % points.len()]);
+            let cross = (b.0 - a.0) * (q.1 - a.1) - (b.1 - a.1) * (q.0 - a.0);
+            if cross.abs() < 1e-3 {
+                continue;
+            }
+            if sign == 0.0 {
+                sign = cross.signum();
+            } else if sign != cross.signum() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn the_polygons(ch: char, g: &CellGrid, col: i32, line: i32) -> Vec<Vec<Point2>> {
+        glyph_paths(ch, g, col, line)
+            .unwrap()
+            .as_slice()
+            .iter()
+            .map(|s| {
+                assert!(matches!(s, PathShape::Polygon { .. }), "{ch:?}");
+                s.polygon_points().to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_diagonal_is_the_band_around_the_line_between_opposite_corners() {
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            let cell = g.cell(3, 2);
+            let (cw, ch_) = (cell.width() * s, cell.height() * s);
+            let light = g.light_stroke_phys() as f32;
+            for (c, rising) in [('\u{2571}', true), ('\u{2572}', false)] {
+                let polys = the_polygons(c, &g, 3, 2);
+                assert_eq!(polys.len(), 1, "{c:?}");
+                let poly: Vec<Point2> = polys[0].iter().map(|&p| physical(p, &g)).collect();
+                // Reference: area of the pixels' sub-samples within light/2 of the line, counted on a
+                // 1/16 px grid, from the definition of distance to a line.
+                let n = 16;
+                let (ox, oy) = ((cell.x0 + g.origin_x) * s, (cell.y0 + g.origin_y) * s);
+                let norm = (cw * cw + ch_ * ch_).sqrt();
+                let mut hits = 0;
+                for iy in 0..(ch_.round() as i32 * n) {
+                    for ix in 0..(cw.round() as i32 * n) {
+                        let (x, y) = ((ix as f32 + 0.5) / n as f32, (iy as f32 + 0.5) / n as f32);
+                        let d = if rising {
+                            (x * ch_ + (y - ch_) * cw) / norm
+                        } else {
+                            (x * ch_ - y * cw) / norm
+                        };
+                        if d.abs() <= light / 2.0 {
+                            hits += 1;
+                        }
+                    }
+                }
+                let _ = (ox, oy);
+                let reference = hits as f32 / (n * n) as f32;
+                let area = polygon_area(&poly);
+                assert!(
+                    (area - reference).abs() <= 0.02 * reference + 0.05,
+                    "{w}x{h}@{s} {c:?}: area {area} vs sampled {reference}"
+                );
+                // Passes through the two corners it joins and the centre of the cell.
+                let (x0, y0, x1, y1) = (
+                    (cell.x0 + g.origin_x) * s,
+                    (cell.y0 + g.origin_y) * s,
+                    (cell.x1 + g.origin_x) * s,
+                    (cell.y1 + g.origin_y) * s,
+                );
+                let (a, b) = if rising {
+                    ((x0, y1), (x1, y0))
+                } else {
+                    ((x0, y0), (x1, y1))
+                };
+                for q in [a, b, ((x0 + x1) / 2.0, (y0 + y1) / 2.0)] {
+                    assert!(
+                        inside_convex(&poly, q),
+                        "{w}x{h}@{s} {c:?}: {q:?} not on the band"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_diagonal_never_leaves_its_cell_and_its_edge_points_are_exact() {
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            for (c, _) in &PATH_NAMES[4..] {
+                for (col, line) in [(0, 0), (5, 3), (20, 11)] {
+                    let cell = g.cell(col, line);
+                    for poly in the_polygons(*c, &g, col, line) {
+                        assert!((3..=MAX_POLYGON_POINTS).contains(&poly.len()), "{c:?}");
+                        for &(x, y) in &poly {
+                            assert!(x >= cell.x0 && x <= cell.x1, "{w}x{h}@{s} {c:?}: x {x}");
+                            assert!(y >= cell.y0 && y <= cell.y1, "{w}x{h}@{s} {c:?}: y {y}");
+                            let (px, py) = physical((x, y), &g);
+                            // Every point is on the cell border (exact) or on the band's long edges.
+                            let on_border =
+                                x == cell.x0 || x == cell.x1 || y == cell.y0 || y == cell.y1;
+                            assert!(on_border || (px.is_finite() && py.is_finite()), "{c:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diagonals_of_neighbouring_cells_meet_at_the_shared_corner() {
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            // ╱ in (2, 3) rises to its top right corner, where ╱ in (3, 2) starts.
+            let a = the_polygons('\u{2571}', &g, 2, 3).remove(0);
+            let b = the_polygons('\u{2571}', &g, 3, 2).remove(0);
+            let corner = (g.x_edge(3), g.y_edge(3));
+            assert!(
+                a.contains(&corner),
+                "{w}x{h}@{s}: ╱ ends at the corner {corner:?}: {a:?}"
+            );
+            assert!(
+                inside_convex(&b, corner),
+                "{w}x{h}@{s}: the next ╱ starts there"
+            );
+            // And a ╲ chain: (2, 2) falls to its bottom right corner, where ╲ in (3, 3) starts.
+            let a = the_polygons('\u{2572}', &g, 2, 2).remove(0);
+            let corner = (g.x_edge(3), g.y_edge(3));
+            assert!(
+                inside_convex(&a, corner),
+                "{w}x{h}@{s}: ╲ reaches the corner"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cross_is_two_diagonals_that_share_the_centre() {
+        for &(w, h, s) in &BOX_CASES {
+            let g = grid(w, h, s);
+            let rising = the_polygons('\u{2571}', &g, 1, 1).remove(0);
+            let falling = the_polygons('\u{2572}', &g, 1, 1).remove(0);
+            let both = the_polygons('\u{2573}', &g, 1, 1);
+            assert_eq!(both, vec![rising.clone(), falling.clone()], "{w}x{h}@{s}");
+            let cell = g.cell(1, 1);
+            let centre = ((cell.x0 + cell.x1) / 2.0, (cell.y0 + cell.y1) / 2.0);
+            assert!(inside_convex(&rising, centre) && inside_convex(&falling, centre));
+        }
+    }
+
+    #[test]
+    fn an_arc_in_a_cell_too_small_to_curve_is_the_light_corner() {
+        for (ch, left, right, up, down) in [
+            ('\u{256D}', false, true, false, true),
+            ('\u{256E}', true, false, false, true),
+            ('\u{256F}', true, false, true, false),
+            ('\u{2570}', false, true, true, false),
+        ] {
+            let tiny = grid(5.0, 12.0, 1.0);
+            assert!(glyph_paths(ch, &tiny, 0, 0).is_none(), "{ch:?}");
+            let rects = glyph_rects(ch, &tiny, 0, 0).expect("corner stands in");
+            let corner = Connections {
+                left: if left {
+                    LineStyle::Light
+                } else {
+                    LineStyle::None
+                },
+                right: if right {
+                    LineStyle::Light
+                } else {
+                    LineStyle::None
+                },
+                up: if up {
+                    LineStyle::Light
+                } else {
+                    LineStyle::None
+                },
+                down: if down {
+                    LineStyle::Light
+                } else {
+                    LineStyle::None
+                },
+            };
+            let expected = box_rects(&corner, &tiny, tiny.cell(0, 0));
+            assert_eq!(rects.as_slice(), expected.as_slice(), "{ch:?}");
+            // One pixel more room and it curves again.
+            let roomy = grid(6.0, 12.0, 1.0);
+            assert!(glyph_paths(ch, &roomy, 0, 0).is_some(), "{ch:?}");
+            assert!(glyph_rects(ch, &roomy, 0, 0).is_none(), "{ch:?}");
+            let short = grid(12.0, 5.0, 1.0);
+            assert!(glyph_paths(ch, &short, 0, 0).is_none(), "{ch:?}");
+        }
+        // Diagonals have no minimum.
+        assert!(glyph_paths('\u{2573}', &grid(2.0, 2.0, 1.0), 0, 0).is_some());
+    }
+
+    #[test]
+    fn paths_stay_finite_in_extreme_cells() {
+        for (w, h, s) in [
+            (1.0, 1.0, 1.0),
+            (0.3, 0.3, 1.0),
+            (4.0, 4.0, 3.0),
+            (200.0, 400.0, 1.5),
+            (9.6, 19.2, 1.25),
+        ] {
+            let g = grid(w, h, s);
+            for (c, _) in PATH_NAMES {
+                for r in glyph_paths(c, &g, 3, 7).iter().flat_map(|p| p.as_slice()) {
+                    match r {
+                        PathShape::Curve {
+                            from,
+                            ctrl1,
+                            ctrl2,
+                            to,
+                            width,
+                        } => {
+                            for v in [from, ctrl1, ctrl2, to] {
+                                assert!(v.0.is_finite() && v.1.is_finite(), "{w}x{h}@{s} {c:?}");
+                            }
+                            assert!(width.is_finite() && *width > 0.0);
+                        }
+                        PathShape::Polygon { .. } => {
+                            for v in r.polygon_points() {
+                                assert!(v.0.is_finite() && v.1.is_finite(), "{w}x{h}@{s} {c:?}");
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
