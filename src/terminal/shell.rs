@@ -1,8 +1,11 @@
 //! Shell resolution for launching terminal sessions.
 
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::env;
+use std::hash::{BuildHasher, Hasher};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Resolved shell executable and optional initial arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +60,37 @@ impl ShellConfig {
 /// Environment variable that turns Shell Integration off when set to `0`.
 pub const SHELL_INTEGRATION_ENV: &str = "KEGON_SHELL_INTEGRATION";
 
+/// Environment variable used to pass the session identifier to the shell child process.
+///
+/// ## Security & Trust Boundary Note (Phase 2A)
+/// This environment variable is NOT an authentication secret or credential.
+/// It is an internal correlation handle used to prevent cross-tab contamination,
+/// reject orphaned subshell markers, and maintain sequence monotonicity.
+pub const SESSION_ID_ENV: &str = "KEGON_SESSION_ID";
+
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Generates a unique, collision-resistant session identifier for a terminal PTY session.
+///
+/// Format: `kegon-<counter_hex>-<random_hex16><random_hex16>` (e.g. `kegon-1-0123456789abcdef0123456789abcdef`).
+///
+/// Guarantees:
+/// - Fits within `crate::terminal::osc::MAX_SID_LEN` (64 bytes).
+/// - Contains only ASCII alphanumeric characters and hyphens (`[a-zA-Z0-9_-]`).
+/// - Passes [`crate::terminal::osc::is_valid_session_id`].
+/// - Strictly distinct across multiple calls even within the same millisecond or process.
+/// - Provides per-session distributed randomness from `RandomState` entropy and an atomic counter.
+///
+/// ## Security & Trust Boundary Note (L-3)
+/// The session identifier is an internal correlation handle for tab disambiguation and subshell
+/// filtering. It is NOT an authentication token, credential, or cryptographic secret.
+pub fn generate_session_id() -> String {
+    let count = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let r1 = RandomState::new().build_hasher().finish();
+    let r2 = RandomState::new().build_hasher().finish();
+    format!("kegon-{count:x}-{r1:016x}{r2:016x}")
+}
+
 /// The shells Shell Integration knows how to make report their working directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellKind {
@@ -98,6 +132,8 @@ pub struct Launch {
     pub integrated: bool,
     /// The OSC 133 integration launch disposition for this session.
     pub integration_launch: ShellIntegrationLaunch,
+    /// The session identifier generated for this PTY session, if integration is active.
+    pub session_id: Option<String>,
 }
 
 impl Launch {
@@ -132,6 +168,7 @@ impl Launch {
             env: HashMap::new(),
             integrated: false,
             integration_launch,
+            session_id: None,
         };
         if !enabled || !config.args.is_empty() {
             return plain(config);
@@ -139,6 +176,8 @@ impl Launch {
         match shell_kind(&config.program) {
             Some(ShellKind::PowerShell) => {
                 let script = powershell_script(local_host);
+                let sid = generate_session_id();
+                let env = HashMap::from([(SESSION_ID_ENV.to_string(), sid.clone())]);
                 Self {
                     config: ShellConfig {
                         args: vec![
@@ -148,9 +187,10 @@ impl Launch {
                         ],
                         ..config
                     },
-                    env: HashMap::new(),
+                    env,
                     integrated: true,
                     integration_launch,
+                    session_id: Some(sid),
                 }
             }
             Some(ShellKind::Cmd) => {
@@ -160,10 +200,17 @@ impl Launch {
                     env: HashMap::from([("PROMPT".to_string(), prompt)]),
                     integrated: true,
                     integration_launch,
+                    session_id: None,
                 }
             }
             None => plain(config),
         }
+    }
+
+    /// Returns the session ID generated for this launch, if Shell Integration is active.
+    #[allow(dead_code)]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// Resolves a launch from user settings, honoring custom executable paths and integration toggles.
@@ -316,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn powershell_gets_an_encoded_prompt_wrapper_and_no_env() {
+    fn powershell_gets_an_encoded_prompt_wrapper_and_session_id_env() {
         for program in [
             "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
             "powershell.exe",
@@ -325,8 +372,27 @@ mod tests {
             assert!(launch.integrated);
             assert_eq!(launch.config.program, program);
             assert_eq!(launch.config.args[..2], ["-NoExit", "-EncodedCommand"]);
-            assert!(launch.env.is_empty());
+            assert_eq!(launch.env.len(), 1);
+            let sid = launch
+                .env
+                .get(SESSION_ID_ENV)
+                .expect("must contain KEGON_SESSION_ID");
+            assert!(crate::terminal::osc::is_valid_session_id(sid));
+            assert_eq!(launch.session_id(), Some(sid.as_str()));
         }
+    }
+
+    #[test]
+    fn session_id_generation_is_valid_unique_and_unpredictable() {
+        let sid1 = generate_session_id();
+        let sid2 = generate_session_id();
+        assert_ne!(sid1, sid2);
+        assert!(crate::terminal::osc::is_valid_session_id(&sid1));
+        assert!(crate::terminal::osc::is_valid_session_id(&sid2));
+        assert!(sid1.starts_with("kegon-"));
+        assert!(sid2.starts_with("kegon-"));
+        assert!(sid1.len() <= crate::terminal::osc::MAX_SID_LEN);
+        assert!(sid2.len() <= crate::terminal::osc::MAX_SID_LEN);
     }
 
     #[test]
@@ -410,6 +476,19 @@ mod tests {
         assert!(
             script.contains("PSConsoleHostReadLine"),
             "Must hook PSConsoleHostReadLine for command boundaries"
+        );
+        assert!(
+            script.contains("133;C;kegon.v=1;kegon.sid="),
+            "Must contain Scheme A OSC 133 C start marker with sid/seq"
+        );
+        // Option E independent status notification
+        assert!(
+            script.contains("1337;SetUserVar=kegon_status="),
+            "Must contain OSC 1337 status notification"
+        );
+        assert!(
+            script.contains("Seq"),
+            "Must maintain monotonic sequence state"
         );
     }
 

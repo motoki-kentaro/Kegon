@@ -297,6 +297,39 @@ Set `KEGON_SHELL_INTEGRATION=0` to disable it.
 
 **Known limit: stale directories.** A report is only as fresh as the shell's last prompt. If the user replaces the prompt (`function prompt { … }` in PowerShell, `prompt $G` in cmd) or moves into a shell without integration (for example starting `pwsh` or `bash` from inside it), reports stop and `reported_cwd` keeps the last value, so a new tab can start in a directory the user has since left. Both prompt cases are pinned by ignored tests. Detecting this reliably needs prompt boundaries (for example OSC 133 marks) so that "a prompt appeared without a report" can reset the directory to unknown; that is a separate design.
 
+## Shell Integration Lifecycle and Reported Status (Issue #63, #66)
+
+Kegon tracks the execution lifecycle of commands within shell sessions using standard FinalTerm / Semantic Prompts OSC 133 sequences (`A`, `B`, `C`, `D`), and augments this with independent shell runtime status reporting (`$?` in PowerShell) via OSC 1337 user variables.
+
+### Architecture and State Machine
+
+1. **Prompt and Input Boundaries**:
+   - `OSC 133 ; A ST`: Prompt started (rendering).
+   - `OSC 133 ; B ST`: Input line editing active.
+2. **Command Start with Correlation (Scheme A)**:
+   - When launched in Kegon (`$env:KEGON_SESSION_ID` set), PowerShell sends:
+     `OSC 133 ; C ; kegon.v=1 ; kegon.sid=<sid> ; kegon.seq=<seq> ST`
+   - In external terminals or when unconfigured, falls back to standard `OSC 133 ; C ST`.
+   - Kegon establishes `ActiveCorrelation { session_id, seq }` on the tab's `CommandStateMachine`.
+3. **Independent Status Notification (OSC 1337 SetUserVar)**:
+   - PowerShell captures `$?` immediately upon entering the `prompt` function:
+     `OSC 1337 ; SetUserVar=kegon_status=<Base64(kegon.v=1;kegon.sid=<sid>;kegon.seq=<seq>;kegon.ps=<success|failure>)> ST`
+   - The payload is parsed and verified: `(sid, seq)` must strictly match `ActiveCorrelation`.
+   - If Base64 decode or metadata parse fails, `InvalidMetadata` is emitted, marking the command cycle as corrupted and permanently preventing status revival.
+4. **Command Termination (OSC 133 D)**:
+   - PowerShell sends standard, codeless `OSC 133 ; D ST`. Kegon does not guess `$LASTEXITCODE`.
+   - `CommandExecutionResult` is constructed, distinguishing between `shell_status`, `osc133_exit`, `native_exit`, `completion`, and `correlation`.
+   - `VerifiedCommandEvent::CommandFinished { command_id, execution_result }` is emitted to the registry and UI.
+
+### Trust Boundaries and Guarantees
+
+- **PowerShell `$?` Semantics**: `$?` reports only the success or failure of the last executed operation/cmdlet. It does not provide a cryptographic or holistic guarantee for an entire compound pipeline or multi-statement block.
+- **Unauthenticated D Boundary**: Standard OSC 133 D markers carry no session credentials or cryptographic signatures. An arbitrary child process writing `\x1b]133;D\x07` to stdout cannot be prevented at the byte-stream level. However, Kegon enforces that without matching `(sid, seq)` metadata, status is strictly relegated to `Unknown` / `Mismatched`, preventing malicious status spoofing.
+- **Session ID (`SID`) Trust Model**: `KEGON_SESSION_ID` is a per-tab routing and correlation identifier to prevent cross-tab contamination and subshell desynchronization, not an authentication secret.
+- **Degradation and Resynchronization**: Any dropped C, dropped D, or sequence gap degrades safely to `Unknown` / `Mismatched` without consuming sequence numbers arbitrarily, and resynchronizes cleanly on the next valid command start.
+- **External Terminal Compatibility**: While major terminal emulators (Windows Terminal, WezTerm, iTerm2) ignore trailing arguments after `OSC 133 ; C`, universal compatibility across all arbitrary third-party terminals is not unconditionally guaranteed; Kegon guards extended C emission with `$env:KEGON_SESSION_ID`.
+- **Dopamine Mode (#62) Separation**: Visual celebration or audio effects based on command execution results are explicitly decoupled from the core terminal engine and handled in separate issues.
+
 ## Testing the Terminal Stack
 
 - `cargo test` runs the unit tests: tab and registry state, event routing, CWD parsing and the OSC framer (including malformed, split, overlong and random input), shell launch planning, and randomized tab operation sequences.

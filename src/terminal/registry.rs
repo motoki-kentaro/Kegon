@@ -7,7 +7,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::terminal::integration::{CommandState, CommandStateMachine, ShellIntegrationStatus};
+use crate::terminal::integration::{
+    CommandExecutionResult, CommandState, CommandStateMachine, ShellIntegrationStatus,
+    VerifiedCommandEvent,
+};
 use crate::terminal::session::{TerminalEvent, TerminalSession};
 use crate::terminal::shell::ShellIntegrationLaunch;
 use crate::terminal::title::normalize_terminal_title;
@@ -50,9 +53,20 @@ impl TerminalEntry {
         &self.command_state
     }
 
+    /// Returns a mutable reference to the command state machine for this terminal.
+    #[allow(dead_code)]
+    pub fn command_state_machine_mut(&mut self) -> &mut CommandStateMachine {
+        &mut self.command_state
+    }
+
     /// Returns the executable path or name of the shell running in this terminal.
     pub fn shell_program(&self) -> &str {
         self.session.shell_program()
+    }
+
+    /// Returns the session ID generated for this terminal's PTY session, if any.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session.session_id()
     }
 
     /// Derives the current Shell Integration status based on launch configuration,
@@ -75,20 +89,31 @@ impl TerminalEntry {
         }
     }
 
-    fn apply(&mut self, event: TerminalEvent) {
+    /// Returns the comprehensive execution result of the last finished command, if any.
+    #[allow(dead_code)]
+    pub fn last_execution_result(&self) -> Option<CommandExecutionResult> {
+        self.command_state.last_execution_result()
+    }
+
+    pub fn apply(&mut self, event: TerminalEvent) -> Option<VerifiedCommandEvent> {
         match event {
-            TerminalEvent::Title(raw) => self.title = normalize_terminal_title(&raw),
-            TerminalEvent::ResetTitle => self.title = None,
-            TerminalEvent::WorkingDirectory(path) => self.reported_cwd = Some(path),
-            TerminalEvent::ShellIntegration(marker) => {
-                let _ = self.command_state.transition(marker);
+            TerminalEvent::Title(raw) => {
+                self.title = normalize_terminal_title(&raw);
+                None
             }
-            TerminalEvent::ChildExit(_) => {
-                let _ = self.command_state.on_shell_exit();
+            TerminalEvent::ResetTitle => {
+                self.title = None;
+                None
             }
+            TerminalEvent::WorkingDirectory(path) => {
+                self.reported_cwd = Some(path);
+                None
+            }
+            TerminalEvent::ShellIntegration(marker) => self.command_state.transition(marker),
+            TerminalEvent::ChildExit(_) => self.command_state.on_shell_exit(),
             // Redraw happens because a message was processed; the last title is kept after exit
             // since the terminal contents stay on screen.
-            TerminalEvent::Wakeup => {}
+            TerminalEvent::Wakeup => None,
         }
     }
 }
@@ -106,9 +131,14 @@ impl TerminalRegistry {
 
     /// Registers a session for `tab`. An already registered tab is left untouched and the
     /// rejected session is handed back.
+    #[allow(clippy::result_large_err)]
     pub fn insert(&mut self, tab: TabId, session: TerminalSession) -> Result<(), TerminalSession> {
         if self.entries.contains_key(&tab) {
             return Err(session);
+        }
+        let mut command_state = CommandStateMachine::new();
+        if let Some(sid) = session.session_id() {
+            command_state.set_expected_session_id(Some(sid.to_string()));
         }
         self.entries.insert(
             tab,
@@ -116,7 +146,7 @@ impl TerminalRegistry {
                 session,
                 title: None,
                 reported_cwd: None,
-                command_state: CommandStateMachine::new(),
+                command_state,
             },
         );
         Ok(())
@@ -145,6 +175,14 @@ impl TerminalRegistry {
             .map(TerminalEntry::command_state_machine)
     }
 
+    /// Returns a mutable reference to the command state machine of `tab` if registered.
+    #[allow(dead_code)]
+    pub fn command_state_machine_mut(&mut self, tab: TabId) -> Option<&mut CommandStateMachine> {
+        self.entries
+            .get_mut(&tab)
+            .map(TerminalEntry::command_state_machine_mut)
+    }
+
     /// Returns the derived Shell Integration status for `tab` if registered.
     #[allow(dead_code)]
     pub fn shell_integration_status(&self, tab: TabId) -> Option<ShellIntegrationStatus> {
@@ -157,6 +195,12 @@ impl TerminalRegistry {
     #[allow(dead_code)]
     pub fn shell_program(&self, tab: TabId) -> Option<&str> {
         self.entries.get(&tab).map(TerminalEntry::shell_program)
+    }
+
+    /// Returns the session ID for `tab` if registered and active.
+    #[allow(dead_code)]
+    pub fn session_id(&self, tab: TabId) -> Option<&str> {
+        self.entries.get(&tab).and_then(TerminalEntry::session_id)
     }
 
     #[cfg(test)]
@@ -181,16 +225,35 @@ impl TerminalRegistry {
         self.entries.len()
     }
 
-    /// Routes an event to the session of `tab`. Returns `false` and changes nothing when the tab
-    /// has no session (for example a late event from a removed terminal).
-    pub fn handle_event(&mut self, tab: TabId, event: TerminalEvent) -> bool {
+    /// Returns the comprehensive execution result of the last finished command for `tab`, if any.
+    #[allow(dead_code)]
+    pub fn last_execution_result(&self, tab: TabId) -> Option<CommandExecutionResult> {
+        self.entries
+            .get(&tab)
+            .and_then(TerminalEntry::last_execution_result)
+    }
+
+    /// Handles an incoming terminal event, returning whether the tab was found and
+    /// any verified command lifecycle event generated by the transition.
+    pub fn handle_event_with_command_event(
+        &mut self,
+        tab: TabId,
+        event: TerminalEvent,
+    ) -> (bool, Option<VerifiedCommandEvent>) {
         match self.entries.get_mut(&tab) {
             Some(entry) => {
-                entry.apply(event);
-                true
+                let cmd_event = entry.apply(event);
+                (true, cmd_event)
             }
-            None => false,
+            None => (false, None),
         }
+    }
+
+    /// Routes an event to the session of `tab`. Returns `false` and changes nothing when the tab
+    /// has no session (for example a late event from a removed terminal).
+    #[allow(dead_code)]
+    pub fn handle_event(&mut self, tab: TabId, event: TerminalEvent) -> bool {
+        self.handle_event_with_command_event(tab, event).0
     }
 }
 
@@ -418,7 +481,10 @@ mod tests {
 
     #[test]
     fn shell_integration_state_machine_tab_isolation_and_lifecycle() {
-        use crate::terminal::integration::{CommandResult, CommandState, Osc133Marker};
+        use crate::terminal::integration::{
+            CommandExecutionResult, CommandResult, CommandState, CompletionReason,
+            MetadataCorrelation, Osc133Marker, ShellReportedStatus,
+        };
 
         let ids = tab_ids(2);
         let mut registry = TerminalRegistry::new();
@@ -462,7 +528,13 @@ mod tests {
             registry.command_state(ids[0]),
             Some(&CommandState::Finished {
                 command_id: 1,
-                result: CommandResult::Success,
+                execution_result: CommandExecutionResult::new(
+                    ShellReportedStatus::Unknown,
+                    Some(0),
+                    None,
+                    CompletionReason::DObserved,
+                    MetadataCorrelation::Unprovided,
+                ),
             })
         );
 
@@ -482,7 +554,13 @@ mod tests {
             registry.command_state(ids[1]),
             Some(&CommandState::Finished {
                 command_id: 1,
-                result: CommandResult::Unknown,
+                execution_result: CommandExecutionResult::new(
+                    ShellReportedStatus::Unknown,
+                    None,
+                    None,
+                    CompletionReason::ShellExited,
+                    MetadataCorrelation::Unprovided,
+                ),
             })
         );
 
@@ -666,5 +744,163 @@ mod tests {
                 Some(ShellIntegrationStatus::Active)
             );
         }
+    }
+
+    #[test]
+    fn multi_tab_sid_wiring_isolation_and_lifecycle() {
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+        use crate::terminal::shell::{Launch, ShellConfig};
+
+        let mut registry = TerminalRegistry::new();
+        let tabs = tab_ids(2);
+
+        // Spawn Tab 0 with PowerShell launch
+        let launch0 = Launch::new(
+            ShellConfig {
+                program: "powershell.exe".to_string(),
+                args: vec![],
+            },
+            true,
+            "PC",
+            None,
+        );
+        let sid0 = launch0
+            .session_id()
+            .expect("launch0 must have session_id")
+            .to_string();
+        let (tx0, _rx0) = unbounded();
+        let session0 = TerminalSession::spawn_launch(launch0, 80, 24, 10, 20, tx0, None).unwrap();
+        registry.insert(tabs[0], session0).ok().unwrap();
+
+        // Spawn Tab 1 with PowerShell launch
+        let launch1 = Launch::new(
+            ShellConfig {
+                program: "powershell.exe".to_string(),
+                args: vec![],
+            },
+            true,
+            "PC",
+            None,
+        );
+        let sid1 = launch1
+            .session_id()
+            .expect("launch1 must have session_id")
+            .to_string();
+        let (tx1, _rx1) = unbounded();
+        let session1 = TerminalSession::spawn_launch(launch1, 80, 24, 10, 20, tx1, None).unwrap();
+        registry.insert(tabs[1], session1).ok().unwrap();
+
+        // 1. Verify SIDs are distinct and non-empty
+        assert_ne!(sid0, sid1);
+        assert_eq!(registry.session_id(tabs[0]), Some(sid0.as_str()));
+        assert_eq!(registry.session_id(tabs[1]), Some(sid1.as_str()));
+
+        // 2. Verify state machines received the expected session IDs
+        assert_eq!(
+            registry
+                .command_state_machine(tabs[0])
+                .unwrap()
+                .expected_session_id(),
+            Some(sid0.as_str())
+        );
+        assert_eq!(
+            registry
+                .command_state_machine(tabs[1])
+                .unwrap()
+                .expected_session_id(),
+            Some(sid1.as_str())
+        );
+
+        // 3. Tab 0 receives matching marker -> accepted
+        let meta_c0 = Osc133Metadata {
+            version: 1,
+            session_id: sid0.clone(),
+            seq: 1,
+            shell_status: ShellReportedStatus::Unknown,
+        };
+        registry.handle_event(
+            tabs[0],
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(meta_c0)),
+        );
+        assert_eq!(
+            registry
+                .command_state_machine(tabs[0])
+                .unwrap()
+                .active_correlation(),
+            Some((sid0.as_str(), 1))
+        );
+
+        // 4. Tab 1 receives marker with Tab 0's SID -> rejected as alien session!
+        let alien_c = Osc133Metadata {
+            version: 1,
+            session_id: sid0.clone(),
+            seq: 1,
+            shell_status: ShellReportedStatus::Unknown,
+        };
+        registry.handle_event(
+            tabs[1],
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(alien_c)),
+        );
+        // Active correlation for Tab 1 must be None, and anomaly metric incremented!
+        assert_eq!(
+            registry
+                .command_state_machine(tabs[1])
+                .unwrap()
+                .active_correlation(),
+            None
+        );
+        assert_eq!(
+            registry
+                .command_state_machine(tabs[1])
+                .unwrap()
+                .metrics()
+                .desynchronized_metadata_count,
+            1
+        );
+
+        // 5. Lifecycle removal: removing tab drops the entry and state machine
+        assert!(registry.contains(tabs[0]));
+        let removed = registry.remove(tabs[0]);
+        assert!(removed.is_some());
+        assert!(!registry.contains(tabs[0]));
+        assert_eq!(registry.session_id(tabs[0]), None);
+        assert!(registry.command_state_machine(tabs[0]).is_none());
+
+        // Tab 1 remains unaffected
+        assert!(registry.contains(tabs[1]));
+        assert_eq!(registry.session_id(tabs[1]), Some(sid1.as_str()));
+    }
+
+    #[test]
+    fn disabled_integration_produces_no_session_id() {
+        use crate::terminal::shell::{Launch, SESSION_ID_ENV, ShellConfig};
+
+        let mut registry = TerminalRegistry::new();
+        let tabs = tab_ids(1);
+
+        let launch = Launch::new(
+            ShellConfig {
+                program: "powershell.exe".to_string(),
+                args: vec![],
+            },
+            false, // Disabled!
+            "PC",
+            None,
+        );
+        assert_eq!(launch.session_id(), None);
+        assert!(!launch.env.contains_key(SESSION_ID_ENV));
+
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx, None).unwrap();
+        registry.insert(tabs[0], session).ok().unwrap();
+
+        assert_eq!(registry.session_id(tabs[0]), None);
+        assert_eq!(
+            registry
+                .command_state_machine(tabs[0])
+                .unwrap()
+                .expected_session_id(),
+            None
+        );
     }
 }
