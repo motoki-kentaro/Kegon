@@ -53,8 +53,11 @@ terminal-tooltip-command-state-prompt = プロンプト
 terminal-tooltip-command-state-editing = 編集中
 terminal-tooltip-command-state-executing = 実行中
 terminal-tooltip-command-state-finished = 完了
-terminal-tooltip-last-exit-code = 直近の終了コード
-terminal-tooltip-exit-code-unknown = 不明
+terminal-tooltip-shell-reported-status = シェル報告成否
+terminal-tooltip-status-success = 成功
+terminal-tooltip-status-failure = 失敗
+terminal-tooltip-status-unknown = 不明
+terminal-tooltip-osc-exit-code = OSC報告終了コード
 terminal-tooltip-exit-code-none = —
 
 ## Settings tab

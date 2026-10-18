@@ -72,8 +72,11 @@ message_keys! {
     TerminalTooltipCommandStateEditing => "terminal-tooltip-command-state-editing",
     TerminalTooltipCommandStateExecuting => "terminal-tooltip-command-state-executing",
     TerminalTooltipCommandStateFinished => "terminal-tooltip-command-state-finished",
-    TerminalTooltipLastExitCode => "terminal-tooltip-last-exit-code",
-    TerminalTooltipExitCodeUnknown => "terminal-tooltip-exit-code-unknown",
+    TerminalTooltipShellReportedStatus => "terminal-tooltip-shell-reported-status",
+    TerminalTooltipStatusSuccess => "terminal-tooltip-status-success",
+    TerminalTooltipStatusFailure => "terminal-tooltip-status-failure",
+    TerminalTooltipStatusUnknown => "terminal-tooltip-status-unknown",
+    TerminalTooltipOscExitCode => "terminal-tooltip-osc-exit-code",
     TerminalTooltipExitCodeNone => "terminal-tooltip-exit-code-none",
 
     SettingsTabTitle => "settings-tab-title",

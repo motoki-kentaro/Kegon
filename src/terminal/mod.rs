@@ -30,8 +30,10 @@ pub use dopamine::{DopamineController, DopamineSoundKind, ParticleOverlayProgram
 pub use input::{InputAction, format_paste, process_key_event};
 pub use input_event::{KeyEventKind, TerminalInputEvent};
 pub use integration::{
-    CommandExecutionEvent, CommandResult, CommandState, CommandStateMachine, Osc133Marker,
-    ShellIntegrationStatus, StateMachineMetrics, TransitionAnomaly, VerifiedCommandEvent,
+    CommandExecutionEvent, CommandExecutionResult, CommandResult, CommandState,
+    CommandStateMachine, CompletionReason, MetadataCorrelation, Osc133Marker, Osc133Metadata,
+    ShellIntegrationStatus, ShellReportedStatus, StateMachineMetrics, TransitionAnomaly,
+    VerifiedCommandEvent,
 };
 pub use key_encoder::TerminalKeyEncoder;
 pub use mode::TerminalKeyboardMode;
@@ -41,5 +43,5 @@ pub use renderer::{DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, TerminalProgram, cal
 pub use session::{
     EventSink, SHUTDOWN_WAIT, ShellCleanup, TerminalEvent, TerminalSession, wait_for_shell_cleanup,
 };
-pub use shell::{ShellConfig, ShellIntegrationLaunch};
+pub use shell::{SESSION_ID_ENV, ShellConfig, ShellIntegrationLaunch, generate_session_id};
 pub use surface::{TerminalSurface, calculate_cursor_rectangle};

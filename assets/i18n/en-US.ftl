@@ -54,8 +54,11 @@ terminal-tooltip-command-state-prompt = Prompt
 terminal-tooltip-command-state-editing = Editing
 terminal-tooltip-command-state-executing = Executing
 terminal-tooltip-command-state-finished = Finished
-terminal-tooltip-last-exit-code = Last Exit Code
-terminal-tooltip-exit-code-unknown = Unknown
+terminal-tooltip-shell-reported-status = Shell-reported status
+terminal-tooltip-status-success = Success
+terminal-tooltip-status-failure = Failure
+terminal-tooltip-status-unknown = Unknown
+terminal-tooltip-osc-exit-code = OSC-reported exit code
 terminal-tooltip-exit-code-none = —
 
 ## Settings tab

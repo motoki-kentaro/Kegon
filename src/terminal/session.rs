@@ -282,6 +282,7 @@ pub struct TerminalSession {
     selection_anchor: Mutex<Option<alacritty_terminal::index::Point>>,
     shell_program: String,
     integration_launch: crate::terminal::shell::ShellIntegrationLaunch,
+    session_id: Option<String>,
 }
 
 impl TerminalSession {
@@ -407,6 +408,7 @@ impl TerminalSession {
         // generated without a sink.
         let _ = pty_sink.set(PtySink::EventLoop(event_loop_sender.clone()));
         let _join_handle = event_loop.spawn();
+        let session_id = launch.session_id;
 
         Ok(Self {
             term,
@@ -416,7 +418,16 @@ impl TerminalSession {
             selection_anchor: Mutex::new(None),
             shell_program,
             integration_launch,
+            session_id,
         })
+    }
+
+    /// Returns the session ID generated for this PTY session, if Shell Integration is active.
+    ///
+    /// ## Security Note (Phase 2A)
+    /// The session identifier is NOT an authentication credential or secret.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// Returns the executable path or name of the shell running in this session.
@@ -1523,7 +1534,78 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    #[ignore = "needs PowerShell and ConPTY; spawns a real shell"]
+    fn powershell_session_inherits_kegon_session_id_env() {
+        use crate::terminal::shell::installed;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let program = installed::pwsh()
+            .or_else(installed::windows_powershell)
+            .expect("PowerShell is not installed");
+        let start = scratch_dir("pwsh-sid-env");
+        let sid_file = start.join("sid.txt");
+        let _ = std::fs::remove_file(&sid_file);
+
+        let launch = Launch::new(
+            crate::terminal::shell::ShellConfig {
+                program,
+                args: vec![],
+            },
+            true,
+            &local_host_name(),
+            None,
+        );
+        let expected_sid = launch
+            .session_id()
+            .expect("must have session_id")
+            .to_string();
+
+        let (tx, rx) = mpsc::channel();
+        let sink = EventSink::from_fn(move |event| {
+            if let TerminalEvent::ShellIntegration(marker) = event {
+                let _ = tx.send(marker);
+            }
+        });
+        let session =
+            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
+                .unwrap();
+
+        // Wait for prompt to load
+        let _ = rx.recv_timeout(Duration::from_secs(15));
+        let _ = rx.recv_timeout(Duration::from_secs(15));
+
+        // Write env var to file
+        let cmd = format!(
+            "$env:KEGON_SESSION_ID | Set-Content -Path '{}' -NoNewline\r\n",
+            sid_file.display()
+        );
+        session.write_input(cmd.into_bytes());
+
+        // Poll for file content with timeout
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut actual_sid = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(content) = std::fs::read_to_string(&sid_file)
+                .ok()
+                .filter(|c| !c.is_empty())
+            {
+                actual_sid = Some(content);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        drop(session);
+        let _ = std::fs::remove_file(&sid_file);
+
+        assert_eq!(actual_sid, Some(expected_sid));
+    }
+
+    #[cfg(windows)]
     fn assert_powershell_emits_osc133_markers(program: String, expect_command_markers: bool) {
+        use crate::terminal::{Osc133Metadata, ShellReportedStatus};
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -1555,7 +1637,7 @@ mod tests {
         let expect = |marker: Osc133Marker, context: &str| {
             assert_eq!(
                 rx.recv_timeout(Duration::from_secs(30)),
-                Ok(marker),
+                Ok(marker.clone()),
                 "{context}: expected {marker:?}"
             );
         };
@@ -1568,41 +1650,101 @@ mod tests {
                 missing_output.display().to_string().replace('\'', "''")
             );
             let cases = [
-                ("native success", "cmd.exe /c exit 0"),
-                ("native failure", "cmd.exe /c exit 42"),
+                (
+                    "native success",
+                    "cmd.exe /c exit 0",
+                    crate::terminal::ShellReportedStatus::Success,
+                ),
+                (
+                    "native failure",
+                    "cmd.exe /c exit 42",
+                    crate::terminal::ShellReportedStatus::Failure,
+                ),
                 (
                     "pre-execution redirection failure with stale 42",
                     redirect_failure.as_str(),
+                    crate::terminal::ShellReportedStatus::Failure,
                 ),
                 (
                     "unexecuted branch",
                     "if ($false) { cmd.exe /c exit 0 }; Write-Error bad -ErrorAction Ignore",
+                    crate::terminal::ShellReportedStatus::Failure,
                 ),
                 (
                     "argument evaluation failure",
                     "cmd.exe /c exit $(throw 'kegon argument failure')",
+                    crate::terminal::ShellReportedStatus::Failure,
                 ),
                 (
                     "command resolution failure",
                     "nonexistent_kegon_command_784392",
+                    crate::terminal::ShellReportedStatus::Failure,
                 ),
-                ("compound success", "cmd.exe /c exit 0; Write-Output done"),
+                (
+                    "compound success",
+                    "cmd.exe /c exit 0; Write-Output done",
+                    crate::terminal::ShellReportedStatus::Success,
+                ),
                 (
                     "compound failure",
                     "cmd.exe /c exit 0; Write-Error bad -ErrorAction Ignore",
+                    crate::terminal::ShellReportedStatus::Failure,
                 ),
                 (
                     "failure followed by success",
                     "cmd.exe /c exit 42; Write-Output done",
+                    crate::terminal::ShellReportedStatus::Success,
                 ),
-                ("quoted native invocation", "& \"cmd.exe\" /c exit 17"),
-                ("dynamic invocation", "$exe = 'cmd.exe'; & $exe /c exit 42"),
-                ("pipeline", "cmd.exe /c exit 42 | Out-Null"),
-                ("cmdlet failure", "Get-Item NonExistentPath_Test123"),
+                (
+                    "quoted native invocation",
+                    "& \"cmd.exe\" /c exit 17",
+                    crate::terminal::ShellReportedStatus::Failure,
+                ),
+                (
+                    "dynamic invocation",
+                    "$exe = 'cmd.exe'; & $exe /c exit 42",
+                    crate::terminal::ShellReportedStatus::Failure,
+                ),
+                (
+                    "pipeline",
+                    "cmd.exe /c exit 42 | Out-Null",
+                    crate::terminal::ShellReportedStatus::Failure,
+                ),
+                (
+                    "cmdlet failure",
+                    "Get-Item NonExistentPath_Test123",
+                    crate::terminal::ShellReportedStatus::Failure,
+                ),
             ];
-            for (context, command) in cases {
+            let sid = session.session_id().expect("session_id must be present");
+            let mut seq = 0u64;
+            for (context, command, expected_status) in cases {
+                seq += 1;
                 session.write_input(format!("{command}\r").into_bytes());
-                expect(Osc133Marker::CommandStarted, context);
+                expect(
+                    Osc133Marker::CommandStartedWithMetadata(Osc133Metadata {
+                        version: 1,
+                        session_id: sid.to_string(),
+                        seq,
+                        shell_status: ShellReportedStatus::Unknown,
+                    }),
+                    context,
+                );
+                let next_marker = rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("independent metadata timeout");
+                match next_marker {
+                    Osc133Marker::IndependentMetadata(meta) => {
+                        assert_eq!(meta.version, 1, "{context}: version");
+                        assert_eq!(meta.session_id, sid, "{context}: sid");
+                        assert_eq!(meta.seq, seq, "{context}: seq");
+                        assert_eq!(
+                            meta.shell_status, expected_status,
+                            "{context}: shell_status"
+                        );
+                    }
+                    other => panic!("{context}: expected IndependentMetadata, got {other:?}"),
+                }
                 expect(Osc133Marker::CommandFinished(None), context);
                 expect(Osc133Marker::PromptStarted, context);
                 expect(Osc133Marker::InputStarted, context);
@@ -1648,6 +1790,296 @@ mod tests {
         );
         // Drop also runs on any failed assertion/timeout; existing PTY shutdown and
         // the test binary's bounded cleanup wait reap the child.
+        drop(session);
+        let _ = std::fs::remove_dir_all(&start);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a real PowerShell 7 and ConPTY; spawns real shells"]
+    fn pwsh_state_machine_e2e() {
+        let program = crate::terminal::shell::installed::pwsh().expect("pwsh is not installed");
+        assert_powershell_state_machine_e2e(program, true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Windows PowerShell 5.1 and ConPTY; spawns real shells"]
+    fn windows_powershell_state_machine_e2e() {
+        let program = crate::terminal::shell::installed::windows_powershell()
+            .expect("Windows PowerShell is not installed");
+        assert_powershell_state_machine_e2e(program, false);
+    }
+
+    #[cfg(windows)]
+    fn assert_powershell_state_machine_e2e(program: String, expect_command_tracking: bool) {
+        use crate::terminal::integration::{
+            CommandState, CommandStateMachine, CompletionReason, MetadataCorrelation,
+            Osc133Metadata, ShellReportedStatus, VerifiedCommandEvent,
+        };
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let start = scratch_dir("pwsh-sm-e2e");
+        let (tx, rx) = mpsc::channel();
+        let sink = EventSink::from_fn(move |event| {
+            if let TerminalEvent::ShellIntegration(marker) = event {
+                let _ = tx.send(marker);
+            }
+        });
+        let launch = Launch::new(
+            crate::terminal::shell::ShellConfig {
+                program,
+                args: vec![],
+            },
+            true,
+            &local_host_name(),
+            None,
+        );
+        assert!(launch.integrated);
+        let session =
+            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
+                .unwrap();
+
+        let mut sm = CommandStateMachine::new();
+        sm.set_expected_session_id(session.session_id().map(|s| s.to_string()));
+
+        let pump_one = |rx: &mpsc::Receiver<Osc133Marker>, context: &str| -> Osc133Marker {
+            rx.recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|e| panic!("{context}: timeout waiting for marker ({e:?})"))
+        };
+
+        // 1. Initial Prompt and Input markers
+        let m1 = pump_one(&rx, "initial prompt");
+        assert_eq!(m1, Osc133Marker::PromptStarted);
+        assert_eq!(sm.transition(m1), Some(VerifiedCommandEvent::PromptStarted));
+
+        let m2 = pump_one(&rx, "initial input");
+        assert_eq!(m2, Osc133Marker::InputStarted);
+        assert_eq!(sm.transition(m2), Some(VerifiedCommandEvent::InputStarted));
+        assert_eq!(sm.state(), &CommandState::Editing);
+
+        if expect_command_tracking {
+            let sid = session.session_id().expect("session_id must be present");
+            // Helper for standard command execution lifecycle
+            let execute_and_verify = |sm: &mut CommandStateMachine,
+                                      cmd: &str,
+                                      expected_status: ShellReportedStatus,
+                                      expected_seq: u64,
+                                      context: &str| {
+                session.write_input(format!("{cmd}\r").into_bytes());
+
+                // Command start with Scheme A correlation metadata
+                let m_c = pump_one(&rx, &format!("{context}: wait C"));
+                assert_eq!(
+                    m_c,
+                    Osc133Marker::CommandStartedWithMetadata(Osc133Metadata {
+                        version: 1,
+                        session_id: sid.to_string(),
+                        seq: expected_seq,
+                        shell_status: ShellReportedStatus::Unknown,
+                    }),
+                    "{context}: expected C with metadata"
+                );
+                let ev_c = sm.transition(m_c);
+                assert!(
+                    matches!(ev_c, Some(VerifiedCommandEvent::CommandStarted { .. })),
+                    "{context}: expected CommandStarted event, got {ev_c:?}"
+                );
+                assert!(sm.is_executing());
+
+                // Option E Independent metadata
+                let m_meta = pump_one(&rx, &format!("{context}: wait SetUserVar"));
+                match &m_meta {
+                    Osc133Marker::IndependentMetadata(meta) => {
+                        assert_eq!(meta.version, 1, "{context}: version");
+                        assert_eq!(meta.seq, expected_seq, "{context}: seq");
+                        assert_eq!(meta.shell_status, expected_status, "{context}: status");
+                    }
+                    other => panic!("{context}: expected IndependentMetadata, got {other:?}"),
+                }
+                assert_eq!(sm.transition(m_meta), None);
+
+                // Command finish
+                let m_d = pump_one(&rx, &format!("{context}: wait D"));
+                assert_eq!(
+                    m_d,
+                    Osc133Marker::CommandFinished(None),
+                    "{context}: expected D"
+                );
+                let ev_d = sm.transition(m_d);
+                match ev_d {
+                    Some(VerifiedCommandEvent::CommandFinished {
+                        execution_result, ..
+                    }) => {
+                        assert_eq!(
+                            execution_result.shell_status, expected_status,
+                            "{context}: execution_result.shell_status"
+                        );
+                        assert_eq!(
+                            execution_result.correlation,
+                            MetadataCorrelation::Matched,
+                            "{context}: execution_result.correlation"
+                        );
+                        assert_eq!(
+                            execution_result.completion,
+                            CompletionReason::DObserved,
+                            "{context}: execution_result.completion"
+                        );
+                    }
+                    other => panic!("{context}: expected CommandFinished event, got {other:?}"),
+                }
+                assert_eq!(sm.last_confirmed_seq(), Some(expected_seq));
+
+                // Prompt and Input for next command
+                let m_p = pump_one(&rx, &format!("{context}: wait next prompt"));
+                assert_eq!(m_p, Osc133Marker::PromptStarted);
+                assert_eq!(
+                    sm.transition(m_p),
+                    Some(VerifiedCommandEvent::PromptStarted)
+                );
+
+                let m_i = pump_one(&rx, &format!("{context}: wait next input"));
+                assert_eq!(m_i, Osc133Marker::InputStarted);
+                assert_eq!(sm.transition(m_i), Some(VerifiedCommandEvent::InputStarted));
+                assert_eq!(sm.state(), &CommandState::Editing);
+            };
+
+            // Test 1: Native / cmdlet success
+            execute_and_verify(
+                &mut sm,
+                "Write-Output 'kegon_success'",
+                ShellReportedStatus::Success,
+                1,
+                "case 1: success",
+            );
+
+            // Test 2: Native / cmdlet failure
+            execute_and_verify(
+                &mut sm,
+                "cmd.exe /c exit 42",
+                ShellReportedStatus::Failure,
+                2,
+                "case 2: failure",
+            );
+
+            // Test 3: Compound command
+            execute_and_verify(
+                &mut sm,
+                "cmd.exe /c exit 0; Write-Output done",
+                ShellReportedStatus::Success,
+                3,
+                "case 3: compound",
+            );
+
+            // Test 4: Empty Enter
+            session.write_input(b"\r".to_vec());
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(Osc133Marker::PromptStarted) => {
+                    sm.transition(Osc133Marker::PromptStarted);
+                    let m_i = pump_one(&rx, "empty input: next input");
+                    assert_eq!(m_i, Osc133Marker::InputStarted);
+                    sm.transition(m_i);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                other => panic!("empty input emitted unexpected marker: {other:?}"),
+            }
+            assert_eq!(sm.state(), &CommandState::Editing);
+            assert_eq!(sm.last_confirmed_seq(), Some(3));
+
+            // Test 5: Ctrl+C during long-running execution and recovery
+            session.write_input(b"Start-Sleep -Seconds 10\r".to_vec());
+            let m_c5 = pump_one(&rx, "ctrl-c test: wait C");
+            assert_eq!(
+                m_c5,
+                Osc133Marker::CommandStartedWithMetadata(Osc133Metadata {
+                    version: 1,
+                    session_id: sid.to_string(),
+                    seq: 4,
+                    shell_status: ShellReportedStatus::Unknown,
+                })
+            );
+            let ev_c5 = sm.transition(m_c5);
+            assert!(matches!(
+                ev_c5,
+                Some(VerifiedCommandEvent::CommandStarted { .. })
+            ));
+            assert!(sm.is_executing());
+
+            // Send Ctrl+C (\x03)
+            std::thread::sleep(Duration::from_millis(200));
+            session.write_input(vec![0x03]);
+
+            // Next marker after Ctrl+C: PowerShell's prompt hook executes upon interrupt ($? == False).
+            // It emits IndependentMetadata with Failure status, followed by D and prompt markers.
+            let m_meta5 = pump_one(&rx, "ctrl-c test: wait metadata after interrupt");
+            match &m_meta5 {
+                Osc133Marker::IndependentMetadata(meta) => {
+                    assert_eq!(meta.version, 1, "ctrl-c: version");
+                    assert_eq!(meta.seq, 4, "ctrl-c: seq");
+                    assert_eq!(
+                        meta.shell_status,
+                        ShellReportedStatus::Failure,
+                        "ctrl-c: status"
+                    );
+                }
+                other => panic!("expected IndependentMetadata after Ctrl+C, got {other:?}"),
+            }
+            assert_eq!(sm.transition(m_meta5), None);
+
+            let m_d5 = pump_one(&rx, "ctrl-c test: wait D after interrupt");
+            assert_eq!(m_d5, Osc133Marker::CommandFinished(None));
+            let ev_d5 = sm.transition(m_d5);
+            match ev_d5 {
+                Some(VerifiedCommandEvent::CommandFinished {
+                    execution_result, ..
+                }) => {
+                    assert_eq!(execution_result.completion, CompletionReason::DObserved);
+                    assert_eq!(execution_result.correlation, MetadataCorrelation::Matched);
+                    assert_eq!(execution_result.shell_status, ShellReportedStatus::Failure);
+                }
+                other => panic!("expected CommandFinished event after Ctrl+C, got {other:?}"),
+            }
+            assert_eq!(sm.last_confirmed_seq(), Some(4));
+
+            let m_p5 = pump_one(&rx, "ctrl-c test: wait prompt after interrupt");
+            assert_eq!(m_p5, Osc133Marker::PromptStarted);
+            assert_eq!(
+                sm.transition(m_p5),
+                Some(VerifiedCommandEvent::PromptStarted)
+            );
+
+            let m_i5 = pump_one(&rx, "ctrl-c test: wait input after interrupt");
+            assert_eq!(m_i5, Osc133Marker::InputStarted);
+            sm.transition(m_i5);
+            assert_eq!(sm.state(), &CommandState::Editing);
+
+            // Test 6: Recovery after Ctrl+C — subsequent command runs and matches cleanly!
+            execute_and_verify(
+                &mut sm,
+                "Write-Output 'recovered_after_ctrl_c'",
+                ShellReportedStatus::Success,
+                5,
+                "case 6: recovery after ctrl-c",
+            );
+            assert_eq!(sm.last_confirmed_seq(), Some(5));
+        } else {
+            // Windows PowerShell 5.1 in ConPTY without PSReadLine:
+            // Verify empty input and commands do not corrupt or crash the prompt loop
+            session.write_input(b"\r".to_vec());
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(Osc133Marker::PromptStarted) => {
+                    sm.transition(Osc133Marker::PromptStarted);
+                    let m_i = pump_one(&rx, "ps5.1 empty input: next input");
+                    sm.transition(m_i);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                other => panic!("ps5.1 empty input emitted unexpected marker: {other:?}"),
+            }
+            assert_eq!(sm.state(), &CommandState::Editing);
+        }
+
+        // Drop session immediately to reap child process
         drop(session);
         let _ = std::fs::remove_dir_all(&start);
     }

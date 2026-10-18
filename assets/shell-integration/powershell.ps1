@@ -24,6 +24,7 @@ try {
         HasReadLine = $false
         Executing = $false
         HostName = '@HOST@'
+        Seq = 0
     }
 
     # 4. Attempt to hook PSConsoleHostReadLine for command execution start (OSC 133;C)
@@ -43,8 +44,16 @@ try {
                 $line = & $global:__KegonState.OriginalReadLine
                 if ($null -ne $line -and $line.Trim().Length -gt 0) {
                     $global:__KegonState.Executing = $true
-                    # Command execution start marker: OSC 133;C
-                    [Console]::Write("$([char]27)]133;C$([char]7)")
+                    $global:__KegonState.Seq++
+                    if ($env:KEGON_SESSION_ID) {
+                        $sid = $env:KEGON_SESSION_ID
+                        $seq = $global:__KegonState.Seq
+                        # Scheme A: Command execution start marker with correlation metadata
+                        [Console]::Write("$([char]27)]133;C;kegon.v=1;kegon.sid=$sid;kegon.seq=$seq$([char]7)")
+                    } else {
+                        # Standard command execution start marker: OSC 133;C
+                        [Console]::Write("$([char]27)]133;C$([char]7)")
+                    }
                 }
                 return $line
             }
@@ -58,6 +67,16 @@ try {
         $out = ''
         if ($global:__KegonState.HasReadLine -and $global:__KegonState.Executing) {
             $global:__KegonState.Executing = $false
+            if ($env:KEGON_SESSION_ID) {
+                try {
+                    $status = if ($lastSuccess) { 'success' } else { 'failure' }
+                    $seq = $global:__KegonState.Seq
+                    $payload = "kegon.v=1;kegon.sid=$($env:KEGON_SESSION_ID);kegon.seq=$seq;kegon.ps=$status"
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+                    $b64 = [System.Convert]::ToBase64String($bytes)
+                    $out += "$([char]27)]1337;SetUserVar=kegon_status=$b64$([char]7)"
+                } catch { }
+            }
             # Boundary only: neither $? nor a possibly stale LASTEXITCODE proves the
             # exit code of this input. Success, failure, and compound input are Unknown.
             $out += "$([char]27)]133;D$([char]7)"
