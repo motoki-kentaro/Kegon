@@ -43,11 +43,11 @@ use crate::settings::{
     validate_shell_path,
 };
 use crate::terminal::{
-    CommandState, DopamineController, DopamineSoundKind, EventSink, InputArbiter, InputRoute,
-    MetadataCorrelation, ParticleOverlayProgram, ShellIntegrationStatus, ShellReportedStatus,
-    SystemClipboard, TerminalEvent, TerminalInputEvent, TerminalKeyEncoder, TerminalProgram,
-    TerminalRegistry, TerminalSession, TerminalSurface, calculate_cursor_rectangle,
-    registry::TerminalEntry,
+    BorderKind, CommandState, CompletionReason, DopamineController, DopamineSoundKind, EventSink,
+    InputArbiter, InputRoute, MetadataCorrelation, ParticleOverlayProgram, ShellIntegrationStatus,
+    ShellReportedStatus, SystemClipboard, TerminalEvent, TerminalInputEvent, TerminalKeyEncoder,
+    TerminalProgram, TerminalRegistry, TerminalSession, TerminalSurface, VerifiedCommandEvent,
+    calculate_cursor_rectangle, registry::TerminalEntry,
 };
 use crate::theme::{KegonTheme, ThemeId, resolve_theme, style};
 use crate::workbench::{ActivityItem, SIDE_BAR_DEFAULT_WIDTH, TabId, TabKind, Workbench};
@@ -1122,8 +1122,43 @@ impl Kegon {
             Message::TerminalEventReceived(tab, event) => {
                 let (_handled, _cmd_event) =
                     self.terminals.handle_event_with_command_event(tab, event);
-                // Future #62 Dopamine Mode integration hook point:
-                // if let Some(VerifiedCommandEvent::CommandFinished { command_id, execution_result }) = _cmd_event { ... }
+                if let Some(VerifiedCommandEvent::CommandFinished {
+                    command_id,
+                    execution_result,
+                }) = _cmd_event
+                {
+                    let is_integration_active = self
+                        .terminals
+                        .get(tab)
+                        .map(|e| e.shell_integration_status().is_active())
+                        .unwrap_or(false);
+
+                    if self.dopamine.is_enabled()
+                        && is_integration_active
+                        && execution_result.completion == CompletionReason::DObserved
+                        && execution_result.correlation == MetadataCorrelation::Matched
+                    {
+                        match execution_result.shell_status {
+                            ShellReportedStatus::Success => {
+                                self.dopamine.trigger_command_border(
+                                    tab,
+                                    command_id,
+                                    BorderKind::Rainbow,
+                                    std::time::Instant::now(),
+                                );
+                            }
+                            ShellReportedStatus::Failure => {
+                                self.dopamine.trigger_command_border(
+                                    tab,
+                                    command_id,
+                                    BorderKind::Red,
+                                    std::time::Instant::now(),
+                                );
+                            }
+                            ShellReportedStatus::Unknown => {}
+                        }
+                    }
+                }
             }
             Message::IcedEventReceived(event) => {
                 self.handle_iced_event(event);
@@ -1565,7 +1600,7 @@ impl Kegon {
         let events = event::listen().map(Message::IcedEventReceived);
         let terminal_events = Subscription::run(terminal_events_stream);
 
-        let dopamine_tick = if self.dopamine.has_active_particles() {
+        let dopamine_tick = if self.dopamine.has_active_animations() {
             iced::window::frames().map(Message::DopamineTicked)
         } else {
             Subscription::none()
@@ -2302,7 +2337,9 @@ impl Kegon {
             let particles = active_tab_id
                 .map(|id| self.dopamine.particles_for_tab(id))
                 .unwrap_or(&[]);
-            let overlay_program = ParticleOverlayProgram::new(particles);
+            let border = active_tab_id
+                .and_then(|id| self.dopamine.border_for_tab(id, std::time::Instant::now()));
+            let overlay_program = ParticleOverlayProgram::new(particles, border, self.scale_factor);
             let overlay_widget = Canvas::new(overlay_program).width(Fill).height(Fill);
 
             let main_content: Element<'_, Message> = stack![surface, overlay_widget]
@@ -6176,5 +6213,320 @@ mod tests {
         assert_eq!(result.shell_status, ShellReportedStatus::Success);
         assert_eq!(result.osc133_exit, Some(0));
         assert!(result.correlation.is_matched());
+    }
+
+    #[test]
+    fn dopamine_command_completion_border_success_rainbow_and_failure_red() {
+        use crate::terminal::BorderKind;
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+
+        // Ensure session has expected session ID
+        app.terminals
+            .command_state_machine_mut(tab)
+            .unwrap()
+            .set_expected_session_id(Some("TEST_SID".into()));
+
+        // --- Command 1: Success -> Rainbow ---
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "TEST_SID".into(),
+                seq: 1,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+
+        // Border effect must be Rainbow with 100% initial opacity
+        let border = app
+            .dopamine
+            .border_for_tab(tab, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(border.kind, BorderKind::Rainbow);
+        assert!((border.alpha - 1.0).abs() < 1e-4);
+        assert!(app.dopamine.has_active_animations());
+
+        // --- Command 2: Failure -> Red ---
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 2,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "TEST_SID".into(),
+                seq: 2,
+                shell_status: ShellReportedStatus::Failure,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+
+        // Border effect must be replaced with Red at 100% opacity
+        let border2 = app
+            .dopamine
+            .border_for_tab(tab, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(border2.kind, BorderKind::Red);
+        assert!((border2.alpha - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn dopamine_command_completion_border_negative_conditions_no_effect() {
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+        app.terminals
+            .command_state_machine_mut(tab)
+            .unwrap()
+            .set_expected_session_id(Some("TEST_SID".into()));
+
+        // Case 1: Legacy OSC 133 D with exit code 0 (Unprovided metadata) -> No effect
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+        ));
+        assert!(
+            app.dopamine
+                .border_for_tab(tab, std::time::Instant::now())
+                .is_none()
+        );
+
+        // Case 2: Mismatched correlation (seq jumped to 999) -> No effect
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "TEST_SID".into(),
+                seq: 999,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+        assert!(
+            app.dopamine
+                .border_for_tab(tab, std::time::Instant::now())
+                .is_none()
+        );
+
+        // Case 3: MissingD (interrupted by prompt A/B) -> No effect
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 2,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        assert!(
+            app.dopamine
+                .border_for_tab(tab, std::time::Instant::now())
+                .is_none()
+        );
+
+        // Case 4: Dopamine Mode OFF -> No effect
+        app.update(Message::SettingsDopamineToggled(false));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 3,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "TEST_SID".into(),
+                seq: 3,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+        assert!(
+            app.dopamine
+                .border_for_tab(tab, std::time::Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dopamine_command_completion_border_tab_isolation_fade_and_close() {
+        use crate::terminal::BorderKind;
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab1 = active_tab(&app);
+
+        // Open a second terminal tab
+        app.update(Message::NewTerminalTab);
+        let tab2 = active_tab(&app);
+        assert_ne!(tab1, tab2);
+
+        app.terminals
+            .command_state_machine_mut(tab1)
+            .unwrap()
+            .set_expected_session_id(Some("SID_1".into()));
+
+        // Trigger Success on tab1
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "SID_1".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "SID_1".into(),
+                seq: 1,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+
+        let t0 = Instant::now();
+        // Tab isolation: tab1 has Rainbow border, tab2 has None
+        assert_eq!(
+            app.dopamine.border_for_tab(tab1, t0).map(|b| b.kind),
+            Some(BorderKind::Rainbow)
+        );
+        assert!(app.dopamine.border_for_tab(tab2, t0).is_none());
+
+        // Fade out check: after 450ms, border is gone
+        let t_fade = t0 + Duration::from_millis(450);
+        app.update(Message::DopamineTicked(t_fade));
+        assert!(app.dopamine.border_for_tab(tab1, t_fade).is_none());
+        assert!(!app.dopamine.has_active_animations());
+
+        // Close tab clears border state
+        app.update(Message::TabClosed(tab1));
+        assert!(app.dopamine.border_for_tab(tab1, t0).is_none());
     }
 }

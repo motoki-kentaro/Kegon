@@ -7,16 +7,23 @@ use iced::mouse;
 use iced::widget::canvas::{Frame, Geometry, Path, Program};
 use iced::{Color, Point, Rectangle};
 
+use super::border::{ActiveBorder, paint_border};
 use super::params::VISUAL;
 use super::particles::{Look, Particle, ParticleKind};
 
 pub struct ParticleOverlayProgram<'a> {
     particles: &'a [Particle],
+    border: Option<ActiveBorder>,
+    scale_factor: f32,
 }
 
 impl<'a> ParticleOverlayProgram<'a> {
-    pub fn new(particles: &'a [Particle]) -> Self {
-        Self { particles }
+    pub fn new(particles: &'a [Particle], border: Option<ActiveBorder>, scale_factor: f32) -> Self {
+        Self {
+            particles,
+            border,
+            scale_factor,
+        }
     }
 }
 
@@ -80,17 +87,31 @@ impl<'a, Message> Program<Message> for ParticleOverlayProgram<'a> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        if self.particles.is_empty() {
+        let has_particles = !self.particles.is_empty();
+        let has_border = self.border.is_some();
+
+        if !has_particles && !has_border {
             return Vec::new();
         }
+
         let mut frame = Frame::new(renderer, bounds.size());
-        for particle in self.particles {
-            let look = particle.look(bounds.height);
-            if look.alpha <= 0.01 {
-                continue;
-            }
-            paint(&mut frame, particle, &look);
+
+        if let Some(border) = self.border
+            && border.alpha > 0.001
+        {
+            paint_border(&mut frame, bounds.size(), border, self.scale_factor);
         }
+
+        if has_particles {
+            for particle in self.particles {
+                let look = particle.look(bounds.height);
+                if look.alpha <= 0.01 {
+                    continue;
+                }
+                paint(&mut frame, particle, &look);
+            }
+        }
+
         vec![frame.into_geometry()]
     }
 }

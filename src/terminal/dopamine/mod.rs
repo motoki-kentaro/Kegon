@@ -4,6 +4,7 @@
 //! [`synth`] the procedural sounds and [`audio`] their playback.
 
 pub mod audio;
+pub mod border;
 pub mod overlay;
 pub mod params;
 pub mod particles;
@@ -17,15 +18,17 @@ use iced::{Color, Point};
 use crate::workbench::TabId;
 
 pub use audio::{DopamineAudio, DopamineSoundKind};
+pub use border::{ActiveBorder, BORDER_DURATION, BorderEffect, BorderKind};
 pub use overlay::ParticleOverlayProgram;
 #[cfg(test)]
 pub use particles::BACKSPACE_BURST_COUNT;
 pub use particles::{MAX_PARTICLES_PER_TAB, Particle, ParticleKind, TabParticles};
 
-/// High-level controller managing particle simulations and audio feedback across terminal tabs.
+/// High-level controller managing particle simulations, border effects, and audio feedback across terminal tabs.
 pub struct DopamineController {
     enabled: bool,
     tab_particles: HashMap<TabId, TabParticles>,
+    tab_borders: HashMap<TabId, BorderEffect>,
     audio: DopamineAudio,
     last_tick: Option<Instant>,
 }
@@ -36,6 +39,7 @@ impl DopamineController {
         Self {
             enabled,
             tab_particles: HashMap::new(),
+            tab_borders: HashMap::new(),
             audio: DopamineAudio::new(),
             last_tick: None,
         }
@@ -110,7 +114,7 @@ impl DopamineController {
         }
     }
 
-    /// Advances simulation using wall clock time and prunes particles exiting `viewport_height`.
+    /// Advances simulation using wall clock time and prunes particles and expired borders.
     pub fn tick(&mut self, now: Instant, viewport_height: f32) {
         let dt = if let Some(last) = self.last_tick {
             (now - last).as_secs_f32()
@@ -119,6 +123,59 @@ impl DopamineController {
         };
         self.last_tick = Some(now);
         self.update(dt, viewport_height);
+
+        // Prune expired border effects
+        self.tab_borders.retain(|_, b| !b.is_expired(now));
+    }
+
+    /// Triggers a command completion border effect for the specified tab.
+    ///
+    /// If an effect is already active for this tab:
+    /// - If the `command_id` matches the existing effect, it is deduplicated and ignored.
+    /// - Otherwise, the existing effect is replaced with the new one.
+    pub fn trigger_command_border(
+        &mut self,
+        tab_id: TabId,
+        command_id: u64,
+        kind: BorderKind,
+        now: Instant,
+    ) {
+        if !self.enabled {
+            return;
+        }
+
+        if let Some(existing) = self.tab_borders.get(&tab_id)
+            && existing.command_id == command_id
+            && !existing.is_expired(now)
+        {
+            return;
+        }
+
+        self.tab_borders
+            .insert(tab_id, BorderEffect::new(kind, command_id, now));
+    }
+
+    /// Returns the active border rendering state for `tab_id`, if active and not expired.
+    pub fn border_for_tab(&self, tab_id: TabId, now: Instant) -> Option<ActiveBorder> {
+        if !self.enabled {
+            return None;
+        }
+        self.tab_borders
+            .get(&tab_id)
+            .and_then(|b| b.current_active(now))
+    }
+
+    /// Whether any terminal tab currently has an active border effect requiring frame redraws.
+    pub fn has_active_borders(&self, now: Instant) -> bool {
+        self.enabled && self.tab_borders.values().any(|b| !b.is_expired(now))
+    }
+
+    /// Whether any tab has active particles or active border effects requiring animation frame redraws.
+    pub fn has_active_animations(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        self.has_active_particles() || self.has_active_borders(Instant::now())
     }
 
     /// Whether any terminal tab currently has alive particles that require animation frames.
@@ -140,11 +197,13 @@ impl DopamineController {
     /// Cleans up state when a terminal tab is closed.
     pub fn clear_tab(&mut self, tab_id: TabId) {
         self.tab_particles.remove(&tab_id);
+        self.tab_borders.remove(&tab_id);
     }
 
-    /// Clears all particles across all tabs.
+    /// Clears all particles and border effects across all tabs.
     pub fn clear_all(&mut self) {
         self.tab_particles.clear();
+        self.tab_borders.clear();
         self.last_tick = None;
     }
 
@@ -225,5 +284,66 @@ mod tests {
         ctrl.set_sound_kind(DopamineSoundKind::Crack);
         assert_eq!(ctrl.audio().sound_kind(), DopamineSoundKind::Crack);
         ctrl.audio_mut().stop_all();
+    }
+
+    #[test]
+    fn controller_command_border_lifecycle_and_deduplication() {
+        use std::time::Duration;
+
+        let mut ctrl = DopamineController::new(false);
+        let mut tabs = WorkbenchTabs::default();
+        let tab1 = tabs.add(TabKind::Terminal);
+        let tab2 = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+
+        // 1. Disabled controller ignores triggers
+        ctrl.trigger_command_border(tab1, 100, BorderKind::Rainbow, t0);
+        assert!(!ctrl.has_active_borders(t0));
+        assert!(ctrl.border_for_tab(tab1, t0).is_none());
+
+        // 2. Enable controller and trigger Rainbow on tab1
+        ctrl.set_enabled(true);
+        ctrl.trigger_command_border(tab1, 100, BorderKind::Rainbow, t0);
+        assert!(ctrl.has_active_borders(t0));
+        assert!(ctrl.has_active_animations());
+        let border1 = ctrl.border_for_tab(tab1, t0).unwrap();
+        assert_eq!(border1.kind, BorderKind::Rainbow);
+        assert_eq!(border1.alpha, 1.0);
+
+        // Tab isolation: tab2 has no border
+        assert!(ctrl.border_for_tab(tab2, t0).is_none());
+
+        // 3. Deduplication: triggering same command_id (100) before expiry is ignored
+        let t_half = t0 + Duration::from_millis(200);
+        ctrl.trigger_command_border(tab1, 100, BorderKind::Red, t_half);
+        // Still Rainbow with faded alpha, not replaced by Red
+        let border_dedup = ctrl.border_for_tab(tab1, t_half).unwrap();
+        assert_eq!(border_dedup.kind, BorderKind::Rainbow);
+        assert!((border_dedup.alpha - 0.5).abs() < 0.05);
+
+        // 4. Replacement: new command_id (101) immediately replaces with fresh Red border
+        ctrl.trigger_command_border(tab1, 101, BorderKind::Red, t_half);
+        let border_rep = ctrl.border_for_tab(tab1, t_half).unwrap();
+        assert_eq!(border_rep.kind, BorderKind::Red);
+        assert_eq!(border_rep.alpha, 1.0);
+
+        // 5. Expiry after tick
+        let t_exp = t_half + Duration::from_millis(450);
+        ctrl.tick(t_exp, 800.0);
+        assert!(!ctrl.has_active_borders(t_exp));
+        assert!(ctrl.border_for_tab(tab1, t_exp).is_none());
+
+        // 6. Tab clear
+        ctrl.trigger_command_border(tab2, 200, BorderKind::Rainbow, t0);
+        assert!(ctrl.border_for_tab(tab2, t0).is_some());
+        ctrl.clear_tab(tab2);
+        assert!(ctrl.border_for_tab(tab2, t0).is_none());
+
+        // 7. Clear all when disabled
+        ctrl.trigger_command_border(tab1, 300, BorderKind::Rainbow, t0);
+        assert!(ctrl.border_for_tab(tab1, t0).is_some());
+        ctrl.set_enabled(false);
+        assert!(!ctrl.has_active_borders(t0));
+        assert!(ctrl.border_for_tab(tab1, t0).is_none());
     }
 }
