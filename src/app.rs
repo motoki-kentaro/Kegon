@@ -43,10 +43,10 @@ use crate::settings::{
     validate_shell_path,
 };
 use crate::terminal::{
-    CommandResult, CommandState, EventSink, InputArbiter, InputRoute, ShellIntegrationStatus,
-    SystemClipboard, TerminalEvent, TerminalInputEvent, TerminalKeyEncoder, TerminalProgram,
-    TerminalRegistry, TerminalSession, TerminalSurface, calculate_cursor_rectangle,
-    registry::TerminalEntry,
+    CommandState, EventSink, InputArbiter, InputRoute, MetadataCorrelation, ShellIntegrationStatus,
+    ShellReportedStatus, SystemClipboard, TerminalEvent, TerminalInputEvent, TerminalKeyEncoder,
+    TerminalProgram, TerminalRegistry, TerminalSession, TerminalSurface,
+    calculate_cursor_rectangle, registry::TerminalEntry,
 };
 use crate::theme::{KegonTheme, ThemeId, resolve_theme, style};
 use crate::workbench::{ActivityItem, SIDE_BAR_DEFAULT_WIDTH, TabId, TabKind, Workbench};
@@ -1064,7 +1064,10 @@ impl Kegon {
             }
             // Events from removed sessions are dropped by the registry.
             Message::TerminalEventReceived(tab, event) => {
-                self.terminals.handle_event(tab, event);
+                let (_handled, _cmd_event) =
+                    self.terminals.handle_event_with_command_event(tab, event);
+                // Future #62 Dopamine Mode integration hook point:
+                // if let Some(VerifiedCommandEvent::CommandFinished { command_id, execution_result }) = _cmd_event { ... }
             }
             Message::IcedEventReceived(event) => {
                 self.handle_iced_event(event);
@@ -2379,10 +2382,9 @@ impl Kegon {
         }
     }
 
-    /// Shell Integration hover tooltip for a terminal tab.
-    fn terminal_tab_tooltip(&self, tab: TabId) -> Option<Element<'_, Message>> {
+    /// Text lines of the Shell Integration hover tooltip for a terminal tab.
+    fn terminal_tab_tooltip_lines(&self, tab: TabId) -> Option<Vec<String>> {
         let entry = self.terminals.get(tab)?;
-        let theme = self.active_theme;
 
         let raw_program = entry.shell_program();
         let display_program = std::path::Path::new(raw_program)
@@ -2408,16 +2410,8 @@ impl Kegon {
         let status_text = self.localizer.text(status_key);
 
         let mut lines = vec![
-            text(display_program.to_string())
-                .size(UI_TEXT_SIZE)
-                .font(self.active_ui_font)
-                .color(theme.text.emphasis)
-                .into(),
-            text(format!("{integration_label}: {status_text}"))
-                .size(UI_TEXT_SIZE)
-                .font(self.active_ui_font)
-                .color(theme.text.primary)
-                .into(),
+            display_program.to_string(),
+            format!("{integration_label}: {status_text}"),
         ];
 
         if status.is_active() {
@@ -2430,28 +2424,61 @@ impl Kegon {
                 CommandState::Finished { .. } => MessageKey::TerminalTooltipCommandStateFinished,
             };
             let state_text = self.localizer.text(state_key);
-            lines.push(
-                text(format!("{state_label}: {state_text}"))
-                    .size(UI_TEXT_SIZE)
-                    .font(self.active_ui_font)
-                    .color(theme.text.muted)
-                    .into(),
-            );
+            lines.push(format!("{state_label}: {state_text}"));
 
-            let last_exit_code_label = self.localizer.text(MessageKey::TerminalTooltipLastExitCode);
-            let exit_code_text = match entry.command_state_machine().last_result() {
-                Some(CommandResult::Success) => "0".to_string(),
-                Some(CommandResult::Failure(code)) => code.to_string(),
-                Some(CommandResult::Unknown) => self
+            let shell_status_label = self
+                .localizer
+                .text(MessageKey::TerminalTooltipShellReportedStatus);
+            let last_exec = entry.command_state_machine().last_execution_result();
+            let shell_status_text = match last_exec {
+                Some(res) if res.correlation == MetadataCorrelation::Matched => {
+                    match res.shell_status {
+                        ShellReportedStatus::Success => self
+                            .localizer
+                            .text(MessageKey::TerminalTooltipStatusSuccess),
+                        ShellReportedStatus::Failure => self
+                            .localizer
+                            .text(MessageKey::TerminalTooltipStatusFailure),
+                        ShellReportedStatus::Unknown => self
+                            .localizer
+                            .text(MessageKey::TerminalTooltipStatusUnknown),
+                    }
+                }
+                Some(_) => self
                     .localizer
-                    .text(MessageKey::TerminalTooltipExitCodeUnknown),
+                    .text(MessageKey::TerminalTooltipStatusUnknown),
                 None => self.localizer.text(MessageKey::TerminalTooltipExitCodeNone),
             };
+            lines.push(format!("{shell_status_label}: {shell_status_text}"));
+
+            let osc_exit_code_label = self.localizer.text(MessageKey::TerminalTooltipOscExitCode);
+            let osc_exit_code_text = match last_exec.and_then(|r| r.osc133_exit) {
+                Some(code) => code.to_string(),
+                None => self.localizer.text(MessageKey::TerminalTooltipExitCodeNone),
+            };
+            lines.push(format!("{osc_exit_code_label}: {osc_exit_code_text}"));
+        }
+
+        Some(lines)
+    }
+
+    /// Shell Integration hover tooltip for a terminal tab.
+    fn terminal_tab_tooltip(&self, tab: TabId) -> Option<Element<'_, Message>> {
+        let text_lines = self.terminal_tab_tooltip_lines(tab)?;
+        let theme = self.active_theme;
+
+        let mut lines = Vec::with_capacity(text_lines.len());
+        for (i, line) in text_lines.into_iter().enumerate() {
+            let color = match i {
+                0 => theme.text.emphasis,
+                1 => theme.text.primary,
+                _ => theme.text.muted,
+            };
             lines.push(
-                text(format!("{last_exit_code_label}: {exit_code_text}"))
+                text(line)
                     .size(UI_TEXT_SIZE)
                     .font(self.active_ui_font)
-                    .color(theme.text.muted)
+                    .color(color)
                     .into(),
             );
         }
@@ -3026,6 +3053,7 @@ impl std::fmt::Display for ShellIntegrationOption {
 mod tests {
     use super::*;
     use crate::command::{CommandId, KeyChord, Modifiers};
+    use crate::terminal::CommandResult;
 
     #[test]
     fn shortcuts_select_activity_items() {
@@ -5537,8 +5565,12 @@ mod tests {
             TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(42))),
         ));
 
-        let tooltip_elem = app.terminal_tab_tooltip(tab);
-        assert!(tooltip_elem.is_some());
+        let lines = app.terminal_tab_tooltip_lines(tab).unwrap();
+        assert_eq!(lines[1], "Shell Integration: 有効");
+        assert_eq!(lines[2], "コマンド状態: 完了");
+        assert_eq!(lines[3], "シェル報告成否: 不明");
+        assert_eq!(lines[4], "OSC報告終了コード: 42");
+
         let entry = app.terminals.get(tab).unwrap();
         assert_eq!(
             entry.shell_integration_status(),
@@ -5548,5 +5580,206 @@ mod tests {
             entry.command_state_machine().last_result(),
             Some(CommandResult::Failure(42))
         );
+    }
+
+    #[test]
+    fn terminal_tab_tooltip_japanese_matched_success_and_failure() {
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+
+        let mut app = new_test_app(Locale::JaJp);
+        let tab = app.workbench.tabs().active().unwrap().id;
+
+        // Fresh tab: status waiting, no command executed
+        let init_lines = app.terminal_tab_tooltip_lines(tab).unwrap();
+        assert_eq!(init_lines[1], "Shell Integration: 待機中");
+
+        // Set expected SID on tab's state machine
+        app.terminals
+            .command_state_machine_mut(tab)
+            .unwrap()
+            .set_expected_session_id(Some("TEST_SID".into()));
+
+        // Command 1: Matched success with codeless D (PowerShell standard)
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+
+        // While executing: Command State is Executing
+        let executing_lines = app.terminal_tab_tooltip_lines(tab).unwrap();
+        assert_eq!(executing_lines[2], "コマンド状態: 実行中");
+        assert_eq!(executing_lines[3], "シェル報告成否: —");
+        assert_eq!(executing_lines[4], "OSC報告終了コード: —");
+
+        // Independent metadata (success) + codeless D
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "TEST_SID".into(),
+                seq: 1,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+
+        let success_lines = app.terminal_tab_tooltip_lines(tab).unwrap();
+        assert_eq!(success_lines[2], "コマンド状態: 完了");
+        assert_eq!(success_lines[3], "シェル報告成否: 成功");
+        assert_eq!(success_lines[4], "OSC報告終了コード: —");
+
+        // Command 2: Matched failure with codeless D
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 2,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "TEST_SID".into(),
+                seq: 2,
+                shell_status: ShellReportedStatus::Failure,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+
+        let failure_lines = app.terminal_tab_tooltip_lines(tab).unwrap();
+        assert_eq!(failure_lines[2], "コマンド状態: 完了");
+        assert_eq!(failure_lines[3], "シェル報告成否: 失敗");
+        assert_eq!(failure_lines[4], "OSC報告終了コード: —");
+
+        // Command 3: Mismatched seq -> Unknown
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 3,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "TEST_SID".into(),
+                seq: 999,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+
+        let mismatch_lines = app.terminal_tab_tooltip_lines(tab).unwrap();
+        assert_eq!(mismatch_lines[2], "コマンド状態: 完了");
+        assert_eq!(mismatch_lines[3], "シェル報告成否: 不明");
+        assert_eq!(mismatch_lines[4], "OSC報告終了コード: —");
+    }
+
+    #[test]
+    fn terminal_tab_tooltip_english_matched_rendering() {
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+
+        let mut app = new_test_app(Locale::EnUs);
+        let tab = app.workbench.tabs().active().unwrap().id;
+
+        app.terminals
+            .command_state_machine_mut(tab)
+            .unwrap()
+            .set_expected_session_id(Some("EN_SID".into()));
+
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "EN_SID".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "EN_SID".into(),
+                seq: 1,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+        ));
+
+        let lines = app.terminal_tab_tooltip_lines(tab).unwrap();
+        assert_eq!(lines[1], "Shell Integration: Active");
+        assert_eq!(lines[2], "Command State: Finished");
+        assert_eq!(lines[3], "Shell-reported status: Success");
+        assert_eq!(lines[4], "OSC-reported exit code: 0");
+
+        // Verify typed result query on registry
+        let result = app.terminals.last_execution_result(tab).unwrap();
+        assert_eq!(result.shell_status, ShellReportedStatus::Success);
+        assert_eq!(result.osc133_exit, Some(0));
+        assert!(result.correlation.is_matched());
     }
 }

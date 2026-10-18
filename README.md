@@ -65,6 +65,7 @@ Kegon is **experimental and under active development**. It runs day to day, but 
 - Replies to terminal queries from programs (for example cursor position and device attributes).
 - Window and tab titles set by the running program.
 - Multiple terminal tabs, each with its own shell; a new tab opens in the directory the active tab's shell last reported (PowerShell 7, Windows PowerShell 5.1 and `cmd.exe`, with no change to your profile).
+- Shell integration and execution status: command lifecycle tracking via OSC 133, independent PowerShell-reported status ($?) via OSC 1337 user variables, and per-tab hover tooltip displaying command state, shell-reported success/failure, and exit codes.
 - Settings persisted to a TOML file in the OS configuration directory: UI language, UI font, terminal font, and theme (one built-in dark theme so far).
 - English (`en-US`) and Japanese (`ja-JP`) UI; by default it follows the OS language.
 
