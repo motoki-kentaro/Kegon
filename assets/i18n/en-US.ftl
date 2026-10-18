@@ -41,6 +41,22 @@ terminal-tab-default-title = Terminal
 terminal-new-tab-tooltip = New Terminal
 terminal-close-tab-tooltip = Close Terminal
 terminal-process-exited = Process exited with code { $code }.
+terminal-tooltip-shell-integration = Shell Integration
+terminal-tooltip-status-active = Active
+terminal-tooltip-status-active-prompt-only = Active (Prompt only)
+terminal-tooltip-status-waiting = Waiting
+terminal-tooltip-status-disabled = Disabled
+terminal-tooltip-status-unsupported = Unsupported
+terminal-tooltip-status-unavailable = Unavailable
+terminal-tooltip-command-state = Command State
+terminal-tooltip-command-state-unknown = Unknown
+terminal-tooltip-command-state-prompt = Prompt
+terminal-tooltip-command-state-editing = Editing
+terminal-tooltip-command-state-executing = Executing
+terminal-tooltip-command-state-finished = Finished
+terminal-tooltip-last-exit-code = Last Exit Code
+terminal-tooltip-exit-code-unknown = Unknown
+terminal-tooltip-exit-code-none = —
 
 ## Settings tab
 
@@ -81,6 +97,23 @@ settings-dopamine-sound-zap = Electric Zap
 settings-dopamine-sound-crack = Metal Crack
 settings-dopamine-sound-burst = Neon Burst
 settings-dopamine-sound-preview = Preview
+settings-shell-mode-label = Shell
+settings-shell-mode-description = Choose which shell to launch in terminal sessions.
+settings-shell-mode-auto = Auto-detect
+settings-shell-mode-custom = Specify executable
+settings-shell-path-label = Executable path
+settings-shell-path-placeholder = C:\Program Files\PowerShell\7\pwsh.exe
+settings-shell-integration-label = Shell Integration
+settings-shell-integration-description = When set to Auto, detects command execution in supported shells (PowerShell). When disabled, shell integration is turned off.
+settings-shell-integration-auto = Auto
+settings-shell-integration-disabled = Disabled
+settings-shell-new-tab-note = Changes apply to newly opened terminal tabs.
+settings-shell-path-empty = Path cannot be empty.
+settings-shell-path-not-absolute = Path must be an absolute path (e.g. C:\...).
+settings-shell-path-not-found = The specified file does not exist.
+settings-shell-path-is-directory = A directory was specified instead of an executable file.
+settings-shell-path-not-executable = The file must be an executable (.exe).
+settings-shell-path-has-arguments = Arguments cannot be included; specify the executable path only.
 settings-tab-close-tooltip = Close Settings
 
 ## Main area

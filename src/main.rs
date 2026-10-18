@@ -35,6 +35,9 @@ fn main() -> iced::Result {
     if let Some(warning) = settings.dopamine.diagnostic() {
         eprintln!("kegon: {warning}");
     }
+    for warning in settings.terminal.diagnostics() {
+        eprintln!("kegon: {warning}");
+    }
 
     let locale = settings::resolve_application_locale(
         options.locale.as_deref(),
