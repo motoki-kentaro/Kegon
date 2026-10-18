@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::terminal::integration::{CommandState, CommandStateMachine, ShellIntegrationStatus};
 use crate::terminal::session::{TerminalEvent, TerminalSession};
+use crate::terminal::shell::ShellIntegrationLaunch;
 use crate::terminal::title::normalize_terminal_title;
 use crate::workbench::TabId;
 
@@ -20,6 +22,8 @@ pub struct TerminalEntry {
     /// never filled from a guess or from the directory the session was started in, since the
     /// shell may have changed directory since without being able to tell us.
     reported_cwd: Option<PathBuf>,
+    /// Command execution state machine tracking OSC 133 shell integration.
+    command_state: CommandStateMachine,
 }
 
 impl TerminalEntry {
@@ -36,14 +40,55 @@ impl TerminalEntry {
         self.reported_cwd.as_deref()
     }
 
+    /// Returns the current command execution state for this terminal.
+    pub fn command_state(&self) -> &CommandState {
+        self.command_state.state()
+    }
+
+    /// Returns a reference to the command state machine for this terminal.
+    pub fn command_state_machine(&self) -> &CommandStateMachine {
+        &self.command_state
+    }
+
+    /// Returns the executable path or name of the shell running in this terminal.
+    pub fn shell_program(&self) -> &str {
+        self.session.shell_program()
+    }
+
+    /// Derives the current Shell Integration status based on launch configuration,
+    /// received OSC 133 markers, and process exit status.
+    pub fn shell_integration_status(&self) -> ShellIntegrationStatus {
+        match self.session.integration_launch() {
+            ShellIntegrationLaunch::Disabled => ShellIntegrationStatus::Disabled,
+            ShellIntegrationLaunch::Unsupported => ShellIntegrationStatus::Unsupported,
+            ShellIntegrationLaunch::Injected => {
+                if self.command_state.has_verified_command_execution() {
+                    ShellIntegrationStatus::Active
+                } else if self.command_state.has_verified_prompt() {
+                    ShellIntegrationStatus::ActivePromptOnly
+                } else if self.session.is_exited() {
+                    ShellIntegrationStatus::Unavailable
+                } else {
+                    ShellIntegrationStatus::Waiting
+                }
+            }
+        }
+    }
+
     fn apply(&mut self, event: TerminalEvent) {
         match event {
             TerminalEvent::Title(raw) => self.title = normalize_terminal_title(&raw),
             TerminalEvent::ResetTitle => self.title = None,
             TerminalEvent::WorkingDirectory(path) => self.reported_cwd = Some(path),
+            TerminalEvent::ShellIntegration(marker) => {
+                let _ = self.command_state.transition(marker);
+            }
+            TerminalEvent::ChildExit(_) => {
+                let _ = self.command_state.on_shell_exit();
+            }
             // Redraw happens because a message was processed; the last title is kept after exit
             // since the terminal contents stay on screen.
-            TerminalEvent::Wakeup | TerminalEvent::ChildExit(_) => {}
+            TerminalEvent::Wakeup => {}
         }
     }
 }
@@ -71,6 +116,7 @@ impl TerminalRegistry {
                 session,
                 title: None,
                 reported_cwd: None,
+                command_state: CommandStateMachine::new(),
             },
         );
         Ok(())
@@ -83,6 +129,34 @@ impl TerminalRegistry {
     #[allow(dead_code)] // Part of the session-management API; no caller needs it yet.
     pub fn get_mut(&mut self, tab: TabId) -> Option<&mut TerminalEntry> {
         self.entries.get_mut(&tab)
+    }
+
+    /// Returns the command state of `tab` if registered.
+    #[allow(dead_code)]
+    pub fn command_state(&self, tab: TabId) -> Option<&CommandState> {
+        self.entries.get(&tab).map(TerminalEntry::command_state)
+    }
+
+    /// Returns a reference to the command state machine of `tab` if registered.
+    #[allow(dead_code)]
+    pub fn command_state_machine(&self, tab: TabId) -> Option<&CommandStateMachine> {
+        self.entries
+            .get(&tab)
+            .map(TerminalEntry::command_state_machine)
+    }
+
+    /// Returns the derived Shell Integration status for `tab` if registered.
+    #[allow(dead_code)]
+    pub fn shell_integration_status(&self, tab: TabId) -> Option<ShellIntegrationStatus> {
+        self.entries
+            .get(&tab)
+            .map(TerminalEntry::shell_integration_status)
+    }
+
+    /// Returns the shell program name for `tab` if registered.
+    #[allow(dead_code)]
+    pub fn shell_program(&self, tab: TabId) -> Option<&str> {
+        self.entries.get(&tab).map(TerminalEntry::shell_program)
     }
 
     #[cfg(test)]
@@ -340,5 +414,257 @@ mod tests {
             ids[0],
             TerminalEvent::WorkingDirectory(PathBuf::from(r"C:\x"))
         ));
+    }
+
+    #[test]
+    fn shell_integration_state_machine_tab_isolation_and_lifecycle() {
+        use crate::terminal::integration::{CommandResult, CommandState, Osc133Marker};
+
+        let ids = tab_ids(2);
+        let mut registry = TerminalRegistry::new();
+        registry.insert(ids[0], session()).ok().unwrap();
+        registry.insert(ids[1], session()).ok().unwrap();
+
+        assert_eq!(registry.command_state(ids[0]), Some(&CommandState::Unknown));
+        assert_eq!(registry.command_state(ids[1]), Some(&CommandState::Unknown));
+
+        // Advance tab 0: A -> B -> C
+        registry.handle_event(
+            ids[0],
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        );
+        assert_eq!(registry.command_state(ids[0]), Some(&CommandState::Prompt));
+        // Tab 1 remains completely isolated
+        assert_eq!(registry.command_state(ids[1]), Some(&CommandState::Unknown));
+
+        registry.handle_event(
+            ids[0],
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        );
+        assert_eq!(registry.command_state(ids[0]), Some(&CommandState::Editing));
+
+        registry.handle_event(
+            ids[0],
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStarted),
+        );
+        assert_eq!(
+            registry.command_state(ids[0]),
+            Some(&CommandState::Executing { command_id: 1 })
+        );
+        assert_eq!(registry.command_state(ids[1]), Some(&CommandState::Unknown));
+
+        // Finish tab 0 command with exit code 0
+        registry.handle_event(
+            ids[0],
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+        );
+        assert_eq!(
+            registry.command_state(ids[0]),
+            Some(&CommandState::Finished {
+                command_id: 1,
+                result: CommandResult::Success,
+            })
+        );
+
+        // Advance tab 1 into Executing
+        registry.handle_event(
+            ids[1],
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStarted),
+        );
+        assert_eq!(
+            registry.command_state(ids[1]),
+            Some(&CommandState::Executing { command_id: 1 })
+        );
+
+        // Child exit on tab 1 interrupts active command as Unknown (does NOT borrow shell exit code)
+        registry.handle_event(ids[1], TerminalEvent::ChildExit(Some(42)));
+        assert_eq!(
+            registry.command_state(ids[1]),
+            Some(&CommandState::Finished {
+                command_id: 1,
+                result: CommandResult::Unknown,
+            })
+        );
+
+        // Removing a tab drops its entry and state
+        registry.remove(ids[0]);
+        assert_eq!(registry.command_state(ids[0]), None);
+    }
+
+    #[test]
+    fn shell_integration_status_transitions_and_isolation() {
+        use crate::terminal::integration::{
+            CommandResult, CommandState, Osc133Marker, ShellIntegrationStatus,
+        };
+
+        let ids = tab_ids(2);
+        let mut registry = TerminalRegistry::new();
+        registry.insert(ids[0], session()).ok().unwrap();
+        registry.insert(ids[1], session()).ok().unwrap();
+
+        let status0 = registry.shell_integration_status(ids[0]).unwrap();
+        if status0 == ShellIntegrationStatus::Waiting {
+            // A marker -> ActivePromptOnly
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::ActivePromptOnly)
+            );
+            // Tab 1 remains Waiting
+            assert_eq!(
+                registry.shell_integration_status(ids[1]),
+                Some(ShellIntegrationStatus::Waiting)
+            );
+
+            // B marker -> Still ActivePromptOnly
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::ActivePromptOnly)
+            );
+
+            // C marker -> Full Active
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::CommandStarted),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::Active)
+            );
+
+            // D marker -> Still Active, last_result recorded
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::Active)
+            );
+            assert_eq!(
+                registry
+                    .get(ids[0])
+                    .unwrap()
+                    .command_state_machine()
+                    .last_result(),
+                Some(CommandResult::Success)
+            );
+
+            // Tab 1 was untouched
+            assert_eq!(
+                registry.shell_integration_status(ids[1]),
+                Some(ShellIntegrationStatus::Waiting)
+            );
+        }
+    }
+
+    #[test]
+    fn shell_integration_status_disabled_session() {
+        use crate::settings::{ShellIntegrationMode, TerminalSettings};
+        use crate::terminal::integration::ShellIntegrationStatus;
+
+        let (tx, _rx) = unbounded();
+        let settings = TerminalSettings {
+            shell_integration: ShellIntegrationMode::Disabled,
+            ..TerminalSettings::default()
+        };
+        let session =
+            TerminalSession::spawn_with_settings(&settings, 80, 24, 10, 20, tx, None).unwrap();
+        let mut registry = TerminalRegistry::new();
+        let ids = tab_ids(1);
+        registry.insert(ids[0], session).ok().unwrap();
+
+        assert_eq!(
+            registry.shell_integration_status(ids[0]),
+            Some(ShellIntegrationStatus::Disabled)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn orphaned_d_does_not_promote_shell_integration_to_active() {
+        use crate::terminal::integration::{Osc133Marker, ShellIntegrationStatus};
+        use crate::terminal::shell::{Launch, ShellConfig, installed};
+
+        let ids = tab_ids(1);
+        let mut registry = TerminalRegistry::new();
+        // Explicit launch: neither the user's integration environment variable nor shell
+        // auto-detection may silently skip this regression. Its real events are not applied.
+        let launch = Launch::new(
+            ShellConfig {
+                program: installed::windows_powershell().expect("Windows PowerShell is required"),
+                args: vec![],
+            },
+            true,
+            &crate::terminal::cwd::local_host_name(),
+            None,
+        );
+        let (tx, _rx) = unbounded();
+        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx, None).unwrap();
+        registry.insert(ids[0], session).ok().unwrap();
+        assert_eq!(
+            registry.shell_integration_status(ids[0]),
+            Some(ShellIntegrationStatus::Waiting)
+        );
+        {
+            // 1. Orphaned D received without C: must NOT become Active; stays Waiting
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::Waiting),
+                "Orphaned D alone must not promote to Active"
+            );
+
+            // 2. Prompt A received: becomes ActivePromptOnly
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::ActivePromptOnly)
+            );
+
+            // 3. Another orphaned D received: still ActivePromptOnly, NOT Active
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::ActivePromptOnly),
+                "Orphaned D after prompt must not promote to Active"
+            );
+
+            // 4. Legitimate C received: now promoted to Active
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::CommandStarted),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::Active)
+            );
+
+            // 5. Normal D finishes command: remains Active
+            registry.handle_event(
+                ids[0],
+                TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+            );
+            assert_eq!(
+                registry.shell_integration_status(ids[0]),
+                Some(ShellIntegrationStatus::Active)
+            );
+        }
     }
 }

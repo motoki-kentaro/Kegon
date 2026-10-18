@@ -131,14 +131,19 @@ pub fn local_host_name() -> String {
         .unwrap_or_default()
 }
 
-/// Longest OSC payload kept. Real reports are a few hundred bytes; anything longer is discarded.
+#[allow(dead_code)]
 const MAX_PAYLOAD: usize = 8 * 1024;
 
+#[allow(dead_code)]
 const ESC: u8 = 0x1b;
+#[allow(dead_code)]
 const BEL: u8 = 0x07;
+#[allow(dead_code)]
 const CAN: u8 = 0x18;
+#[allow(dead_code)]
 const SUB: u8 = 0x1a;
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Framing {
     /// Outside any escape sequence.
@@ -162,6 +167,7 @@ enum Framing {
 /// followed by anything else abandons the sequence. The payload is capped at [`MAX_PAYLOAD`]; an
 /// overlong one is discarded unread, so memory stays bounded however much output arrives. State
 /// carries across `scan` calls, so a sequence split across reads is still recognized.
+#[allow(dead_code)]
 pub struct CwdScanner {
     local_host: String,
     state: Framing,
@@ -170,6 +176,7 @@ pub struct CwdScanner {
     overlong: bool,
 }
 
+#[allow(dead_code)]
 impl CwdScanner {
     pub fn new(local_host: String) -> Self {
         Self {

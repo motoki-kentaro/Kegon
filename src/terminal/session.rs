@@ -15,7 +15,9 @@ use alacritty_terminal::term::Config;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::tty::{self, ChildEvent, EventedPty, EventedReadWrite, Options, Shell};
 
-use crate::terminal::cwd::{CwdScanner, local_host_name};
+use crate::terminal::cwd::local_host_name;
+use crate::terminal::integration::Osc133Marker;
+use crate::terminal::osc::{OscEvent, OscScanner};
 use crate::terminal::shell::Launch;
 
 /// State of a terminal session lifecycle.
@@ -39,24 +41,41 @@ pub enum TerminalEvent {
     ChildExit(Option<i32>),
     /// The shell reported its current local working directory (Shell Integration).
     WorkingDirectory(PathBuf),
+    /// Raw OSC 133 shell integration marker.
+    ShellIntegration(Osc133Marker),
 }
 
-/// The PTY with a tap on its output: every read is also scanned for working-directory reports.
+/// The PTY with a tap on its output: every read is scanned for working-directory reports
+/// and OSC 133 shell integration markers.
 ///
-/// `alacritty_terminal` ignores OSC 7, and the event loop owns the only read path, so the tap sits
-/// between the loop and the real PTY. Bytes are passed through unchanged.
+/// `alacritty_terminal` ignores OSC 7, 9;9, and 133, and the event loop owns the only read path,
+/// so the tap sits between the loop and the real PTY. Bytes are passed through unchanged.
 struct TappedPty<P> {
     inner: P,
-    scanner: CwdScanner,
+    scanner: OscScanner,
     sink: EventSink,
 }
 
 impl<P: EventedReadWrite> io::Read for TappedPty<P> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let read = io::Read::read(self.inner.reader(), buf)?;
-        // Only the last report of a read matters: it supersedes the others, and forwarding just
-        // one keeps a flood of reports from flooding the event channel.
-        if let Some(path) = self.scanner.scan(&buf[..read]).pop() {
+        let events = self.scanner.scan(&buf[..read]);
+        let mut last_cwd = None;
+        for event in events {
+            match event {
+                OscEvent::WorkingDirectory(path) => {
+                    last_cwd = Some(path);
+                }
+                OscEvent::ShellIntegration(marker) => {
+                    let _ = self
+                        .sink
+                        .unbounded_send(TerminalEvent::ShellIntegration(marker));
+                }
+            }
+        }
+        // Only the last working directory report of a read matters: it supersedes the others,
+        // and forwarding just one keeps a flood of reports from flooding the event channel.
+        if let Some(path) = last_cwd {
             let _ = self
                 .sink
                 .unbounded_send(TerminalEvent::WorkingDirectory(path));
@@ -261,10 +280,13 @@ pub struct TerminalSession {
     state: Arc<Mutex<SessionState>>,
     window_size: Arc<Mutex<WindowSize>>,
     selection_anchor: Mutex<Option<alacritty_terminal::index::Point>>,
+    shell_program: String,
+    integration_launch: crate::terminal::shell::ShellIntegrationLaunch,
 }
 
 impl TerminalSession {
     /// Spawns a new terminal session with the default shell, in the default directory.
+    #[allow(dead_code)]
     pub fn spawn(
         cols: u16,
         rows: u16,
@@ -277,6 +299,7 @@ impl TerminalSession {
 
     /// Spawns a new terminal session with the default shell, started in `working_directory` when
     /// given. The shell is set up to report its directory (see [`Launch`]).
+    #[allow(dead_code)]
     pub fn spawn_in(
         cols: u16,
         rows: u16,
@@ -287,6 +310,28 @@ impl TerminalSession {
     ) -> Result<Self, String> {
         Self::spawn_launch(
             Launch::resolve_default(),
+            cols,
+            rows,
+            cell_width,
+            cell_height,
+            event_tx,
+            working_directory,
+        )
+    }
+
+    /// Spawns a new terminal session configured according to [`crate::settings::TerminalSettings`].
+    pub fn spawn_with_settings(
+        settings: &crate::settings::TerminalSettings,
+        cols: u16,
+        rows: u16,
+        cell_width: u16,
+        cell_height: u16,
+        event_tx: impl Into<EventSink>,
+        working_directory: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let launch = Launch::from_settings(settings, std::env::var("PROMPT").ok().as_deref())?;
+        Self::spawn_launch(
+            launch,
             cols,
             rows,
             cell_width,
@@ -309,6 +354,8 @@ impl TerminalSession {
         #[cfg(all(test, windows))]
         wait_for_shells_at_test_exit();
 
+        let shell_program = launch.config.program.clone();
+        let integration_launch = launch.integration_launch;
         let event_tx = event_tx.into();
         let options = Options {
             drain_on_exit: true,
@@ -329,7 +376,7 @@ impl TerminalSession {
             tty::new(&options, window_size, 0).map_err(|e| format!("Failed to spawn PTY: {e}"))?;
         let pty = TappedPty {
             inner: pty,
-            scanner: CwdScanner::new(local_host_name()),
+            scanner: OscScanner::new(local_host_name()),
             sink: event_tx.clone(),
         };
 
@@ -367,7 +414,19 @@ impl TerminalSession {
             state,
             window_size: shared_window_size,
             selection_anchor: Mutex::new(None),
+            shell_program,
+            integration_launch,
         })
+    }
+
+    /// Returns the executable path or name of the shell running in this session.
+    pub fn shell_program(&self) -> &str {
+        &self.shell_program
+    }
+
+    /// Returns the Shell Integration disposition determined at session launch.
+    pub fn integration_launch(&self) -> crate::terminal::shell::ShellIntegrationLaunch {
+        self.integration_launch
     }
 
     /// Access the underlying locked terminal for rendering and state queries.
@@ -1367,6 +1426,213 @@ mod tests {
         let program = crate::terminal::shell::installed::windows_powershell()
             .expect("Windows PowerShell is not installed");
         assert_shell_reports_directories(program, powershell_cd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a real PowerShell 7 and ConPTY; spawns real shells"]
+    fn pwsh_shell_integration_emits_osc133_markers() {
+        let program = crate::terminal::shell::installed::pwsh().expect("pwsh is not installed");
+        assert_powershell_emits_osc133_markers(program, true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs PowerShell 7 and ConPTY; spawns a real shell"]
+    fn pwsh_hook_preserves_error_history_and_prompt_status() {
+        assert_hook_preserves_state(
+            crate::terminal::shell::installed::pwsh().expect("pwsh is not installed"),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Windows PowerShell 5.1 and ConPTY; spawns a real shell"]
+    fn windows_powershell_hook_preserves_error_history_and_prompt_status() {
+        assert_hook_preserves_state(
+            crate::terminal::shell::installed::windows_powershell()
+                .expect("Windows PowerShell is not installed"),
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_hook_preserves_state(program: String) {
+        use crate::terminal::shell::{ShellConfig, encode_powershell_command};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Define an input provider even if PSReadLine is unavailable in this host.
+        // The fixture replaces only that provider after installing the production hooks.
+        let script = format!(
+            "try {{ function global:PSConsoleHostReadLine {{ '' }}\n{}\n{}\nexit 0\n}} catch {{ [Console]::Error.WriteLine($_); exit 1 }}",
+            include_str!("../../assets/shell-integration/powershell.ps1"),
+            include_str!("../../assets/shell-integration/tests/hook-state.ps1"),
+        );
+        let launch = Launch::new(
+            ShellConfig {
+                program,
+                args: vec![
+                    "-NoProfile".into(),
+                    "-EncodedCommand".into(),
+                    encode_powershell_command(&script),
+                ],
+            },
+            false,
+            &local_host_name(),
+            None,
+        );
+        let (tx, rx) = mpsc::channel();
+        let sink = EventSink::from_fn(move |event| {
+            if let TerminalEvent::ChildExit(code) = event {
+                let _ = tx.send(code);
+            }
+        });
+        let session = TerminalSession::spawn_launch(launch, 120, 40, 10, 20, sink, None).unwrap();
+        let result = rx.recv_timeout(Duration::from_secs(30));
+        // Drop on success, failure, or timeout; the PTY shutdown reaps the process.
+        drop(session);
+        assert_eq!(result, Ok(Some(0)), "hook state regression: {result:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Windows PowerShell 5.1 and ConPTY; spawns real shells"]
+    fn windows_powershell_shell_integration_emits_osc133_markers() {
+        let program = crate::terminal::shell::installed::windows_powershell()
+            .expect("Windows PowerShell is not installed");
+        // Windows PowerShell 5.1 built-in PSReadLine does not load in ConPTY, so command tracking (C/D)
+        // is safely degraded while prompt markers (A/B) and CWD (OSC 7) are emitted.
+        assert_powershell_emits_osc133_markers(program, false);
+    }
+
+    #[cfg(windows)]
+    fn assert_powershell_emits_osc133_markers(program: String, expect_command_markers: bool) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let start = scratch_dir("pwsh-osc133-start");
+        let missing_output = start.join("missing-parent").join("out.txt");
+        assert!(!missing_output.parent().unwrap().exists());
+        let (tx, rx) = mpsc::channel();
+        let sink = EventSink::from_fn(move |event| {
+            if let TerminalEvent::ShellIntegration(marker) = event {
+                let _ = tx.send(marker);
+            }
+        });
+        let launch = Launch::new(
+            crate::terminal::shell::ShellConfig {
+                program,
+                args: vec![],
+            },
+            true,
+            &local_host_name(),
+            None,
+        );
+        assert!(launch.integrated);
+        let session =
+            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
+                .unwrap();
+
+        // Assert every marker, not just the eventual presence of a matching D:
+        // a numeric D, duplicate C/D, or reordered boundary must fail immediately.
+        let expect = |marker: Osc133Marker, context: &str| {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(30)),
+                Ok(marker),
+                "{context}: expected {marker:?}"
+            );
+        };
+        expect(Osc133Marker::PromptStarted, "initial prompt");
+        expect(Osc133Marker::InputStarted, "initial input");
+
+        if expect_command_markers {
+            let redirect_failure = format!(
+                "cmd.exe /c exit 0 > '{}'",
+                missing_output.display().to_string().replace('\'', "''")
+            );
+            let cases = [
+                ("native success", "cmd.exe /c exit 0"),
+                ("native failure", "cmd.exe /c exit 42"),
+                (
+                    "pre-execution redirection failure with stale 42",
+                    redirect_failure.as_str(),
+                ),
+                (
+                    "unexecuted branch",
+                    "if ($false) { cmd.exe /c exit 0 }; Write-Error bad -ErrorAction Ignore",
+                ),
+                (
+                    "argument evaluation failure",
+                    "cmd.exe /c exit $(throw 'kegon argument failure')",
+                ),
+                (
+                    "command resolution failure",
+                    "nonexistent_kegon_command_784392",
+                ),
+                ("compound success", "cmd.exe /c exit 0; Write-Output done"),
+                (
+                    "compound failure",
+                    "cmd.exe /c exit 0; Write-Error bad -ErrorAction Ignore",
+                ),
+                (
+                    "failure followed by success",
+                    "cmd.exe /c exit 42; Write-Output done",
+                ),
+                ("quoted native invocation", "& \"cmd.exe\" /c exit 17"),
+                ("dynamic invocation", "$exe = 'cmd.exe'; & $exe /c exit 42"),
+                ("pipeline", "cmd.exe /c exit 42 | Out-Null"),
+                ("cmdlet failure", "Get-Item NonExistentPath_Test123"),
+            ];
+            for (context, command) in cases {
+                session.write_input(format!("{command}\r").into_bytes());
+                expect(Osc133Marker::CommandStarted, context);
+                expect(Osc133Marker::CommandFinished(None), context);
+                expect(Osc133Marker::PromptStarted, context);
+                expect(Osc133Marker::InputStarted, context);
+            }
+
+            // Empty input must not create a command. Accept either no redraw or A/B.
+            session.write_input(b"\r".to_vec());
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(Osc133Marker::PromptStarted) => {
+                    expect(Osc133Marker::InputStarted, "empty input");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                other => panic!("empty input emitted a command marker: {other:?}"),
+            }
+        }
+
+        // OSC 133 must not leak into the visible terminal grid.
+        let text = {
+            let term = session.term().lock();
+            let grid = term.grid();
+            (0..grid.screen_lines() as i32)
+                .map(|l| {
+                    (0..grid.columns())
+                        .map(|c| {
+                            grid[alacritty_terminal::index::Point::new(
+                                alacritty_terminal::index::Line(l),
+                                alacritty_terminal::index::Column(c),
+                            )]
+                            .c
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            !text.contains("]133;")
+                && !text.contains("133;A")
+                && !text.contains("133;B")
+                && !text.contains("133;C")
+                && !text.contains("133;D"),
+            "{text}"
+        );
+        // Drop also runs on any failed assertion/timeout; existing PTY shutdown and
+        // the test binary's bounded cleanup wait reap the child.
+        drop(session);
+        let _ = std::fs::remove_dir_all(&start);
     }
 
     #[cfg(windows)]

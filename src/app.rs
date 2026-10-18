@@ -12,7 +12,8 @@ use iced::widget::canvas::Canvas;
 use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::scrollable::{self, Direction, Scrollbar};
 use iced::widget::{
-    Id, Space, button, column, container, mouse_area, pick_list, row, space, svg, text, tooltip,
+    Id, Space, button, column, container, mouse_area, pick_list, row, space, svg, text, text_input,
+    tooltip,
 };
 use iced::{
     Border, Center, Color, Element, Event, Fill, Font, Point, Size, Subscription, Task, Theme,
@@ -37,13 +38,15 @@ use crate::icons::{
     settings_icon, tab_add_icon, tab_close_icon, tab_scroll_left_icon, tab_scroll_right_icon,
 };
 use crate::settings::{
-    AppearanceSettings, ApplicationSettings, LocalePreference, TerminalMetric, ThemePreference,
-    resolve_application_locale, save_settings,
+    AppearanceSettings, ApplicationSettings, LocalePreference, ShellIntegrationMode, ShellMode,
+    ShellPathError, TerminalMetric, ThemePreference, resolve_application_locale, save_settings,
+    validate_shell_path,
 };
 use crate::terminal::{
-    EventSink, InputArbiter, InputRoute, SystemClipboard, TerminalEvent, TerminalInputEvent,
-    TerminalKeyEncoder, TerminalProgram, TerminalRegistry, TerminalSession, TerminalSurface,
-    calculate_cursor_rectangle, registry::TerminalEntry,
+    CommandResult, CommandState, EventSink, InputArbiter, InputRoute, ShellIntegrationStatus,
+    SystemClipboard, TerminalEvent, TerminalInputEvent, TerminalKeyEncoder, TerminalProgram,
+    TerminalRegistry, TerminalSession, TerminalSurface, calculate_cursor_rectangle,
+    registry::TerminalEntry,
 };
 use crate::theme::{KegonTheme, ThemeId, resolve_theme, style};
 use crate::workbench::{ActivityItem, SIDE_BAR_DEFAULT_WIDTH, TabId, TabKind, Workbench};
@@ -304,6 +307,12 @@ pub enum Message {
     SettingsBuiltinGlyphsToggled(bool),
     /// The Reset button of the Built-in Glyphs setting: removes the key (default: on).
     SettingsBuiltinGlyphsReset,
+    /// The Shell Mode pick list selection changed ("auto" or "custom").
+    SettingsShellModeChanged(ShellMode),
+    /// The Shell Path input text changed.
+    SettingsShellPathChanged(String),
+    /// The Shell Integration pick list selection changed ("auto" or "disabled").
+    SettingsShellIntegrationChanged(ShellIntegrationMode),
     FontPickerSearchChanged(String),
     FontPickerMonospaceToggled(bool),
     FontPickerCandidateSelected(usize),
@@ -434,12 +443,14 @@ impl Kegon {
         let workbench = Workbench::default();
         let mut terminals = TerminalRegistry::new();
         if let Some(tab) = workbench.tabs().active().map(|tab| tab.id)
-            && let Ok(session) = TerminalSession::spawn(
+            && let Ok(session) = TerminalSession::spawn_with_settings(
+                &settings.terminal,
                 cols,
                 rows,
                 terminal_font_config.metrics.cell_width as u16,
                 terminal_font_config.metrics.cell_height as u16,
                 tagged_sink(&tx, tab),
+                None,
             )
         {
             let _ = terminals.insert(tab, session);
@@ -737,9 +748,11 @@ impl Kegon {
         let (cols, rows) = self.terminal_grid_size();
         let metrics = self.terminal_font_config.metrics;
         let tx = self.terminal_event_tx.clone();
+        let terminal_settings = self.settings.terminal.clone();
         self.open_terminal_tab_with(|tab, cwd| {
             let spawn = |cwd| {
-                TerminalSession::spawn_in(
+                TerminalSession::spawn_with_settings(
+                    &terminal_settings,
                     cols,
                     rows,
                     metrics.cell_width as u16,
@@ -1106,6 +1119,21 @@ impl Kegon {
             Message::SettingsMetricReset(metric) => self.reset_metric(metric),
             Message::SettingsBuiltinGlyphsToggled(enabled) => self.set_builtin_glyphs(enabled),
             Message::SettingsBuiltinGlyphsReset => self.reset_builtin_glyphs(),
+            Message::SettingsShellModeChanged(mode) => {
+                let mut updated_settings = self.settings.clone();
+                updated_settings.terminal.shell_mode = mode;
+                self.commit_settings(updated_settings);
+            }
+            Message::SettingsShellPathChanged(path) => {
+                let mut updated_settings = self.settings.clone();
+                updated_settings.terminal.shell_path = path;
+                self.commit_settings(updated_settings);
+            }
+            Message::SettingsShellIntegrationChanged(mode) => {
+                let mut updated_settings = self.settings.clone();
+                updated_settings.terminal.shell_integration = mode;
+                self.commit_settings(updated_settings);
+            }
             Message::FontPickerSearchChanged(query) => {
                 if let Some(picker) = self.font_picker.as_mut() {
                     picker.set_search_query(query);
@@ -1813,6 +1841,159 @@ impl Kegon {
         field.into()
     }
 
+    /// Shell selection and executable path setting for terminal sessions.
+    fn settings_shell_field(&self) -> Element<'_, Message> {
+        let theme = self.active_theme;
+        let is_custom = matches!(self.settings.terminal.shell_mode, ShellMode::Custom);
+
+        let mode_label = self.settings_label(MessageKey::SettingsShellModeLabel);
+        let mode_description = text(
+            self.localizer
+                .text(MessageKey::SettingsShellModeDescription),
+        )
+        .size(UI_TEXT_SIZE)
+        .font(self.active_ui_font)
+        .color(theme.text.muted);
+
+        let mut mode_options = vec![
+            ShellModeOption {
+                mode: ShellMode::Auto,
+                label: self.localizer.text(MessageKey::SettingsShellModeAuto),
+            },
+            ShellModeOption {
+                mode: ShellMode::Custom,
+                label: self.localizer.text(MessageKey::SettingsShellModeCustom),
+            },
+        ];
+        if let ShellMode::Unknown(ref raw) = self.settings.terminal.shell_mode {
+            mode_options.push(ShellModeOption {
+                mode: ShellMode::Unknown(raw.clone()),
+                label: format!("Unknown ({raw})"),
+            });
+        }
+
+        let selected_mode = mode_options
+            .iter()
+            .find(|opt| opt.mode == self.settings.terminal.shell_mode)
+            .cloned();
+
+        let mode_picker = self.settings_pick_list(mode_options, selected_mode, |opt| {
+            Message::SettingsShellModeChanged(opt.mode)
+        });
+
+        let path_error = if is_custom {
+            validate_shell_path(&self.settings.terminal.shell_path).err()
+        } else {
+            None
+        };
+        let is_path_invalid = path_error.is_some();
+
+        let path_label = text(self.localizer.text(MessageKey::SettingsShellPathLabel))
+            .size(UI_TEXT_SIZE)
+            .font(self.active_ui_font)
+            .color(if is_custom {
+                theme.text.primary
+            } else {
+                theme.text.disabled
+            });
+
+        let placeholder = self
+            .localizer
+            .text(MessageKey::SettingsShellPathPlaceholder);
+        let mut path_input = text_input(&placeholder, &self.settings.terminal.shell_path)
+            .size(UI_TEXT_SIZE)
+            .font(self.active_ui_font)
+            .padding(8)
+            .style(move |_, status| shell_text_input_style(theme, status, is_path_invalid));
+
+        if is_custom {
+            path_input = path_input.on_input(Message::SettingsShellPathChanged);
+        }
+
+        let note = text(self.localizer.text(MessageKey::SettingsShellNewTabNote))
+            .size(11.0)
+            .font(self.active_ui_font)
+            .color(theme.text.muted);
+
+        let mut col = column![
+            mode_label,
+            mode_description,
+            mode_picker,
+            path_label,
+            path_input,
+        ]
+        .spacing(8);
+
+        if let Some(err) = path_error {
+            let error_key = match err {
+                ShellPathError::Empty => MessageKey::SettingsShellPathEmpty,
+                ShellPathError::NotAbsolute => MessageKey::SettingsShellPathNotAbsolute,
+                ShellPathError::NotFound => MessageKey::SettingsShellPathNotFound,
+                ShellPathError::IsDirectory => MessageKey::SettingsShellPathIsDirectory,
+                ShellPathError::NotExecutable => MessageKey::SettingsShellPathNotExecutable,
+                ShellPathError::HasArguments => MessageKey::SettingsShellPathHasArguments,
+            };
+            let err_text = text(self.localizer.text(error_key))
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font)
+                .color(theme.semantic.destructive);
+            col = col.push(err_text);
+        }
+
+        col = col.push(note);
+        col.into()
+    }
+
+    /// Shell Integration toggle setting (Auto / Disabled).
+    fn settings_shell_integration_field(&self) -> Element<'_, Message> {
+        let theme = self.active_theme;
+        let label = self.settings_label(MessageKey::SettingsShellIntegrationLabel);
+        let description = text(
+            self.localizer
+                .text(MessageKey::SettingsShellIntegrationDescription),
+        )
+        .size(UI_TEXT_SIZE)
+        .font(self.active_ui_font)
+        .color(theme.text.muted);
+
+        let mut options = vec![
+            ShellIntegrationOption {
+                mode: ShellIntegrationMode::Auto,
+                label: self
+                    .localizer
+                    .text(MessageKey::SettingsShellIntegrationAuto),
+            },
+            ShellIntegrationOption {
+                mode: ShellIntegrationMode::Disabled,
+                label: self
+                    .localizer
+                    .text(MessageKey::SettingsShellIntegrationDisabled),
+            },
+        ];
+        if let ShellIntegrationMode::Unknown(ref raw) = self.settings.terminal.shell_integration {
+            options.push(ShellIntegrationOption {
+                mode: ShellIntegrationMode::Unknown(raw.clone()),
+                label: format!("Unknown ({raw})"),
+            });
+        }
+
+        let selected = options
+            .iter()
+            .find(|opt| opt.mode == self.settings.terminal.shell_integration)
+            .cloned();
+
+        let picker = self.settings_pick_list(options, selected, |opt| {
+            Message::SettingsShellIntegrationChanged(opt.mode)
+        });
+
+        let note = text(self.localizer.text(MessageKey::SettingsShellNewTabNote))
+            .size(11.0)
+            .font(self.active_ui_font)
+            .color(theme.text.muted);
+
+        column![label, description, picker, note].spacing(8).into()
+    }
+
     /// A label above a settings control.
     fn settings_label(&self, key: MessageKey) -> Element<'_, Message> {
         text(self.localizer.text(key))
@@ -2117,6 +2298,8 @@ impl Kegon {
                 self.settings_metric_field(TerminalMetric::CellHeight),
                 self.settings_metric_field(TerminalMetric::CellWidth),
                 self.settings_builtin_glyphs_field(),
+                self.settings_shell_field(),
+                self.settings_shell_integration_field(),
             ]
             .spacing(16)
             .into(),
@@ -2196,6 +2379,99 @@ impl Kegon {
         }
     }
 
+    /// Shell Integration hover tooltip for a terminal tab.
+    fn terminal_tab_tooltip(&self, tab: TabId) -> Option<Element<'_, Message>> {
+        let entry = self.terminals.get(tab)?;
+        let theme = self.active_theme;
+
+        let raw_program = entry.shell_program();
+        let display_program = std::path::Path::new(raw_program)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(raw_program);
+
+        let status = entry.shell_integration_status();
+        let status_key = match status {
+            ShellIntegrationStatus::Active => MessageKey::TerminalTooltipStatusActive,
+            ShellIntegrationStatus::ActivePromptOnly => {
+                MessageKey::TerminalTooltipStatusActivePromptOnly
+            }
+            ShellIntegrationStatus::Waiting => MessageKey::TerminalTooltipStatusWaiting,
+            ShellIntegrationStatus::Disabled => MessageKey::TerminalTooltipStatusDisabled,
+            ShellIntegrationStatus::Unsupported => MessageKey::TerminalTooltipStatusUnsupported,
+            ShellIntegrationStatus::Unavailable => MessageKey::TerminalTooltipStatusUnavailable,
+        };
+
+        let integration_label = self
+            .localizer
+            .text(MessageKey::TerminalTooltipShellIntegration);
+        let status_text = self.localizer.text(status_key);
+
+        let mut lines = vec![
+            text(display_program.to_string())
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font)
+                .color(theme.text.emphasis)
+                .into(),
+            text(format!("{integration_label}: {status_text}"))
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font)
+                .color(theme.text.primary)
+                .into(),
+        ];
+
+        if status.is_active() {
+            let state_label = self.localizer.text(MessageKey::TerminalTooltipCommandState);
+            let state_key = match entry.command_state() {
+                CommandState::Unknown => MessageKey::TerminalTooltipCommandStateUnknown,
+                CommandState::Prompt => MessageKey::TerminalTooltipCommandStatePrompt,
+                CommandState::Editing => MessageKey::TerminalTooltipCommandStateEditing,
+                CommandState::Executing { .. } => MessageKey::TerminalTooltipCommandStateExecuting,
+                CommandState::Finished { .. } => MessageKey::TerminalTooltipCommandStateFinished,
+            };
+            let state_text = self.localizer.text(state_key);
+            lines.push(
+                text(format!("{state_label}: {state_text}"))
+                    .size(UI_TEXT_SIZE)
+                    .font(self.active_ui_font)
+                    .color(theme.text.muted)
+                    .into(),
+            );
+
+            let last_exit_code_label = self.localizer.text(MessageKey::TerminalTooltipLastExitCode);
+            let exit_code_text = match entry.command_state_machine().last_result() {
+                Some(CommandResult::Success) => "0".to_string(),
+                Some(CommandResult::Failure(code)) => code.to_string(),
+                Some(CommandResult::Unknown) => self
+                    .localizer
+                    .text(MessageKey::TerminalTooltipExitCodeUnknown),
+                None => self.localizer.text(MessageKey::TerminalTooltipExitCodeNone),
+            };
+            lines.push(
+                text(format!("{last_exit_code_label}: {exit_code_text}"))
+                    .size(UI_TEXT_SIZE)
+                    .font(self.active_ui_font)
+                    .color(theme.text.muted)
+                    .into(),
+            );
+        }
+
+        let content =
+            container(column(lines).spacing(3))
+                .padding([6, 10])
+                .style(move |_: &Theme| {
+                    container::Style::default()
+                        .background(theme.workbench.surface_elevated)
+                        .border(Border {
+                            color: theme.workbench.border,
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        })
+                });
+
+        Some(content.into())
+    }
+
     /// Tooltip of a tab's close button.
     fn tab_close_tooltip(&self, kind: TabKind) -> String {
         self.localizer.text(match kind {
@@ -2218,7 +2494,7 @@ impl Kegon {
 
             // Two sibling buttons rather than a nested one, so a click on the close button can
             // never also select the tab.
-            let select = button(
+            let select_button = button(
                 container(
                     text(title)
                         .size(UI_TEXT_SIZE)
@@ -2235,6 +2511,16 @@ impl Kegon {
             .padding(iced::Padding::ZERO.left(12.0).right(4.0))
             .on_press(Message::TabSelected(tab.id))
             .style(move |_, status| tab_style(theme, is_active, status));
+
+            let select: Element<'_, Message> = if tab.kind == TabKind::Terminal {
+                if let Some(tooltip_content) = self.terminal_tab_tooltip(tab.id) {
+                    tooltip(select_button, tooltip_content, tooltip::Position::Bottom).into()
+                } else {
+                    select_button.into()
+                }
+            } else {
+                select_button.into()
+            };
 
             let close = tooltip(
                 button(
@@ -2664,6 +2950,73 @@ struct LocaleOption {
 }
 
 impl std::fmt::Display for LocaleOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+fn shell_text_input_style(
+    theme: &KegonTheme,
+    status: text_input::Status,
+    is_invalid: bool,
+) -> text_input::Style {
+    let is_disabled = matches!(status, text_input::Status::Disabled);
+    let border_color = if is_disabled {
+        theme.workbench.border
+    } else if is_invalid {
+        theme.semantic.destructive
+    } else {
+        match status {
+            text_input::Status::Focused { .. } | text_input::Status::Hovered => {
+                theme.interaction.accent
+            }
+            _ => theme.workbench.border,
+        }
+    };
+    let value_color = if is_disabled {
+        theme.text.disabled
+    } else if is_invalid {
+        theme.semantic.destructive
+    } else {
+        theme.text.primary
+    };
+    text_input::Style {
+        background: theme.workbench.background.into(),
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        icon: if is_disabled {
+            theme.text.disabled
+        } else {
+            theme.text.muted
+        },
+        placeholder: theme.text.muted,
+        value: value_color,
+        selection: theme.interaction.selection,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellModeOption {
+    mode: ShellMode,
+    label: String,
+}
+
+impl std::fmt::Display for ShellModeOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellIntegrationOption {
+    mode: ShellIntegrationMode,
+    label: String,
+}
+
+impl std::fmt::Display for ShellIntegrationOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.label)
     }
@@ -4975,5 +5328,225 @@ mod tests {
         let g_sash_narrow =
             calculate_tab_strip_geometry(total_tabs, new_base2, app.tab_scroll_offset_x);
         assert!(app.tab_scroll_offset_x <= g_sash_narrow.max_scroll);
+    }
+
+    #[test]
+    fn terminal_shell_settings_messages_update_and_persist() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.update(Message::SettingsShellModeChanged(ShellMode::Custom));
+        app.update(Message::SettingsShellPathChanged(
+            r"C:\Windows\System32\cmd.exe".to_string(),
+        ));
+        app.update(Message::SettingsShellIntegrationChanged(
+            ShellIntegrationMode::Disabled,
+        ));
+
+        assert_eq!(app.settings.terminal.shell_mode, ShellMode::Custom);
+        assert_eq!(
+            app.settings.terminal.shell_path,
+            r"C:\Windows\System32\cmd.exe"
+        );
+        assert_eq!(
+            app.settings.terminal.shell_integration,
+            ShellIntegrationMode::Disabled
+        );
+
+        let path = app.settings_path.as_ref().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("shell_mode = \"custom\""), "{text}");
+        assert!(text.contains(r"C:\Windows\System32\cmd.exe"), "{text}");
+        assert!(text.contains("shell_integration = \"disabled\""), "{text}");
+    }
+
+    #[test]
+    fn terminal_tab_spawning_with_custom_shell() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.update(Message::SettingsShellModeChanged(ShellMode::Custom));
+        app.update(Message::SettingsShellPathChanged(
+            r"C:\Windows\System32\cmd.exe".to_string(),
+        ));
+
+        let initial_tabs = app.workbench.tabs().len();
+        let new_tab = app.open_terminal_tab();
+        assert!(
+            new_tab.is_some(),
+            "Spawning valid custom shell should succeed"
+        );
+        assert_eq!(app.workbench.tabs().len(), initial_tabs + 1);
+        assert!(app.terminals.get(new_tab.unwrap()).is_some());
+    }
+
+    #[test]
+    fn terminal_tab_spawning_fails_safely_with_invalid_custom_shell() {
+        let mut app = new_test_app(Locale::EnUs);
+        let initial_tabs = app.workbench.tabs().len();
+        let initial_active = app.workbench.tabs().active().map(|t| t.id);
+
+        app.update(Message::SettingsShellModeChanged(ShellMode::Custom));
+        app.update(Message::SettingsShellPathChanged(
+            r"C:\Windows\System32\definitely_not_a_real_shell_xyz.exe".to_string(),
+        ));
+
+        let failed_tab = app.open_terminal_tab();
+        assert!(
+            failed_tab.is_none(),
+            "Invalid shell path must fail cleanly without falling back to auto"
+        );
+        assert_eq!(
+            app.workbench.tabs().len(),
+            initial_tabs,
+            "Failed tab must be removed"
+        );
+        assert_eq!(
+            app.workbench.tabs().active().map(|t| t.id),
+            initial_active,
+            "Active tab must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn existing_tabs_remain_unaffected_when_shell_settings_change() {
+        let mut app = new_test_app(Locale::EnUs);
+        let initial_tab = app.workbench.tabs().active().map(|t| t.id).unwrap();
+        assert!(app.terminals.get(initial_tab).is_some());
+
+        // Change settings to invalid custom shell
+        app.update(Message::SettingsShellModeChanged(ShellMode::Custom));
+        app.update(Message::SettingsShellPathChanged(
+            r"C:\invalid\path.exe".to_string(),
+        ));
+
+        // Existing tab session is completely unaffected
+        assert!(
+            app.terminals.get(initial_tab).is_some(),
+            "Existing running tab must not be touched by settings change"
+        );
+    }
+
+    #[test]
+    fn terminal_tab_tooltip_presence_and_settings_tab_exclusion() {
+        let mut app = new_test_app(Locale::EnUs);
+        let terminal_tab = app.workbench.tabs().active().unwrap().id;
+
+        // Terminal tab must return a tooltip element
+        assert!(app.terminal_tab_tooltip(terminal_tab).is_some());
+
+        // Open settings tab
+        app.update(Message::OpenSettingsTab);
+        let settings_tab = app.workbench.tabs().active().unwrap().id;
+        assert_eq!(
+            app.workbench.tabs().get(settings_tab).unwrap().kind,
+            TabKind::Settings
+        );
+
+        // Settings tab has no shell integration tooltip
+        assert!(app.terminal_tab_tooltip(settings_tab).is_none());
+    }
+
+    #[test]
+    fn terminal_tab_tooltip_lifecycle_and_tab_isolation() {
+        use crate::terminal::integration::Osc133Marker;
+
+        let mut app = new_test_app(Locale::EnUs);
+        let tab0 = app.workbench.tabs().active().unwrap().id;
+
+        // Open second tab
+        let tab1 = app.open_terminal_tab().unwrap();
+
+        // Initial tooltip exists for both tabs
+        assert!(app.terminal_tab_tooltip(tab0).is_some());
+        assert!(app.terminal_tab_tooltip(tab1).is_some());
+
+        // Tab 0 receives OSC 133 markers
+        app.update(Message::TerminalEventReceived(
+            tab0,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab0,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+
+        // Tab 0 status is ActivePromptOnly, tab 1 is still in initial state
+        let entry0 = app.terminals.get(tab0).unwrap();
+        let entry1 = app.terminals.get(tab1).unwrap();
+        assert_eq!(
+            entry0.shell_integration_status(),
+            ShellIntegrationStatus::ActivePromptOnly
+        );
+        assert_eq!(
+            entry1.shell_integration_status(),
+            ShellIntegrationStatus::Waiting
+        );
+
+        // Tab 0 executes a command and finishes with code 0
+        app.update(Message::TerminalEventReceived(
+            tab0,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab0,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+        ));
+
+        let entry0 = app.terminals.get(tab0).unwrap();
+        assert_eq!(
+            entry0.shell_integration_status(),
+            ShellIntegrationStatus::Active
+        );
+        assert_eq!(
+            entry0.command_state_machine().last_result(),
+            Some(CommandResult::Success)
+        );
+
+        // Tab 1 remains completely isolated
+        let entry1 = app.terminals.get(tab1).unwrap();
+        assert_eq!(
+            entry1.shell_integration_status(),
+            ShellIntegrationStatus::Waiting
+        );
+        assert_eq!(entry1.command_state_machine().last_result(), None);
+
+        // Closing tab 0 cleans up registry and tooltip returns None
+        app.update(Message::TabClosed(tab0));
+        assert!(app.terminals.get(tab0).is_none());
+        assert!(app.terminal_tab_tooltip(tab0).is_none());
+    }
+
+    #[test]
+    fn terminal_tab_tooltip_japanese_locale_rendering() {
+        use crate::terminal::integration::Osc133Marker;
+
+        let mut app = new_test_app(Locale::JaJp);
+        let tab = app.workbench.tabs().active().unwrap().id;
+
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(42))),
+        ));
+
+        let tooltip_elem = app.terminal_tab_tooltip(tab);
+        assert!(tooltip_elem.is_some());
+        let entry = app.terminals.get(tab).unwrap();
+        assert_eq!(
+            entry.shell_integration_status(),
+            ShellIntegrationStatus::Active
+        );
+        assert_eq!(
+            entry.command_state_machine().last_result(),
+            Some(CommandResult::Failure(42))
+        );
     }
 }
