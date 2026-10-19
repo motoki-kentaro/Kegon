@@ -520,6 +520,23 @@ impl TerminalSession {
         (col, line)
     }
 
+    /// The foreground colour of the printed character just left of the cursor, if there is one.
+    ///
+    /// Used only to tint visual effects; it is read from the grid at the moment of the call, so it can
+    /// be a neighbouring character when the line is changing quickly.
+    pub fn foreground_left_of_cursor(&self) -> Option<alacritty_terminal::vte::ansi::Color> {
+        use alacritty_terminal::index::{Column, Line, Point};
+        let term = self.term.lock();
+        let cursor = term.renderable_content().cursor.point;
+        let column = cursor.column.0.checked_sub(1)?;
+        let line = cursor.line;
+        if line.0 < 0 || line.0 as usize >= term.screen_lines() || column >= term.columns() {
+            return None;
+        }
+        let cell = &term.grid()[Point::new(Line(line.0), Column(column))];
+        (!cell.c.is_whitespace() && cell.c != ' ').then_some(cell.fg)
+    }
+
     /// Whether there is an active text selection in the terminal.
     pub fn has_selection(&self) -> bool {
         let term = self.term.lock();

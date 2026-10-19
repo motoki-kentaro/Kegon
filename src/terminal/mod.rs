@@ -8,6 +8,7 @@
 pub mod arbitration;
 pub mod clipboard;
 pub mod cwd;
+pub mod dopamine;
 pub mod glyph;
 pub mod input;
 pub mod input_event;
@@ -25,6 +26,10 @@ pub mod title;
 
 pub use arbitration::{InputArbiter, InputRoute};
 pub use clipboard::SystemClipboard;
+pub use dopamine::{
+    ActiveBorder, BorderEffect, BorderKind, DopamineController, DopamineSoundKind,
+    ParticleOverlayProgram,
+};
 pub use input::{InputAction, format_paste, process_key_event};
 pub use input_event::{KeyEventKind, TerminalInputEvent};
 pub use integration::{

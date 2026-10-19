@@ -6,9 +6,11 @@ mod path;
 mod precedence;
 mod store;
 
+#[allow(unused_imports)]
 pub use model::{
-    AppearanceSettings, ApplicationSettings, LocalePreference, ShellIntegrationMode, ShellMode,
-    ShellPathError, TerminalMetric, TerminalSettings, ThemePreference, validate_shell_path,
+    AppearanceSettings, ApplicationSettings, DopamineSettings, LocalePreference,
+    ShellIntegrationMode, ShellMode, ShellPathError, TerminalMetric, TerminalSettings,
+    ThemePreference, validate_shell_path,
 };
 #[allow(unused_imports)]
 pub use numeric::{BoolSetting, NumericSetting};
@@ -681,6 +683,133 @@ future = 1
             let text = save_and_read(&settings, "glyphs_bad_clear");
             assert!(!text.contains("terminal_builtin_glyphs"), "{text}");
         }
+    }
+
+    #[test]
+    fn dopamine_settings_default_is_off_and_omitted_when_empty() {
+        let settings = ApplicationSettings::default();
+        assert!(!settings.dopamine.enabled());
+        assert!(!settings.dopamine.has_enabled_key());
+        assert!(settings.dopamine.invalid_enabled_text().is_none());
+        assert!(settings.dopamine.diagnostic().is_none());
+        assert!(settings.dopamine.is_empty());
+
+        let text = save_and_read(&settings, "dopamine_default_save");
+        assert!(!text.contains("[dopamine]"), "{text}");
+    }
+
+    #[test]
+    fn dopamine_settings_round_trip() {
+        for value in [true, false] {
+            let mut settings = ApplicationSettings::default();
+            settings.dopamine.set_enabled(value);
+            assert_eq!(settings.dopamine.enabled(), value);
+            assert!(settings.dopamine.has_enabled_key());
+            assert!(!settings.dopamine.is_empty());
+
+            let text = save_and_read(&settings, "dopamine_round_trip");
+            assert!(text.contains("[dopamine]"), "{text}");
+            assert!(text.contains(&format!("enabled = {value}")), "{text}");
+
+            let (reloaded, warning) = load_str("dopamine_round_trip_load", &text);
+            assert!(warning.is_none(), "{text}");
+            assert_eq!(reloaded.dopamine.enabled(), value);
+            assert!(reloaded.dopamine.invalid_enabled_text().is_none());
+            assert!(reloaded.dopamine.diagnostic().is_none());
+        }
+    }
+
+    #[test]
+    fn dopamine_settings_invalid_value_treated_as_off_and_preserved() {
+        for bad in [
+            "\"true\"",
+            "\"yes\"",
+            "1",
+            "0",
+            "[true]",
+            "{ active = true }",
+        ] {
+            let content = format!(
+                "[dopamine]
+enabled = {bad}
+custom_cue = \"retro\"
+"
+            );
+            let (mut settings, warning) = load_str("dopamine_bad", &content);
+            assert!(warning.is_none(), "{bad}: file still loads");
+            assert!(!settings.dopamine.enabled(), "{bad}: treated as off");
+            assert!(settings.dopamine.has_enabled_key(), "{bad}");
+            assert!(settings.dopamine.invalid_enabled_text().is_some(), "{bad}");
+            assert!(settings.dopamine.diagnostic().is_some(), "{bad}");
+
+            // Saving another setting leaves invalid value and unknown keys intact
+            settings.locale = LocalePreference::JaJp;
+            let text = save_and_read(&settings, "dopamine_bad_save");
+            assert!(text.contains("custom_cue = \"retro\""), "{text}");
+            let (reloaded, warning) = load_str("dopamine_bad_reload", &text);
+            assert!(warning.is_none(), "{bad}: {text}");
+            assert_eq!(
+                reloaded.dopamine.invalid_enabled_text(),
+                settings.dopamine.invalid_enabled_text(),
+                "{bad}: raw value preserved"
+            );
+
+            // Replacing with valid boolean clears invalid text
+            settings.dopamine.set_enabled(true);
+            assert!(settings.dopamine.invalid_enabled_text().is_none());
+            assert!(settings.dopamine.diagnostic().is_none());
+            let text = save_and_read(&settings, "dopamine_bad_replace");
+            assert!(text.contains("enabled = true"), "{text}");
+
+            // Clearing removes key
+            settings.dopamine.clear_enabled();
+            assert!(!settings.dopamine.has_enabled_key());
+        }
+    }
+
+    #[test]
+    fn dopamine_sound_settings_round_trip() {
+        use crate::terminal::dopamine::DopamineSoundKind;
+
+        let mut settings = ApplicationSettings::default();
+        assert_eq!(settings.dopamine.sound(), DopamineSoundKind::Zap);
+
+        for kind in [
+            DopamineSoundKind::Crack,
+            DopamineSoundKind::Burst,
+            DopamineSoundKind::Zap,
+        ] {
+            settings.dopamine.set_sound(kind);
+            assert_eq!(settings.dopamine.sound(), kind);
+            let text = save_and_read(&settings, "dopamine_sound");
+            assert!(
+                text.contains(&format!("sound = \"{}\"", kind.as_str())),
+                "{text}"
+            );
+
+            let (reloaded, _) = load_str("dopamine_sound_reload", &text);
+            assert_eq!(reloaded.dopamine.sound(), kind);
+        }
+
+        // A profile name from an earlier build falls back to the default and is kept in the file.
+        for removed in ["plasma", "arcade", "glass"] {
+            let (legacy, _) = load_str(
+                "dopamine_sound_legacy",
+                &format!(
+                    "[dopamine]
+sound = \"{removed}\"
+"
+                ),
+            );
+            assert_eq!(legacy.dopamine.sound(), DopamineSoundKind::Zap, "{removed}");
+            assert!(legacy.dopamine.has_sound_key(), "{removed}");
+        }
+
+        // Reset clears key
+        settings.dopamine.clear_sound();
+        assert_eq!(settings.dopamine.sound(), DopamineSoundKind::Zap);
+        let text = save_and_read(&settings, "dopamine_sound_clear");
+        assert!(!text.contains("sound ="), "{text}");
     }
 
     #[test]

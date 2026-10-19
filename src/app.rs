@@ -12,8 +12,8 @@ use iced::widget::canvas::Canvas;
 use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::scrollable::{self, Direction, Scrollbar};
 use iced::widget::{
-    Id, Space, button, column, container, mouse_area, pick_list, row, space, svg, text, text_input,
-    tooltip,
+    Id, Space, button, column, container, mouse_area, pick_list, row, space, stack, svg, text,
+    text_input, tooltip,
 };
 use iced::{
     Border, Center, Color, Element, Event, Fill, Font, Point, Size, Subscription, Task, Theme,
@@ -43,9 +43,10 @@ use crate::settings::{
     validate_shell_path,
 };
 use crate::terminal::{
-    CommandState, EventSink, InputArbiter, InputRoute, MetadataCorrelation, ShellIntegrationStatus,
+    BorderKind, CommandState, CompletionReason, DopamineController, DopamineSoundKind, EventSink,
+    InputArbiter, InputRoute, MetadataCorrelation, ParticleOverlayProgram, ShellIntegrationStatus,
     ShellReportedStatus, SystemClipboard, TerminalEvent, TerminalInputEvent, TerminalKeyEncoder,
-    TerminalProgram, TerminalRegistry, TerminalSession, TerminalSurface,
+    TerminalProgram, TerminalRegistry, TerminalSession, TerminalSurface, VerifiedCommandEvent,
     calculate_cursor_rectangle, registry::TerminalEntry,
 };
 use crate::theme::{KegonTheme, ThemeId, resolve_theme, style};
@@ -307,6 +308,16 @@ pub enum Message {
     SettingsBuiltinGlyphsToggled(bool),
     /// The Reset button of the Built-in Glyphs setting: removes the key (default: on).
     SettingsBuiltinGlyphsReset,
+    /// The Dopamine Mode checkbox (saved and applied at once).
+    SettingsDopamineToggled(bool),
+    /// The Reset button of the Dopamine Mode setting: removes the key (default: off).
+    SettingsDopamineReset,
+    /// Sound profile choice for Dopamine Mode.
+    SettingsDopamineSoundChanged(DopamineSoundKind),
+    /// Preview active sound profile in Settings tab.
+    SettingsDopamineSoundPreview,
+    /// Redraw/physics tick for Dopamine Mode animations.
+    DopamineTicked(std::time::Instant),
     /// The Shell Mode pick list selection changed ("auto" or "custom").
     SettingsShellModeChanged(ShellMode),
     /// The Shell Path input text changed.
@@ -388,6 +399,8 @@ pub struct Kegon {
     tab_viewport_width: f32,
     /// Pending scroll command to execute in run_update.
     pending_tab_scroll_task: Option<TabScrollTask>,
+    /// Dopamine Mode controller managing particles and audio.
+    dopamine: DopamineController,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -481,7 +494,6 @@ impl Kegon {
             font_catalog: Some(font_catalog),
             font_cache,
             last_font_picker_result: None,
-            settings,
             cli_locale_override,
             active_ui_font: Font::DEFAULT,
             ui_font_status: UiFontStatus::SystemDefault,
@@ -492,6 +504,12 @@ impl Kegon {
             tab_scroll_offset_x: 0.0,
             tab_viewport_width: 0.0,
             pending_tab_scroll_task: None,
+            dopamine: {
+                let mut ctrl = DopamineController::new(settings.dopamine.enabled());
+                ctrl.set_sound_kind(settings.dopamine.sound());
+                ctrl
+            },
+            settings,
         };
 
         app.apply_ui_font_preference();
@@ -695,6 +713,43 @@ impl Kegon {
         if !self.settings.appearance.builtin_glyphs() {
             crate::terminal::renderer::clear_shade_tiles();
         }
+    }
+
+    /// Saves the Dopamine Mode choice and applies it at once. When disabled, all active particles
+    /// and audio are cleared immediately.
+    fn set_dopamine_enabled(&mut self, enabled: bool) {
+        if self.settings.dopamine.enabled == Some(crate::settings::BoolSetting::Value(enabled)) {
+            return;
+        }
+        let mut updated = self.settings.clone();
+        updated.dopamine.set_enabled(enabled);
+        self.commit_settings(updated);
+        self.dopamine.set_enabled(enabled);
+    }
+
+    /// Sets the active Dopamine Mode sound profile, saves it, and previews it immediately.
+    fn set_dopamine_sound(&mut self, kind: DopamineSoundKind) {
+        if self.settings.dopamine.sound == Some(kind.as_str().to_string()) {
+            return;
+        }
+        let mut updated = self.settings.clone();
+        updated.dopamine.set_sound(kind);
+        self.commit_settings(updated);
+        self.dopamine.set_sound_kind(kind);
+        self.dopamine.audio_mut().play_erase();
+    }
+
+    /// Removes the Dopamine Mode keys (enabled and sound), returning to defaults.
+    fn reset_dopamine(&mut self) {
+        if !self.settings.dopamine.has_enabled_key() && !self.settings.dopamine.has_sound_key() {
+            return;
+        }
+        let mut updated = self.settings.clone();
+        updated.dopamine.clear_enabled();
+        updated.dopamine.clear_sound();
+        self.commit_settings(updated);
+        self.dopamine.set_enabled(self.settings.dopamine.enabled());
+        self.dopamine.set_sound_kind(self.settings.dopamine.sound());
     }
 
     /// Records the window scale factor; a value that is not a positive finite number is ignored.
@@ -1024,6 +1079,7 @@ impl Kegon {
                 self.open_terminal_tab();
             }
             Message::TabClosed(id) => {
+                self.dopamine.clear_tab(id);
                 if self.close_tab(id) {
                     self.exit_requested = true;
                 }
@@ -1066,8 +1122,43 @@ impl Kegon {
             Message::TerminalEventReceived(tab, event) => {
                 let (_handled, _cmd_event) =
                     self.terminals.handle_event_with_command_event(tab, event);
-                // Future #62 Dopamine Mode integration hook point:
-                // if let Some(VerifiedCommandEvent::CommandFinished { command_id, execution_result }) = _cmd_event { ... }
+                if let Some(VerifiedCommandEvent::CommandFinished {
+                    command_id,
+                    execution_result,
+                }) = _cmd_event
+                {
+                    let is_integration_active = self
+                        .terminals
+                        .get(tab)
+                        .map(|e| e.shell_integration_status().is_active())
+                        .unwrap_or(false);
+
+                    if self.dopamine.is_enabled()
+                        && is_integration_active
+                        && execution_result.completion == CompletionReason::DObserved
+                        && execution_result.correlation == MetadataCorrelation::Matched
+                    {
+                        match execution_result.shell_status {
+                            ShellReportedStatus::Success => {
+                                self.dopamine.trigger_command_border(
+                                    tab,
+                                    command_id,
+                                    BorderKind::Rainbow,
+                                    std::time::Instant::now(),
+                                );
+                            }
+                            ShellReportedStatus::Failure => {
+                                self.dopamine.trigger_command_border(
+                                    tab,
+                                    command_id,
+                                    BorderKind::Red,
+                                    std::time::Instant::now(),
+                                );
+                            }
+                            ShellReportedStatus::Unknown => {}
+                        }
+                    }
+                }
             }
             Message::IcedEventReceived(event) => {
                 self.handle_iced_event(event);
@@ -1122,6 +1213,16 @@ impl Kegon {
             Message::SettingsMetricReset(metric) => self.reset_metric(metric),
             Message::SettingsBuiltinGlyphsToggled(enabled) => self.set_builtin_glyphs(enabled),
             Message::SettingsBuiltinGlyphsReset => self.reset_builtin_glyphs(),
+            Message::SettingsDopamineToggled(enabled) => self.set_dopamine_enabled(enabled),
+            Message::SettingsDopamineReset => self.reset_dopamine(),
+            Message::SettingsDopamineSoundChanged(kind) => self.set_dopamine_sound(kind),
+            Message::SettingsDopamineSoundPreview => {
+                self.dopamine.audio_mut().play_erase();
+            }
+            Message::DopamineTicked(now) => {
+                let h = (self.window_size.height - TAB_STRIP_HEIGHT).max(100.0);
+                self.dopamine.tick(now, h);
+            }
             Message::SettingsShellModeChanged(mode) => {
                 let mut updated_settings = self.settings.clone();
                 updated_settings.terminal.shell_mode = mode;
@@ -1311,6 +1412,8 @@ impl Kegon {
                         if self.terminal_focused
                             && let Some(session) = self.active_session()
                         {
+                            let is_backspace = logical_key
+                                == keyboard::Key::Named(keyboard::key::Named::Backspace);
                             let input_evt = TerminalInputEvent::press(
                                 logical_key,
                                 physical_key,
@@ -1320,6 +1423,35 @@ impl Kegon {
                             let mode = session.keyboard_mode();
                             if let Some(bytes) = TerminalKeyEncoder::encode(&input_evt, mode) {
                                 session.write_input(bytes);
+
+                                if is_backspace && self.dopamine.is_enabled() {
+                                    let (col, line) = session.cursor_position();
+                                    let metrics = &self.terminal_font_config.metrics;
+                                    let origin_x = if col > 0 {
+                                        (col as f32 - 0.5) * metrics.cell_width
+                                    } else {
+                                        0.5 * metrics.cell_width
+                                    };
+                                    let origin_y = (line as f32 + 0.5) * metrics.cell_height;
+
+                                    let base = session.foreground_left_of_cursor().map(|fg| {
+                                        crate::terminal::renderer::convert_color(
+                                            fg,
+                                            true,
+                                            &self.active_theme.terminal,
+                                        )
+                                    });
+                                    if let Some(tab_id) =
+                                        self.workbench.tabs().active().map(|t| t.id)
+                                    {
+                                        self.dopamine.on_backspace_colored(
+                                            tab_id,
+                                            Point::new(origin_x, origin_y),
+                                            base,
+                                            std::time::Instant::now(),
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1468,6 +1600,12 @@ impl Kegon {
         let events = event::listen().map(Message::IcedEventReceived);
         let terminal_events = Subscription::run(terminal_events_stream);
 
+        let dopamine_tick = if self.dopamine.has_active_animations() {
+            iced::window::frames().map(Message::DopamineTicked)
+        } else {
+            Subscription::none()
+        };
+
         if self.resizing_side_bar {
             let drag = event::listen_with(|event, _status, _window| match event {
                 Event::Mouse(mouse::Event::CursorMoved { position }) => {
@@ -1479,9 +1617,9 @@ impl Kegon {
                 _ => None,
             });
 
-            Subscription::batch([events, terminal_events, drag])
+            Subscription::batch([events, terminal_events, dopamine_tick, drag])
         } else {
-            Subscription::batch([events, terminal_events])
+            Subscription::batch([events, terminal_events, dopamine_tick])
         }
     }
 
@@ -1844,6 +1982,118 @@ impl Kegon {
         field.into()
     }
 
+    /// The Dopamine Mode row of the Settings tab: a checkbox that saves and applies at once, its
+    /// description, a Reset button, and a note when the file holds an invalid value.
+    fn settings_dopamine_field(&self) -> Element<'_, Message> {
+        let theme = self.active_theme;
+        let dopamine = &self.settings.dopamine;
+        let small = |content: String, color: Color| {
+            text(content)
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font)
+                .color(color)
+        };
+        let inset = theme.workbench.background;
+        let checkbox = iced::widget::checkbox(dopamine.enabled())
+            .label(
+                self.localizer
+                    .text(MessageKey::SettingsDopamineEnabledLabel),
+            )
+            .on_toggle(Message::SettingsDopamineToggled)
+            .size(16)
+            .text_size(UI_TEXT_SIZE)
+            .font(self.active_ui_font)
+            .style(move |_, _| iced::widget::checkbox::Style {
+                background: inset.into(),
+                icon_color: theme.text.emphasis,
+                border: iced::Border {
+                    color: theme.workbench.border,
+                    width: 1.0,
+                    radius: 3.0.into(),
+                },
+                text_color: Some(theme.text.primary),
+            });
+        let current_sound = dopamine.sound();
+        let sound_label = small(
+            self.localizer.text(MessageKey::SettingsDopamineSoundLabel),
+            theme.text.primary,
+        );
+
+        let sound_btn = |kind: DopamineSoundKind, label_key: MessageKey| {
+            let is_selected = current_sound == kind;
+            button(
+                text(self.localizer.text(label_key))
+                    .size(UI_TEXT_SIZE)
+                    .font(self.active_ui_font),
+            )
+            .style(move |_, status| {
+                if is_selected {
+                    style::filled_button(theme, theme.interaction.accent, status, false)
+                } else {
+                    style::secondary_button(theme, status, false)
+                }
+            })
+            .on_press(Message::SettingsDopamineSoundChanged(kind))
+        };
+
+        let preview_btn = button(
+            text(
+                self.localizer
+                    .text(MessageKey::SettingsDopamineSoundPreview),
+            )
+            .size(UI_TEXT_SIZE)
+            .font(self.active_ui_font),
+        )
+        .style(move |_, status| style::secondary_button(theme, status, false))
+        .on_press(Message::SettingsDopamineSoundPreview);
+
+        let sound_row = row![
+            sound_btn(DopamineSoundKind::Zap, MessageKey::SettingsDopamineSoundZap),
+            sound_btn(
+                DopamineSoundKind::Crack,
+                MessageKey::SettingsDopamineSoundCrack
+            ),
+            sound_btn(
+                DopamineSoundKind::Burst,
+                MessageKey::SettingsDopamineSoundBurst
+            ),
+            preview_btn,
+        ]
+        .spacing(8)
+        .align_y(Center);
+
+        let mut reset = button(
+            text(self.localizer.text(MessageKey::SettingsMetricReset))
+                .size(UI_TEXT_SIZE)
+                .font(self.active_ui_font),
+        )
+        .style(move |_, status| style::secondary_button(theme, status, false));
+        if dopamine.has_enabled_key() || dopamine.has_sound_key() {
+            reset = reset.on_press(Message::SettingsDopamineReset);
+        }
+        let mut field = column![
+            row![checkbox, reset].spacing(16).align_y(Center),
+            small(
+                self.localizer
+                    .text(MessageKey::SettingsDopamineEnabledDescription),
+                theme.text.muted,
+            ),
+            sound_label,
+            sound_row,
+        ]
+        .spacing(8);
+        if let Some(raw) = dopamine.invalid_enabled_text() {
+            let mut args = FluentArgs::new();
+            args.set("value", raw);
+            field = field.push(small(
+                self.localizer
+                    .text_with(MessageKey::SettingsDopamineEnabledStoredInvalid, &args),
+                theme.semantic.destructive,
+            ));
+        }
+        field.into()
+    }
+
     /// Shell selection and executable path setting for terminal sessions.
     fn settings_shell_field(&self) -> Element<'_, Message> {
         let theme = self.active_theme;
@@ -2080,8 +2330,22 @@ impl Kegon {
 
             let is_focused = self.terminal_focused && !self.is_modal_open();
 
-            let main_content: Element<'_, Message> =
+            let surface: Element<'_, Message> =
                 TerminalSurface::new(canvas_widget, is_focused, Some(cursor_rect)).into();
+
+            let active_tab_id = self.workbench.tabs().active().map(|tab| tab.id);
+            let particles = active_tab_id
+                .map(|id| self.dopamine.particles_for_tab(id))
+                .unwrap_or(&[]);
+            let border = active_tab_id
+                .and_then(|id| self.dopamine.border_for_tab(id, std::time::Instant::now()));
+            let overlay_program = ParticleOverlayProgram::new(particles, border, self.scale_factor);
+            let overlay_widget = Canvas::new(overlay_program).width(Fill).height(Fill);
+
+            let main_content: Element<'_, Message> = stack![surface, overlay_widget]
+                .width(Fill)
+                .height(Fill)
+                .into();
 
             if session.is_exited() {
                 let code_str = session
@@ -2308,11 +2572,18 @@ impl Kegon {
             .into(),
         );
 
+        let dopamine = self.settings_category(
+            MessageKey::SettingsCategoryDopamineTitle,
+            MessageKey::SettingsCategoryDopamineDescription,
+            column![self.settings_dopamine_field()].spacing(16).into(),
+        );
+
         let page = column![
             column![heading, description].spacing(6),
             general,
             appearance,
-            terminal
+            terminal,
+            dopamine,
         ]
         .spacing(28)
         .max_width(SETTINGS_PAGE_MAX_WIDTH);
@@ -5358,6 +5629,167 @@ mod tests {
         assert!(app.tab_scroll_offset_x <= g_sash_narrow.max_scroll);
     }
 
+    // --- Dopamine Mode tests ---
+
+    #[test]
+    fn dopamine_mode_default_off_and_settings_toggle_and_reset() {
+        let mut app = new_test_app(Locale::EnUs);
+        assert!(!app.settings.dopamine.enabled());
+        assert!(!app.dopamine.is_enabled());
+
+        // Toggle on
+        app.update(Message::SettingsDopamineToggled(true));
+        assert!(app.settings.dopamine.enabled());
+        assert!(app.dopamine.is_enabled());
+        let text = saved_text(&app).expect("settings saved on toggle");
+        assert!(text.contains("enabled = true"), "{text}");
+
+        // Toggle off
+        app.update(Message::SettingsDopamineToggled(false));
+        assert!(!app.settings.dopamine.enabled());
+        assert!(!app.dopamine.is_enabled());
+        let text = saved_text(&app).unwrap();
+        assert!(text.contains("enabled = false"), "{text}");
+
+        // Switch sound profile
+        app.update(Message::SettingsDopamineSoundChanged(
+            DopamineSoundKind::Crack,
+        ));
+        assert_eq!(app.settings.dopamine.sound(), DopamineSoundKind::Crack);
+        assert_eq!(app.dopamine.audio().sound_kind(), DopamineSoundKind::Crack);
+        let text = saved_text(&app).unwrap();
+        assert!(text.contains("sound = \"crack\""), "{text}");
+
+        // Preview sound
+        app.update(Message::SettingsDopamineSoundPreview);
+
+        // Reset clears keys back to defaults
+        app.update(Message::SettingsDopamineReset);
+        assert!(!app.settings.dopamine.enabled());
+        assert!(!app.dopamine.is_enabled());
+        assert_eq!(app.settings.dopamine.sound(), DopamineSoundKind::Zap);
+        let text = saved_text(&app).unwrap();
+        assert!(!text.contains("enabled = true"), "{text}");
+        assert!(!text.contains("sound ="), "{text}");
+    }
+
+    #[test]
+    fn dopamine_backspace_triggers_particles_when_enabled() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.terminal_focused = true;
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+
+        assert!(!app.dopamine.has_active_particles());
+
+        // Send Backspace key press
+        app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Backspace),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+            repeat: false,
+            text: None,
+        }));
+
+        assert!(app.dopamine.has_active_particles());
+        let particles = app.dopamine.particles_for_tab(tab);
+        assert_eq!(
+            particles.len(),
+            crate::terminal::dopamine::BACKSPACE_BURST_COUNT
+        );
+
+        let kinds: Vec<_> = particles.iter().map(|p| p.kind).collect();
+        assert!(kinds.contains(&crate::terminal::dopamine::ParticleKind::Flash));
+        assert!(kinds.contains(&crate::terminal::dopamine::ParticleKind::Spark));
+        assert!(kinds.contains(&crate::terminal::dopamine::ParticleKind::Mote));
+
+        // Advance simulation: particles must accelerate down past the viewport
+        app.update(Message::DopamineTicked(
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+        ));
+        assert!(
+            app.dopamine.has_active_particles(),
+            "Motes and long sparks must remain alive and falling across the screen"
+        );
+
+        // Advance simulation past safe viewport exit limit
+        app.update(Message::DopamineTicked(
+            std::time::Instant::now() + std::time::Duration::from_millis(3000),
+        ));
+        assert!(
+            !app.dopamine.has_active_particles(),
+            "All particles must be culled once exiting the viewport"
+        );
+        assert_eq!(app.dopamine.particles_for_tab(tab).len(), 0);
+    }
+
+    #[test]
+    fn dopamine_backspace_ignored_when_disabled_or_modal_open() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.terminal_focused = true;
+        let tab = active_tab(&app);
+
+        // 1. Dopamine mode is OFF by default -> No particles
+        app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Backspace),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+            repeat: false,
+            text: None,
+        }));
+        assert!(!app.dopamine.has_active_particles());
+        assert_eq!(app.dopamine.particles_for_tab(tab).len(), 0);
+
+        // 2. Enable dopamine mode, but open a modal dialog -> No particles
+        app.update(Message::SettingsDopamineToggled(true));
+        let dialog = ConfirmationDialog::builder(
+            DialogKind::Question,
+            MessageKey::DialogSmokeQuestionTitle,
+            MessageKey::DialogSmokeQuestionMessage,
+        )
+        .build();
+        app.open_confirmation_dialog(dialog);
+        assert!(app.is_modal_open());
+
+        app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Backspace),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+            repeat: false,
+            text: None,
+        }));
+        assert!(!app.dopamine.has_active_particles());
+    }
+
+    #[test]
+    fn dopamine_tab_close_clears_particles() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.terminal_focused = true;
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+
+        app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Backspace),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+            repeat: false,
+            text: None,
+        }));
+        assert!(app.dopamine.has_active_particles());
+
+        // Close the tab
+        app.update(Message::TabClosed(tab));
+        assert_eq!(app.dopamine.particles_for_tab(tab).len(), 0);
+    }
+
     #[test]
     fn terminal_shell_settings_messages_update_and_persist() {
         let mut app = new_test_app(Locale::EnUs);
@@ -5781,5 +6213,320 @@ mod tests {
         assert_eq!(result.shell_status, ShellReportedStatus::Success);
         assert_eq!(result.osc133_exit, Some(0));
         assert!(result.correlation.is_matched());
+    }
+
+    #[test]
+    fn dopamine_command_completion_border_success_rainbow_and_failure_red() {
+        use crate::terminal::BorderKind;
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+
+        // Ensure session has expected session ID
+        app.terminals
+            .command_state_machine_mut(tab)
+            .unwrap()
+            .set_expected_session_id(Some("TEST_SID".into()));
+
+        // --- Command 1: Success -> Rainbow ---
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "TEST_SID".into(),
+                seq: 1,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+
+        // Border effect must be Rainbow with 100% initial opacity
+        let border = app
+            .dopamine
+            .border_for_tab(tab, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(border.kind, BorderKind::Rainbow);
+        assert!((border.alpha - 1.0).abs() < 1e-4);
+        assert!(app.dopamine.has_active_animations());
+
+        // --- Command 2: Failure -> Red ---
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 2,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "TEST_SID".into(),
+                seq: 2,
+                shell_status: ShellReportedStatus::Failure,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+
+        // Border effect must be replaced with Red at 100% opacity
+        let border2 = app
+            .dopamine
+            .border_for_tab(tab, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(border2.kind, BorderKind::Red);
+        assert!((border2.alpha - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn dopamine_command_completion_border_negative_conditions_no_effect() {
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+        app.terminals
+            .command_state_machine_mut(tab)
+            .unwrap()
+            .set_expected_session_id(Some("TEST_SID".into()));
+
+        // Case 1: Legacy OSC 133 D with exit code 0 (Unprovided metadata) -> No effect
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+        ));
+        assert!(
+            app.dopamine
+                .border_for_tab(tab, std::time::Instant::now())
+                .is_none()
+        );
+
+        // Case 2: Mismatched correlation (seq jumped to 999) -> No effect
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "TEST_SID".into(),
+                seq: 999,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+        assert!(
+            app.dopamine
+                .border_for_tab(tab, std::time::Instant::now())
+                .is_none()
+        );
+
+        // Case 3: MissingD (interrupted by prompt A/B) -> No effect
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 2,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        assert!(
+            app.dopamine
+                .border_for_tab(tab, std::time::Instant::now())
+                .is_none()
+        );
+
+        // Case 4: Dopamine Mode OFF -> No effect
+        app.update(Message::SettingsDopamineToggled(false));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "TEST_SID".into(),
+                    seq: 3,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "TEST_SID".into(),
+                seq: 3,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+        assert!(
+            app.dopamine
+                .border_for_tab(tab, std::time::Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dopamine_command_completion_border_tab_isolation_fade_and_close() {
+        use crate::terminal::BorderKind;
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab1 = active_tab(&app);
+
+        // Open a second terminal tab
+        app.update(Message::NewTerminalTab);
+        let tab2 = active_tab(&app);
+        assert_ne!(tab1, tab2);
+
+        app.terminals
+            .command_state_machine_mut(tab1)
+            .unwrap()
+            .set_expected_session_id(Some("SID_1".into()));
+
+        // Trigger Success on tab1
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "SID_1".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "SID_1".into(),
+                seq: 1,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+
+        let t0 = Instant::now();
+        // Tab isolation: tab1 has Rainbow border, tab2 has None
+        assert_eq!(
+            app.dopamine.border_for_tab(tab1, t0).map(|b| b.kind),
+            Some(BorderKind::Rainbow)
+        );
+        assert!(app.dopamine.border_for_tab(tab2, t0).is_none());
+
+        // Fade out check: after 450ms, border is gone
+        let t_fade = t0 + Duration::from_millis(450);
+        app.update(Message::DopamineTicked(t_fade));
+        assert!(app.dopamine.border_for_tab(tab1, t_fade).is_none());
+        assert!(!app.dopamine.has_active_animations());
+
+        // Close tab clears border state
+        app.update(Message::TabClosed(tab1));
+        assert!(app.dopamine.border_for_tab(tab1, t0).is_none());
     }
 }
