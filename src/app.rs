@@ -1120,43 +1120,100 @@ impl Kegon {
             }
             // Events from removed sessions are dropped by the registry.
             Message::TerminalEventReceived(tab, event) => {
+                let is_shell_exit = matches!(event, TerminalEvent::ChildExit(_));
                 let (_handled, _cmd_event) =
                     self.terminals.handle_event_with_command_event(tab, event);
-                if let Some(VerifiedCommandEvent::CommandFinished {
-                    command_id,
-                    execution_result,
-                }) = _cmd_event
-                {
-                    let is_integration_active = self
-                        .terminals
-                        .get(tab)
-                        .map(|e| e.shell_integration_status().is_active())
-                        .unwrap_or(false);
 
-                    if self.dopamine.is_enabled()
-                        && is_integration_active
-                        && execution_result.completion == CompletionReason::DObserved
-                        && execution_result.correlation == MetadataCorrelation::Matched
-                    {
-                        match execution_result.shell_status {
-                            ShellReportedStatus::Success => {
-                                self.dopamine.trigger_command_border(
-                                    tab,
-                                    command_id,
-                                    BorderKind::Rainbow,
-                                    std::time::Instant::now(),
-                                );
-                            }
-                            ShellReportedStatus::Failure => {
-                                self.dopamine.trigger_command_border(
-                                    tab,
-                                    command_id,
-                                    BorderKind::Red,
-                                    std::time::Instant::now(),
-                                );
-                            }
-                            ShellReportedStatus::Unknown => {}
+                if is_shell_exit {
+                    self.dopamine.on_shell_exited(tab);
+                } else {
+                    match _cmd_event {
+                        Some(VerifiedCommandEvent::CommandStarted { command_id }) => {
+                            self.dopamine.on_command_started(
+                                tab,
+                                command_id,
+                                std::time::Instant::now(),
+                            );
                         }
+                        Some(VerifiedCommandEvent::CommandFinished {
+                            command_id,
+                            execution_result,
+                        }) => {
+                            if execution_result.completion == CompletionReason::ShellExited {
+                                self.dopamine.on_shell_exited(tab);
+                            } else {
+                                let is_integration_active = self
+                                    .terminals
+                                    .get(tab)
+                                    .map(|e| e.shell_integration_status().is_active())
+                                    .unwrap_or(false);
+
+                                let valid_correlation = execution_result.completion
+                                    == CompletionReason::DObserved
+                                    && execution_result.correlation == MetadataCorrelation::Matched;
+
+                                if self.dopamine.is_enabled()
+                                    && is_integration_active
+                                    && valid_correlation
+                                {
+                                    match execution_result.shell_status {
+                                        ShellReportedStatus::Success => {
+                                            self.dopamine.trigger_command_border(
+                                                tab,
+                                                command_id,
+                                                BorderKind::Rainbow,
+                                                std::time::Instant::now(),
+                                            );
+                                            self.dopamine.on_command_finished(
+                                                tab,
+                                                command_id,
+                                                true,
+                                                true,
+                                                std::time::Instant::now(),
+                                            );
+                                        }
+                                        ShellReportedStatus::Failure => {
+                                            self.dopamine.trigger_command_border(
+                                                tab,
+                                                command_id,
+                                                BorderKind::Red,
+                                                std::time::Instant::now(),
+                                            );
+                                            self.dopamine.on_command_finished(
+                                                tab,
+                                                command_id,
+                                                false,
+                                                true,
+                                                std::time::Instant::now(),
+                                            );
+                                        }
+                                        ShellReportedStatus::Unknown => {
+                                            self.dopamine.on_command_finished(
+                                                tab,
+                                                command_id,
+                                                false,
+                                                true,
+                                                std::time::Instant::now(),
+                                            );
+                                        }
+                                    }
+                                } else if self.dopamine.is_enabled() {
+                                    let is_missing_d =
+                                        execution_result.completion == CompletionReason::MissingD;
+                                    let now = std::time::Instant::now();
+                                    self.dopamine
+                                        .on_command_finished(tab, command_id, false, false, now);
+                                    if is_missing_d {
+                                        self.dopamine.on_prompt_started(tab, now);
+                                    }
+                                }
+                            }
+                        }
+                        Some(VerifiedCommandEvent::PromptStarted) => {
+                            self.dopamine
+                                .on_prompt_started(tab, std::time::Instant::now());
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1399,6 +1456,12 @@ impl Kegon {
                     }
                     InputRoute::Command(command_id) => {
                         let active_tab = self.workbench.tabs().active().map(|tab| tab.id);
+                        let is_paste = command_id == CommandId::TerminalPaste;
+                        let pasted_text = if is_paste && self.dopamine.is_enabled() {
+                            self.system_clipboard.get_text()
+                        } else {
+                            None
+                        };
                         CommandDispatcher::dispatch(
                             command_id,
                             &mut self.workbench,
@@ -1407,6 +1470,12 @@ impl Kegon {
                                 .map(TerminalEntry::session),
                             &mut self.system_clipboard,
                         );
+                        if let Some(tab_id) = active_tab
+                            && let Some(text) = pasted_text
+                        {
+                            self.dopamine
+                                .on_text_input(tab_id, &text, std::time::Instant::now());
+                        }
                     }
                     InputRoute::Terminal => {
                         if self.terminal_focused
@@ -1415,41 +1484,60 @@ impl Kegon {
                             let is_backspace = logical_key
                                 == keyboard::Key::Named(keyboard::key::Named::Backspace);
                             let input_evt = TerminalInputEvent::press(
-                                logical_key,
+                                logical_key.clone(),
                                 physical_key,
                                 modifiers,
-                                text.map(|s| s.to_string()),
+                                text.as_deref().map(|s| s.to_string()),
                             );
                             let mode = session.keyboard_mode();
                             if let Some(bytes) = TerminalKeyEncoder::encode(&input_evt, mode) {
                                 session.write_input(bytes);
 
-                                if is_backspace && self.dopamine.is_enabled() {
-                                    let (col, line) = session.cursor_position();
-                                    let metrics = &self.terminal_font_config.metrics;
-                                    let origin_x = if col > 0 {
-                                        (col as f32 - 0.5) * metrics.cell_width
-                                    } else {
-                                        0.5 * metrics.cell_width
-                                    };
-                                    let origin_y = (line as f32 + 0.5) * metrics.cell_height;
+                                if let Some(tab_id) = self.workbench.tabs().active().map(|t| t.id)
+                                    && self.dopamine.is_enabled()
+                                {
+                                    let now = std::time::Instant::now();
+                                    if is_backspace {
+                                        let (col, line) = session.cursor_position();
+                                        let metrics = &self.terminal_font_config.metrics;
+                                        let origin_x = if col > 0 {
+                                            (col as f32 - 0.5) * metrics.cell_width
+                                        } else {
+                                            0.5 * metrics.cell_width
+                                        };
+                                        let origin_y = (line as f32 + 0.5) * metrics.cell_height;
 
-                                    let base = session.foreground_left_of_cursor().map(|fg| {
-                                        crate::terminal::renderer::convert_color(
-                                            fg,
-                                            true,
-                                            &self.active_theme.terminal,
-                                        )
-                                    });
-                                    if let Some(tab_id) =
-                                        self.workbench.tabs().active().map(|t| t.id)
-                                    {
+                                        let base = session.foreground_left_of_cursor().map(|fg| {
+                                            crate::terminal::renderer::convert_color(
+                                                fg,
+                                                true,
+                                                &self.active_theme.terminal,
+                                            )
+                                        });
+
+                                        if !modifiers.control() && !modifiers.alt() {
+                                            self.dopamine.on_backspace_input(tab_id, now);
+                                        }
                                         self.dopamine.on_backspace_colored(
                                             tab_id,
                                             Point::new(origin_x, origin_y),
                                             base,
-                                            std::time::Instant::now(),
+                                            now,
                                         );
+                                    } else if !modifiers.control() && !modifiers.alt() {
+                                        if logical_key
+                                            == keyboard::Key::Named(keyboard::key::Named::Enter)
+                                        {
+                                            self.dopamine.on_enter(tab_id, now);
+                                        } else if let Some(ref s) = text {
+                                            for c in s.chars() {
+                                                self.dopamine.on_char_input(tab_id, c, now);
+                                            }
+                                        } else if logical_key
+                                            == keyboard::Key::Named(keyboard::key::Named::Space)
+                                        {
+                                            self.dopamine.on_char_input(tab_id, ' ', now);
+                                        }
                                     }
                                 }
                             }
@@ -1483,13 +1571,23 @@ impl Kegon {
                     && let Some(session) =
                         active_entry(&self.workbench, &self.terminals).map(TerminalEntry::session)
                 {
+                    let active_tab = self.workbench.tabs().active().map(|t| t.id);
                     match ime_event {
                         ImeEvent::Preedit(text, _) => {
                             self.preedit_text = if text.is_empty() { None } else { Some(text) };
                         }
                         ImeEvent::Commit(text) => {
                             self.preedit_text = None;
-                            session.write_input(text.into_bytes());
+                            session.write_input(text.clone().into_bytes());
+                            if let Some(tab_id) = active_tab
+                                && self.dopamine.is_enabled()
+                            {
+                                self.dopamine.on_text_input(
+                                    tab_id,
+                                    &text,
+                                    std::time::Instant::now(),
+                                );
+                            }
                         }
                         ImeEvent::Closed => {
                             self.preedit_text = None;
@@ -6528,5 +6626,448 @@ mod tests {
         // Close tab clears border state
         app.update(Message::TabClosed(tab1));
         assert!(app.dopamine.border_for_tab(tab1, t0).is_none());
+    }
+
+    #[test]
+    fn dopamine_combo_and_gauge_input_flow_and_command_success_multiplier() {
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.terminal_focused = true;
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+
+        let type_char = |app: &mut Kegon, s: &str| {
+            app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(s.into()),
+                modified_key: keyboard::Key::Character(s.into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                repeat: false,
+                text: Some(s.into()),
+            }));
+        };
+
+        let type_space = |app: &mut Kegon| {
+            app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Space),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Space),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Space),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                repeat: false,
+                text: Some(" ".into()),
+            }));
+        };
+
+        let type_enter = |app: &mut Kegon| {
+            app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                repeat: false,
+                text: None,
+            }));
+        };
+
+        let t0 = Instant::now();
+
+        // 1. Initial state
+        assert_eq!(app.dopamine.combo_for_tab(tab, t0), 0);
+        assert_eq!(app.dopamine.gauge_for_tab(tab), 0);
+
+        // 2. Type "cargo" -> token 1 (combo = 1)
+        type_char(&mut app, "c");
+        type_char(&mut app, "a");
+        type_char(&mut app, "r");
+        type_char(&mut app, "g");
+        type_char(&mut app, "o");
+        assert_eq!(app.dopamine.combo_for_tab(tab, t0), 1);
+
+        // 3. Consecutive spaces do not increment combo
+        type_space(&mut app);
+        type_space(&mut app);
+        type_space(&mut app);
+        assert_eq!(app.dopamine.combo_for_tab(tab, t0), 1);
+
+        // 4. Type "test" -> token 2 (combo = 2)
+        type_char(&mut app, "t");
+        type_char(&mut app, "e");
+        type_char(&mut app, "s");
+        type_char(&mut app, "t");
+        assert_eq!(app.dopamine.combo_for_tab(tab, t0), 2);
+
+        // 5. Enter maintains combo count
+        type_enter(&mut app);
+        assert_eq!(app.dopamine.combo_for_tab(tab, t0), 2);
+
+        // 6. Verified command completion Success doubles combo (2 -> 4)
+        app.terminals
+            .command_state_machine_mut(tab)
+            .unwrap()
+            .set_expected_session_id(Some("SID_TEST".into()));
+
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "SID_TEST".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "SID_TEST".into(),
+                seq: 1,
+                shell_status: ShellReportedStatus::Success,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+
+        let t_finished = Instant::now();
+        assert_eq!(app.dopamine.combo_for_tab(tab, t_finished), 4);
+        assert_eq!(app.dopamine.gauge_for_tab(tab), 0);
+
+        // 7. Timeout at 1,000ms transfers 4 points to gauge
+        let t_timeout = t_finished + Duration::from_millis(1000);
+        app.update(Message::DopamineTicked(t_timeout));
+        assert_eq!(app.dopamine.combo_for_tab(tab, t_timeout), 0);
+        assert_eq!(app.dopamine.gauge_for_tab(tab), 4);
+    }
+
+    #[test]
+    fn dopamine_combo_failure_and_tab_isolation_and_toggle() {
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.terminal_focused = true;
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab1 = active_tab(&app);
+
+        // Type on tab1: 2 tokens
+        app.dopamine
+            .on_text_input(tab1, "cargo test", Instant::now());
+        assert_eq!(app.dopamine.combo_for_tab(tab1, Instant::now()), 2);
+
+        // Command fails -> combo is NOT doubled
+        app.terminals
+            .command_state_machine_mut(tab1)
+            .unwrap()
+            .set_expected_session_id(Some("SID_1".into()));
+
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::InputStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "SID_1".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::IndependentMetadata(Osc133Metadata {
+                version: 1,
+                session_id: "SID_1".into(),
+                seq: 1,
+                shell_status: ShellReportedStatus::Failure,
+            })),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab1,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
+        ));
+
+        // Combo remains 2 (not doubled)
+        assert_eq!(app.dopamine.combo_for_tab(tab1, Instant::now()), 2);
+
+        // Open a second tab: tab2 has 0 combo and 0 gauge
+        app.update(Message::NewTerminalTab);
+        let tab2 = active_tab(&app);
+        assert_ne!(tab1, tab2);
+        assert_eq!(app.dopamine.combo_for_tab(tab2, Instant::now()), 0);
+        assert_eq!(app.dopamine.gauge_for_tab(tab2), 0);
+
+        // Type on tab2: 1 token
+        app.dopamine.on_text_input(tab2, "git", Instant::now());
+        assert_eq!(app.dopamine.combo_for_tab(tab2, Instant::now()), 1);
+        assert_eq!(app.dopamine.combo_for_tab(tab1, Instant::now()), 2);
+
+        // Tick past timeout: tab1 gauge becomes 2, tab2 gauge becomes 1
+        let t_timeout = Instant::now() + Duration::from_millis(1500);
+        app.update(Message::DopamineTicked(t_timeout));
+        assert_eq!(app.dopamine.gauge_for_tab(tab1), 2);
+        assert_eq!(app.dopamine.gauge_for_tab(tab2), 1);
+
+        // Close tab1: clears tab1's state, tab2 is untouched
+        app.update(Message::TabClosed(tab1));
+        assert_eq!(app.dopamine.gauge_for_tab(tab1), 0);
+        assert_eq!(app.dopamine.gauge_for_tab(tab2), 1);
+
+        // Toggle dopamine OFF: clears all dopamine combo & gauge states
+        app.update(Message::SettingsDopamineToggled(false));
+        assert_eq!(app.dopamine.gauge_for_tab(tab2), 0);
+        assert_eq!(app.dopamine.combo_for_tab(tab2, Instant::now()), 0);
+    }
+
+    #[test]
+    fn dopamine_paste_and_ime_commit_tokens() {
+        use iced::advanced::input_method::Event as ImeEvent;
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::EnUs);
+        app.terminal_focused = true;
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+        let t0 = Instant::now();
+
+        // 1. IME commit with multiple tokens
+        app.update(Message::IcedEventReceived(Event::InputMethod(
+            ImeEvent::Commit(String::from("echo 日本語 テスト")),
+        )));
+        assert_eq!(app.dopamine.combo_for_tab(tab, t0), 3);
+
+        // 2. IME preedit does not add combo and does NOT refresh clock (F-3)
+        app.update(Message::IcedEventReceived(Event::InputMethod(
+            ImeEvent::Preedit(String::from("へんかん"), None),
+        )));
+        assert_eq!(app.dopamine.combo_for_tab(tab, t0), 3);
+        let t_expired = t0 + Duration::from_millis(1001);
+        assert_eq!(app.dopamine.combo_for_tab(tab, t_expired), 0);
+    }
+
+    #[test]
+    fn dopamine_shortcuts_and_anomaly_recovery() {
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+        use std::time::Instant;
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.terminal_focused = true;
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+
+        // 1. Non-character keys (e.g. ArrowUp) do not create combo or clock (F-2)
+        app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::ArrowUp),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowUp),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowUp),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            repeat: false,
+            text: None,
+        }));
+        assert_eq!(app.dopamine.combo_for_tab(tab, Instant::now()), 0);
+
+        // 2. Ctrl/Alt shortcuts (e.g. Ctrl+C) do not create combo or clock (F-5)
+        app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("c".into()),
+            modified_key: keyboard::Key::Character("c".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyC),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            repeat: false,
+            text: Some("\x03".into()),
+        }));
+        assert_eq!(app.dopamine.combo_for_tab(tab, Instant::now()), 0);
+
+        // 3. Normal typing starts combo
+        app.dopamine.on_char_input(tab, 'a', Instant::now());
+        assert_eq!(app.dopamine.combo_for_tab(tab, Instant::now()), 1);
+
+        // 4. CommandStarted (C) pauses clock during execution
+        app.terminals
+            .command_state_machine_mut(tab)
+            .unwrap()
+            .set_expected_session_id(Some("SID_ANOMALY".into()));
+
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "SID_ANOMALY".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+
+        // Animation subscriptions are quiet while command runs (F-7)
+        assert!(!app.dopamine.has_active_combos(Instant::now()));
+
+        // 5. Anomaly: PromptStarted (A) arrives without D (MissingD)
+        // Discards combo to 0 without transferring to gauge
+        app.update(Message::TerminalEventReceived(
+            tab,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        assert_eq!(app.dopamine.combo_for_tab(tab, Instant::now()), 0);
+        assert_eq!(app.dopamine.gauge_for_tab(tab), 0);
+    }
+
+    #[test]
+    fn dopamine_n1_subscription_and_n2_shell_exited_integration() {
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.terminal_focused = true;
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab1 = active_tab(&app);
+        let t0 = Instant::now();
+
+        // 1. Tab 1 Running with combo = 2
+        app.dopamine.on_text_input(tab1, "cargo test", t0);
+        assert_eq!(app.dopamine.combo_for_tab(tab1, t0), 2);
+
+        // Open Tab 2
+        app.update(Message::NewTerminalTab);
+        let tab2 = active_tab(&app);
+        assert_ne!(tab1, tab2);
+
+        // 2. Tab 2 starts a command -> Paused
+        app.dopamine.on_text_input(tab2, "git", t0);
+        app.terminals
+            .command_state_machine_mut(tab2)
+            .unwrap()
+            .set_expected_session_id(Some("SID_T2".into()));
+        app.update(Message::TerminalEventReceived(
+            tab2,
+            TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted),
+        ));
+        app.update(Message::TerminalEventReceived(
+            tab2,
+            TerminalEvent::ShellIntegration(Osc133Marker::CommandStartedWithMetadata(
+                Osc133Metadata {
+                    version: 1,
+                    session_id: "SID_T2".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                },
+            )),
+        ));
+        assert_eq!(app.dopamine.combo_for_tab(tab2, t0), 1);
+
+        // N-1 Integration Check:
+        // Advance time to 1,500ms (past 1,000ms deadline) WITHOUT calling DopamineTicked yet.
+        let t_past = t0 + Duration::from_millis(1500);
+        // Subscription must STILL be active because Tab 1 hasn't been ticked to Idle!
+        assert!(app.dopamine.has_active_combos(t_past));
+        assert!(app.dopamine.has_active_animations());
+        assert_eq!(app.dopamine.combo_for_tab(tab1, t_past), 0); // read query shows expired
+        assert_eq!(app.dopamine.effective_gauge_for_tab(tab1, t_past), 2); // points pending
+        assert_eq!(app.dopamine.gauge_for_tab(tab1), 0); // not yet transferred
+
+        // Frame ticks -> transfers Tab 1 points to gauge
+        app.update(Message::DopamineTicked(t_past));
+        assert_eq!(app.dopamine.gauge_for_tab(tab1), 2);
+        assert_eq!(app.dopamine.combo_for_tab(tab1, t_past), 0);
+
+        // Tab 1 is now Idle, Tab 2 is Paused -> NO frames required!
+        assert!(!app.dopamine.has_active_combos(t_past));
+
+        // N-2 Integration Check:
+        // Tab 2 shell exits while command is Paused
+        app.update(Message::TerminalEventReceived(
+            tab2,
+            TerminalEvent::ChildExit(Some(0)),
+        ));
+
+        // Tab 2 combo and gauge are completely discarded without transfer
+        assert_eq!(app.dopamine.combo_for_tab(tab2, t_past), 0);
+        assert_eq!(app.dopamine.gauge_for_tab(tab2), 0);
+        assert!(app.dopamine.drain_combo_events(tab2).is_empty());
+
+        // Tab 1 state is completely preserved
+        assert_eq!(app.dopamine.gauge_for_tab(tab1), 2);
+
+        // TabClosed on Tab 2 closes cleanly
+        app.update(Message::TabClosed(tab2));
+        assert_eq!(app.dopamine.gauge_for_tab(tab1), 2);
+    }
+
+    #[test]
+    fn dopamine_running_arrow_and_ime_preedit_do_not_extend_clock() {
+        use iced::advanced::input_method::Event as ImeEvent;
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.terminal_focused = true;
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+        // Start combo at a fixed past timestamp (800ms ago)
+        let t0 = Instant::now() - Duration::from_millis(800);
+        app.dopamine.on_char_input(tab, 'c', t0);
+        assert_eq!(app.dopamine.combo_for_tab(tab, t0), 1);
+
+        // 2. Press ArrowLeft/ArrowRight at t0 + 500ms: must NOT refresh clock
+        app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::ArrowLeft),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowLeft),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowLeft),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            repeat: false,
+            text: None,
+        }));
+        app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::ArrowRight),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowRight),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowRight),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            repeat: false,
+            text: None,
+        }));
+
+        // 3. IME Preedit at t0 + 700ms: must NOT refresh clock
+        app.update(Message::IcedEventReceived(Event::InputMethod(
+            ImeEvent::Preedit(String::from("へんかん"), None),
+        )));
+
+        // 4. At t0 + 1001ms (from original 'c' input): combo has expired!
+        let t_expired = t0 + Duration::from_millis(1001);
+        assert_eq!(app.dopamine.combo_for_tab(tab, t_expired), 0);
+        assert_eq!(app.dopamine.effective_gauge_for_tab(tab, t_expired), 1);
+
+        // Tick transfers 1 point
+        app.update(Message::DopamineTicked(t_expired));
+        assert_eq!(app.dopamine.gauge_for_tab(tab), 1);
+        assert_eq!(app.dopamine.combo_for_tab(tab, t_expired), 0);
     }
 }
