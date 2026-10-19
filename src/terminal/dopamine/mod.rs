@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod border;
 pub mod combo;
+pub mod gauge;
 pub mod overlay;
 pub mod params;
 pub mod particles;
@@ -23,6 +24,11 @@ pub use audio::{DopamineAudio, DopamineSoundKind};
 pub use border::{ActiveBorder, BORDER_DURATION, BorderEffect, BorderKind};
 pub use combo::{
     COMBO_TIMEOUT, ClockState, ComboEvent, MAX_COMBO, MAX_GAUGE, TabComboState, TokenPhase,
+};
+pub use gauge::{
+    ArrivalSpark, GAUGE_HEIGHT, GAUGE_INTERPOLATION_DURATION, SPARK_LIFETIME,
+    TRANSFER_FLIGHT_DURATION, TRANSFER_ORIGIN_Y, TabGaugeDisplay, TabTransferManager,
+    TransferParticle, calculate_particle_count, transfer_origin,
 };
 pub use overlay::ParticleOverlayProgram;
 #[cfg(test)]
@@ -43,6 +49,8 @@ pub struct DopamineController {
     tab_particles: HashMap<TabId, TabParticles>,
     tab_borders: HashMap<TabId, BorderEffect>,
     tab_combos: HashMap<TabId, TabComboState>,
+    tab_gauges: HashMap<TabId, TabGaugeDisplay>,
+    tab_transfers: HashMap<TabId, TabTransferManager>,
     audio: DopamineAudio,
     last_tick: Option<Instant>,
     animation_start: Option<Instant>,
@@ -56,6 +64,8 @@ impl DopamineController {
             tab_particles: HashMap::new(),
             tab_borders: HashMap::new(),
             tab_combos: HashMap::new(),
+            tab_gauges: HashMap::new(),
+            tab_transfers: HashMap::new(),
             audio: DopamineAudio::new(),
             last_tick: None,
             animation_start: if enabled { Some(Instant::now()) } else { None },
@@ -154,8 +164,25 @@ impl DopamineController {
         }
     }
 
-    /// Advances simulation using wall clock time and prunes particles and expired borders.
+    /// Advances simulation using wall clock time and default viewport dimensions.
+    #[allow(dead_code)]
     pub fn tick(&mut self, now: Instant, viewport_height: f32) {
+        self.tick_with_viewport(now, 1000.0, viewport_height, None, None);
+    }
+
+    /// Advances simulation using wall clock time, active tab context, and viewport dimensions.
+    pub fn tick_with_viewport(
+        &mut self,
+        now: Instant,
+        viewport_width: f32,
+        viewport_height: f32,
+        active_tab: Option<TabId>,
+        hit_origin: Option<Point>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+
         let dt = if let Some(last) = self.last_tick {
             (now - last).as_secs_f32()
         } else {
@@ -168,9 +195,76 @@ impl DopamineController {
         self.tab_borders.retain(|_, b| !b.is_expired(now));
 
         // Advance combo timers and transfer points across all tabs
-        for state in self.tab_combos.values_mut() {
+        for (&tab_id, state) in self.tab_combos.iter_mut() {
             state.tick(now);
+            let events = state.drain_events();
+            for event in events {
+                match event {
+                    ComboEvent::TransferredToGauge {
+                        points,
+                        gauge_total,
+                    } => {
+                        let gauge_display = self.tab_gauges.entry(tab_id).or_insert_with(|| {
+                            TabGaugeDisplay::new(gauge_total.saturating_sub(points))
+                        });
+
+                        if active_tab == Some(tab_id) {
+                            gauge_display.set_target(gauge_total, now);
+
+                            let origin = transfer_origin(
+                                hit_origin.map_or(viewport_width / 2.0, |p| p.x),
+                                viewport_width,
+                                viewport_height,
+                            );
+                            let target_x = (viewport_width * (gauge_total as f32 / 100.0))
+                                .clamp(8.0, (viewport_width - 8.0).max(8.0));
+                            let target_y = viewport_height - GAUGE_HEIGHT / 2.0;
+                            let target = Point::new(target_x, target_y);
+
+                            self.tab_transfers
+                                .entry(tab_id)
+                                .or_default()
+                                .spawn_transfer(points, origin, target, now);
+                        } else {
+                            gauge_display.snap_to(gauge_total);
+                        }
+                    }
+                    ComboEvent::GaugeMaxReached => {}
+                    ComboEvent::ComboIncremented { .. }
+                    | ComboEvent::CommandSuccessDoubled { .. } => {}
+                }
+            }
         }
+
+        // Advance gauge interpolation animations
+        for gauge in self.tab_gauges.values_mut() {
+            gauge.update(now);
+        }
+
+        // Re-synchronise the display with the Combo Core ground truth. Events only start the
+        // visual effect; the Combo Core gauge is the single source of truth, so a lost event
+        // (e.g. bounded queue overflow) converges here. Running interpolations are left alone.
+        for (&tab_id, state) in self.tab_combos.iter() {
+            let canonical = state.gauge();
+            match self.tab_gauges.get_mut(&tab_id) {
+                Some(display) => {
+                    display.resync(canonical);
+                }
+                None if canonical > 0 => {
+                    self.tab_gauges
+                        .insert(tab_id, TabGaugeDisplay::new(canonical));
+                }
+                None => {}
+            }
+        }
+
+        // Advance transfer particle flights and arrival sparks
+        for transfer in self.tab_transfers.values_mut() {
+            transfer.update(now);
+        }
+
+        // Prune inactive transfer managers to keep memory bounded
+        self.tab_transfers.retain(|_, t| t.is_active());
     }
 
     /// Triggers a command completion border effect for the specified tab.
@@ -216,14 +310,56 @@ impl DopamineController {
         self.enabled && self.tab_borders.values().any(|b| !b.is_expired(now))
     }
 
-    /// Whether any tab has active particles, borders, or active combo timer requiring animation frame redraws.
+    /// Whether any tab has active particles, borders, combo countdowns, transfers, or gauge interpolations.
     #[allow(dead_code)]
     pub fn has_active_animations(&self) -> bool {
         if !self.enabled {
             return false;
         }
         let now = Instant::now();
-        self.has_active_particles() || self.has_active_borders(now) || self.has_active_combos(now)
+        self.has_active_particles()
+            || self.has_active_borders(now)
+            || self.has_active_combos(now)
+            || self.has_active_transfers()
+            || self.has_active_gauge_animations(now)
+    }
+
+    /// Returns the gauge display state for `tab_id`, if any.
+    pub fn gauge_display_for_tab(&self, tab_id: TabId) -> Option<&TabGaugeDisplay> {
+        if !self.enabled {
+            return None;
+        }
+        self.tab_gauges.get(&tab_id)
+    }
+
+    /// Returns the transfer manager for `tab_id`, if active and enabled.
+    pub fn transfer_for_tab(&self, tab_id: TabId) -> Option<&TabTransferManager> {
+        if !self.enabled {
+            return None;
+        }
+        self.tab_transfers.get(&tab_id)
+    }
+
+    /// Returns current displayed gauge value (interpolated) for `tab_id`.
+    #[allow(dead_code)]
+    pub fn displayed_gauge_for_tab(&self, tab_id: TabId) -> f32 {
+        if !self.enabled {
+            return 0.0;
+        }
+        self.tab_gauges
+            .get(&tab_id)
+            .map(|g| g.displayed_value())
+            .unwrap_or(0.0)
+    }
+
+    /// Whether any tab has active transfer particles/sparks requiring animation frame redraws.
+    pub fn has_active_transfers(&self) -> bool {
+        self.enabled && self.tab_transfers.values().any(|t| t.is_active())
+    }
+
+    /// Whether any tab has an active gauge interpolation requiring animation frame redraws.
+    pub fn has_active_gauge_animations(&self, now: Instant) -> bool {
+        self.enabled && self.tab_gauges.values().any(|g| g.is_animating(now))
     }
 
     /// Whether any terminal tab currently has alive particles that require animation frames.
@@ -404,10 +540,15 @@ impl DopamineController {
         if !self.enabled {
             return false;
         }
-        self.tab_combos
+        let consumed = self
+            .tab_combos
             .get_mut(&tab_id)
             .map(|s| s.consume_gauge_burst())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if consumed && let Some(gauge) = self.tab_gauges.get_mut(&tab_id) {
+            gauge.snap_to(0);
+        }
+        consumed
     }
 
     /// Cleans up only the combo counter, gauge, and pending combo events for `tab_id`,
@@ -416,6 +557,8 @@ impl DopamineController {
     /// Combo transfer is NOT performed (points are discarded).
     pub fn clear_tab_combo(&mut self, tab_id: TabId) {
         self.tab_combos.remove(&tab_id);
+        self.tab_gauges.remove(&tab_id);
+        self.tab_transfers.remove(&tab_id);
     }
 
     /// Handles child shell exit for `tab_id` by safely discarding its combo state.
@@ -428,6 +571,8 @@ impl DopamineController {
         self.tab_particles.remove(&tab_id);
         self.tab_borders.remove(&tab_id);
         self.tab_combos.remove(&tab_id);
+        self.tab_gauges.remove(&tab_id);
+        self.tab_transfers.remove(&tab_id);
     }
 
     /// Clears all particles, border effects, and combo/gauge states across all tabs.
@@ -435,6 +580,8 @@ impl DopamineController {
         self.tab_particles.clear();
         self.tab_borders.clear();
         self.tab_combos.clear();
+        self.tab_gauges.clear();
+        self.tab_transfers.clear();
         self.last_tick = None;
     }
 
@@ -757,5 +904,361 @@ mod tests {
         // N-2 Requirement 8: Disabled controller does not panic on on_shell_exited
         ctrl.set_enabled(false);
         ctrl.on_shell_exited(tab1);
+    }
+
+    #[test]
+    fn controller_slice3_active_tab_transfer_and_gauge_interpolation() {
+        use std::time::Duration;
+
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let tab1 = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+
+        // Type a command to build combo = 5
+        ctrl.on_text_input(tab1, "git commit -m foo bar", t0);
+        assert_eq!(ctrl.combo_for_tab(tab1, t0), 5);
+        assert_eq!(ctrl.gauge_for_tab(tab1), 0);
+
+        // Advance past 1,000ms combo timeout
+        let t_timeout = t0 + Duration::from_millis(1005);
+
+        // Tick with tab1 as active tab
+        let hit_origin = Point::new(100.0, -17.5);
+        ctrl.tick_with_viewport(t_timeout, 800.0, 600.0, Some(tab1), Some(hit_origin));
+
+        // Combo Core gauge is now 5
+        assert_eq!(ctrl.gauge_for_tab(tab1), 5);
+        assert_eq!(ctrl.combo_for_tab(tab1, t_timeout), 0);
+
+        // Gauge display is created and interpolating towards 5
+        let gauge = ctrl.gauge_display_for_tab(tab1).expect("gauge exists");
+        assert_eq!(gauge.target_value(), 5.0);
+        assert!(gauge.is_animating(t_timeout));
+        assert!(ctrl.has_active_gauge_animations(t_timeout));
+
+        // Transfer manager exists and has active flying particles
+        let transfer = ctrl.transfer_for_tab(tab1).expect("transfer exists");
+        assert!(transfer.is_active());
+        assert!(ctrl.has_active_transfers());
+        assert!(ctrl.has_active_animations());
+
+        // Events have been drained (no leftover queue)
+        assert!(ctrl.drain_combo_events(tab1).is_empty());
+
+        // Fast forward 1 second: transfer particles finish & sparks extinguish
+        let t_end = t_timeout + Duration::from_millis(1000);
+        ctrl.tick_with_viewport(t_end, 800.0, 600.0, Some(tab1), Some(hit_origin));
+
+        assert_eq!(ctrl.displayed_gauge_for_tab(tab1), 5.0);
+        assert!(!ctrl.has_active_transfers());
+        assert!(!ctrl.has_active_gauge_animations(t_end));
+    }
+
+    #[test]
+    fn controller_slice3_inactive_tab_snaps_gauge_without_particles() {
+        use std::time::Duration;
+
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let active_tab = tabs.add(TabKind::Terminal);
+        let background_tab = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+
+        // Build combo = 3 on background tab
+        ctrl.on_text_input(background_tab, "cat file.txt", t0);
+        assert_eq!(ctrl.combo_for_tab(background_tab, t0), 2);
+
+        // Advance past 1,000ms combo timeout
+        let t_timeout = t0 + Duration::from_millis(1005);
+
+        // Tick with active_tab (NOT background_tab)
+        ctrl.tick_with_viewport(t_timeout, 800.0, 600.0, Some(active_tab), None);
+
+        // Background tab's gauge value is immediately updated
+        assert_eq!(ctrl.gauge_for_tab(background_tab), 2);
+
+        // Background tab's display snapped to 2.0 without animating
+        let gauge = ctrl
+            .gauge_display_for_tab(background_tab)
+            .expect("gauge exists");
+        assert_eq!(gauge.target_value(), 2.0);
+        assert_eq!(gauge.displayed_value(), 2.0);
+        assert!(!gauge.is_animating(t_timeout));
+
+        // NO transfer particles spawned for background tab
+        assert!(ctrl.transfer_for_tab(background_tab).is_none());
+        assert!(!ctrl.has_active_transfers());
+    }
+
+    #[test]
+    fn controller_slice3_cleanup_clears_gauge_and_transfer() {
+        use std::time::Duration;
+
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let tab1 = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+
+        ctrl.on_text_input(tab1, "vim test", t0);
+        let t_timeout = t0 + Duration::from_millis(1005);
+        ctrl.tick_with_viewport(t_timeout, 800.0, 600.0, Some(tab1), None);
+
+        assert!(ctrl.gauge_display_for_tab(tab1).is_some());
+        assert!(ctrl.transfer_for_tab(tab1).is_some());
+
+        // clear_tab cleans up both
+        ctrl.clear_tab(tab1);
+        assert!(ctrl.gauge_display_for_tab(tab1).is_none());
+        assert!(ctrl.transfer_for_tab(tab1).is_none());
+        assert_eq!(ctrl.gauge_for_tab(tab1), 0);
+    }
+
+    fn typed_tokens(n: usize) -> String {
+        (0..n).map(|_| "a").collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn slice3_f1_launch_points_and_trajectories_stay_inside_canvas() {
+        use std::time::Duration;
+
+        for (w, h) in [
+            (800.0_f32, 600.0_f32),
+            (120.0, 40.0),
+            (10.0, 10.0),
+            (1.0, 1.0),
+        ] {
+            let mut ctrl = DopamineController::new(true);
+            let mut tabs = WorkbenchTabs::default();
+            let tab = tabs.add(TabKind::Terminal);
+            let t0 = Instant::now();
+            ctrl.on_text_input(tab, &typed_tokens(30), t0);
+            // The legacy hit origin (y = -17.5, outside the canvas) must be pulled inside.
+            let t1 = t0 + Duration::from_millis(1005);
+            ctrl.tick_with_viewport(t1, w, h, Some(tab), Some(Point::new(-40.0, -17.5)));
+
+            let transfer = ctrl.transfer_for_tab(tab).expect("transfer spawned");
+            assert!(!transfer.particles().is_empty());
+            for p in transfer.particles() {
+                assert!(
+                    p.start.x >= 0.0 && p.start.x <= w,
+                    "start.x {} / {w}",
+                    p.start.x
+                );
+                assert!(
+                    p.start.y >= 0.0 && p.start.y <= h,
+                    "start.y {} / {h}",
+                    p.start.y
+                );
+                assert!(p.end.x.is_finite() && p.end.y.is_finite());
+                for k in 0..=20 {
+                    let at = p.start_time + p.duration.mul_f32(k as f32 / 20.0);
+                    let pos = p.current_pos(at).expect("launched");
+                    assert!(pos.x.is_finite() && pos.y.is_finite());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slice3_f1_launch_point_keeps_horizontal_badge_position_and_gauge_end() {
+        use std::time::Duration;
+
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let tab = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+        ctrl.on_text_input(tab, &typed_tokens(50), t0);
+        let t1 = t0 + Duration::from_millis(1005);
+        ctrl.tick_with_viewport(t1, 800.0, 600.0, Some(tab), Some(Point::new(412.0, -17.5)));
+
+        let transfer = ctrl.transfer_for_tab(tab).unwrap();
+        assert!(
+            transfer
+                .particles()
+                .iter()
+                .all(|p| p.start == Point::new(412.0, TRANSFER_ORIGIN_Y))
+        );
+        // Gauge value 50 of 100 -> the end point sits near the fill tip (x = 400), inside the bar.
+        for p in transfer.particles() {
+            assert!((p.end.x - 400.0).abs() <= 8.0, "end.x {}", p.end.x);
+            assert!((p.end.y - (600.0 - GAUGE_HEIGHT / 2.0)).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn slice3_f2_lost_event_without_display_is_recreated_from_ground_truth() {
+        use std::time::Duration;
+
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let tab = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+        ctrl.on_text_input(tab, &typed_tokens(7), t0);
+        let t1 = t0 + Duration::from_millis(1005);
+        // Enter applies the timeout lazily; the resulting event is then lost.
+        ctrl.on_enter(tab, t1);
+        assert_eq!(ctrl.gauge_for_tab(tab), 7);
+        assert!(!ctrl.drain_combo_events(tab).is_empty());
+
+        ctrl.tick_with_viewport(t1, 800.0, 600.0, Some(tab), None);
+        assert_eq!(ctrl.displayed_gauge_for_tab(tab), 7.0);
+        assert_eq!(
+            ctrl.gauge_for_tab(tab),
+            7,
+            "ground truth is never rewritten"
+        );
+        assert!(
+            ctrl.transfer_for_tab(tab).is_none(),
+            "no effect without an event"
+        );
+    }
+
+    #[test]
+    fn slice3_f2_lost_event_after_idle_display_snaps_to_ground_truth() {
+        use std::time::Duration;
+
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let tab = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+
+        ctrl.on_text_input(tab, &typed_tokens(2), t0);
+        let t1 = t0 + Duration::from_millis(1005);
+        ctrl.tick_with_viewport(t1, 800.0, 600.0, Some(tab), None);
+        let t2 = t1 + Duration::from_millis(500);
+        ctrl.tick_with_viewport(t2, 800.0, 600.0, Some(tab), None);
+        assert_eq!(ctrl.displayed_gauge_for_tab(tab), 2.0);
+
+        // Second transfer: +3, but its event never reaches the display.
+        ctrl.on_text_input(tab, &typed_tokens(3), t2);
+        let t3 = t2 + Duration::from_millis(1005);
+        ctrl.on_enter(tab, t3);
+        assert_eq!(ctrl.gauge_for_tab(tab), 5);
+        ctrl.drain_combo_events(tab);
+
+        ctrl.tick_with_viewport(t3, 800.0, 600.0, Some(tab), None);
+        assert_eq!(ctrl.displayed_gauge_for_tab(tab), 5.0);
+        assert_eq!(ctrl.gauge_for_tab(tab), 5);
+    }
+
+    #[test]
+    fn slice3_f2_running_interpolation_is_not_interrupted_and_ends_on_truth() {
+        use std::time::Duration;
+
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let tab = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+        ctrl.on_text_input(tab, &typed_tokens(40), t0);
+        let t1 = t0 + Duration::from_millis(1005);
+        ctrl.tick_with_viewport(t1, 800.0, 600.0, Some(tab), None);
+        assert_eq!(ctrl.gauge_for_tab(tab), 40);
+
+        // Mid-flight: display strictly between start and truth, still animating, not snapped.
+        let t_mid = t1 + Duration::from_millis(200);
+        ctrl.tick_with_viewport(t_mid, 800.0, 600.0, Some(tab), None);
+        let mid = ctrl.displayed_gauge_for_tab(tab);
+        assert!(mid > 0.0 && mid < 40.0, "mid = {mid}");
+        assert!(ctrl.has_active_gauge_animations(t_mid));
+
+        // Monotone, and exactly the truth at 450 ms.
+        let t_late = t1 + Duration::from_millis(300);
+        ctrl.tick_with_viewport(t_late, 800.0, 600.0, Some(tab), None);
+        assert!(ctrl.displayed_gauge_for_tab(tab) >= mid);
+        let t_end = t1 + Duration::from_millis(450);
+        ctrl.tick_with_viewport(t_end, 800.0, 600.0, Some(tab), None);
+        assert_eq!(ctrl.displayed_gauge_for_tab(tab), 40.0);
+        assert!(!ctrl.has_active_gauge_animations(t_end));
+    }
+
+    #[test]
+    fn slice3_f2_retargeting_mid_interpolation_continues_from_current_value() {
+        use std::time::Duration;
+
+        // 20 -> 48 at t=0, then 48 -> 76 at t=200ms, must reach 76 at t=650ms.
+        let t0 = Instant::now();
+        let mut display = TabGaugeDisplay::new(20);
+        display.set_target(48, t0);
+        let t200 = t0 + Duration::from_millis(200);
+        display.update(t200);
+        let at_200 = display.displayed_value();
+        assert!(at_200 > 20.0 && at_200 < 48.0);
+
+        display.set_target(76, t200);
+        assert_eq!(display.target_value(), 76.0);
+        let mut prev = at_200;
+        for ms in (210..=650).step_by(10) {
+            display.update(t0 + Duration::from_millis(ms));
+            let v = display.displayed_value();
+            assert!(
+                v >= prev - 1e-4,
+                "display moved backwards at {ms}ms: {prev} -> {v}"
+            );
+            assert!(v <= 76.0 + 1e-4);
+            prev = v;
+        }
+        assert_eq!(display.displayed_value(), 76.0);
+        assert!(!display.is_animating(t0 + Duration::from_millis(650)));
+        // Re-sending the same (already reached) target does not restart the animation.
+        display.set_target(76, t0 + Duration::from_millis(700));
+        assert!(!display.is_animating(t0 + Duration::from_millis(700)));
+    }
+
+    #[test]
+    fn slice3_f2_tabs_sync_independently_and_lifecycle_does_not_resurrect_state() {
+        use std::time::Duration;
+
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let b = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+        ctrl.on_text_input(a, &typed_tokens(4), t0);
+        ctrl.on_text_input(b, &typed_tokens(9), t0);
+        let t1 = t0 + Duration::from_millis(1005);
+        ctrl.on_enter(a, t1);
+        ctrl.on_enter(b, t1);
+        ctrl.drain_combo_events(a);
+        ctrl.drain_combo_events(b);
+
+        // `a` is active, `b` is in the background; both lost their events.
+        ctrl.tick_with_viewport(t1, 800.0, 600.0, Some(a), None);
+        assert_eq!(ctrl.displayed_gauge_for_tab(a), 4.0);
+        assert_eq!(ctrl.displayed_gauge_for_tab(b), 9.0);
+
+        // Close: nothing is re-created from stale state.
+        ctrl.clear_tab(a);
+        ctrl.tick_with_viewport(t1 + Duration::from_millis(16), 800.0, 600.0, Some(b), None);
+        assert!(ctrl.gauge_display_for_tab(a).is_none());
+        assert_eq!(ctrl.displayed_gauge_for_tab(b), 9.0);
+
+        // ShellExited on b.
+        ctrl.on_shell_exited(b);
+        ctrl.tick_with_viewport(t1 + Duration::from_millis(32), 800.0, 600.0, Some(b), None);
+        assert!(ctrl.gauge_display_for_tab(b).is_none());
+        assert_eq!(ctrl.gauge_for_tab(b), 0);
+
+        // Mode OFF then ON: old gauges never come back.
+        ctrl.on_text_input(a, &typed_tokens(3), t1);
+        ctrl.on_enter(a, t1 + Duration::from_millis(1005));
+        ctrl.set_enabled(false);
+        ctrl.tick_with_viewport(
+            t1 + Duration::from_millis(2100),
+            800.0,
+            600.0,
+            Some(a),
+            None,
+        );
+        ctrl.set_enabled(true);
+        ctrl.tick_with_viewport(
+            t1 + Duration::from_millis(2200),
+            800.0,
+            600.0,
+            Some(a),
+            None,
+        );
+        assert!(ctrl.gauge_display_for_tab(a).is_none());
+        assert_eq!(ctrl.gauge_for_tab(a), 0);
     }
 }

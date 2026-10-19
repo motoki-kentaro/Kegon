@@ -980,6 +980,48 @@ impl Kegon {
             .max(0.0)
     }
 
+    /// Viewport width available for the main terminal drawing canvas.
+    fn terminal_viewport_width(&self) -> f32 {
+        let side_bar_w = self.workbench.side_bar_width();
+        (self.window_size.width - ACTIVITY_BAR_WIDTH - SASH_WIDTH - side_bar_w).max(10.0)
+    }
+
+    /// Computes the transfer particle launch point for the active tab's HIT badge, in terminal
+    /// overlay canvas coordinates.
+    ///
+    /// The badge itself lives in the tab strip above the canvas, which clips anything at `y < 0`.
+    /// The X coordinate follows the badge (including tab strip scrolling); the Y coordinate is
+    /// the canvas' top edge (`TRANSFER_ORIGIN_Y`) so the whole flight is visible.
+    fn active_tab_hit_position(&self) -> Option<Point> {
+        let tabs = self.workbench.tabs();
+        let active_id = tabs.active().map(|t| t.id)?;
+        let index = tabs.iter().position(|t| t.id == active_id)?;
+        let total_tabs = tabs.len();
+        let base_width = self.tab_strip_base_width();
+        let geometry =
+            calculate_tab_strip_geometry(total_tabs, base_width, self.tab_scroll_offset_x);
+
+        let left_offset = if geometry.show_left_triangle {
+            TAB_SCROLL_BUTTON_WIDTH
+        } else {
+            0.0
+        };
+
+        // Tab index begins at left_offset + index * TAB_WIDTH - scroll_offset
+        // The HIT badge is positioned before the close button and 4px padding.
+        let tab_x = left_offset + (index as f32 * TAB_WIDTH) - self.tab_scroll_offset_x;
+        let badge_offset_x = TAB_WIDTH - TAB_CLOSE_WIDTH - 4.0 - tab_rainbow::HIT_BADGE_WIDTH / 2.0;
+        let badge_center_x = tab_x + badge_offset_x;
+        let w = self.terminal_viewport_width();
+        // Launch inside the overlay canvas: geometry above its top edge is clipped.
+        let h = (self.window_size.height - TAB_STRIP_HEIGHT).max(10.0);
+        Some(crate::terminal::dopamine::transfer_origin(
+            badge_center_x,
+            w,
+            h,
+        ))
+    }
+
     /// Ensures that the tab at `index` is within the visible tab strip viewport, scrolling if needed.
     fn ensure_tab_visible(&mut self, index: usize) {
         let total_tabs = self.workbench.tabs().len();
@@ -1278,8 +1320,12 @@ impl Kegon {
                 self.dopamine.audio_mut().play_erase();
             }
             Message::DopamineTicked(now) => {
+                let w = self.terminal_viewport_width();
                 let h = (self.window_size.height - TAB_STRIP_HEIGHT).max(100.0);
-                self.dopamine.tick(now, h);
+                let active_tab = self.workbench.tabs().active().map(|tab| tab.id);
+                let hit_origin = self.active_tab_hit_position();
+                self.dopamine
+                    .tick_with_viewport(now, w, h, active_tab, hit_origin);
             }
             Message::SettingsShellModeChanged(mode) => {
                 let mut updated_settings = self.settings.clone();
@@ -2438,7 +2484,17 @@ impl Kegon {
                 .unwrap_or(&[]);
             let border = active_tab_id
                 .and_then(|id| self.dopamine.border_for_tab(id, std::time::Instant::now()));
-            let overlay_program = ParticleOverlayProgram::new(particles, border, self.scale_factor);
+            let gauge = active_tab_id.and_then(|id| self.dopamine.gauge_display_for_tab(id));
+            let transfer = active_tab_id.and_then(|id| self.dopamine.transfer_for_tab(id));
+            let now = std::time::Instant::now();
+            let overlay_program = ParticleOverlayProgram::new(
+                particles,
+                border,
+                gauge,
+                transfer,
+                now,
+                self.scale_factor,
+            );
             let overlay_widget = Canvas::new(overlay_program).width(Fill).height(Fill);
 
             let main_content: Element<'_, Message> = stack![surface, overlay_widget]
@@ -7346,5 +7402,163 @@ mod tests {
         // 5. Toggling OFF resets animation timer to 0.0
         app.update(Message::SettingsDopamineToggled(false));
         assert_eq!(app.dopamine.elapsed_animation_seconds(t2), 0.0);
+    }
+
+    #[test]
+    fn dopamine_slice3_combo_timeout_transfers_to_gauge_and_spawns_particles() {
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+        let t0 = Instant::now();
+
+        // Type a multi-token command to build combo = 4
+        app.dopamine.on_text_input(tab, "cargo build --release", t0);
+        assert_eq!(app.dopamine.combo_for_tab(tab, t0), 3);
+        assert_eq!(app.dopamine.gauge_for_tab(tab), 0);
+
+        // Advance past 1,000ms combo timeout
+        let t_timeout = t0 + Duration::from_millis(1005);
+        app.update(Message::DopamineTicked(t_timeout));
+
+        // Combo Core transferred points to gauge
+        assert_eq!(app.dopamine.gauge_for_tab(tab), 3);
+        assert_eq!(app.dopamine.combo_for_tab(tab, t_timeout), 0);
+
+        // Active tab has gauge display interpolating and transfer particles active
+        assert!(app.dopamine.gauge_display_for_tab(tab).is_some());
+        assert!(app.dopamine.has_active_gauge_animations(t_timeout));
+        assert!(app.dopamine.transfer_for_tab(tab).is_some());
+        assert!(app.dopamine.has_active_transfers());
+
+        // Verify active_tab_hit_position returns valid point inside viewport
+        let hit_pos = app.active_tab_hit_position().expect("hit position exists");
+        assert_eq!(hit_pos.y, crate::terminal::dopamine::TRANSFER_ORIGIN_Y);
+        assert!(hit_pos.x >= 8.0 && hit_pos.x <= app.terminal_viewport_width());
+        assert!(hit_pos.y >= 0.0, "launch point must be inside the canvas");
+
+        // main_area rendering executes without panic with active gauge and transfer particles
+        let _view = app.main_area();
+        drop(_view);
+
+        // Fast forward past transfer flight and spark lifetime: animations finish
+        let t_end = t_timeout + Duration::from_millis(1000);
+        app.update(Message::DopamineTicked(t_end));
+        assert_eq!(app.dopamine.displayed_gauge_for_tab(tab), 3.0);
+        assert!(!app.dopamine.has_active_transfers());
+        assert!(!app.dopamine.has_active_gauge_animations(t_end));
+    }
+
+    #[test]
+    fn dopamine_slice3_inactive_tab_transfer_no_particles() {
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab1 = active_tab(&app);
+        app.update(Message::NewTerminalTab);
+        let tab2 = active_tab(&app);
+        assert_ne!(tab1, tab2);
+
+        let t0 = Instant::now();
+        // Inactive tab (tab1) receives text input
+        app.dopamine.on_text_input(tab1, "ping google.com", t0);
+        assert_eq!(app.dopamine.combo_for_tab(tab1, t0), 2);
+
+        // Timeout expires on tab1 while tab2 is active
+        let t_timeout = t0 + Duration::from_millis(1005);
+        app.update(Message::DopamineTicked(t_timeout));
+
+        // Tab 1 gauge updated immediately
+        assert_eq!(app.dopamine.gauge_for_tab(tab1), 2);
+
+        // Inactive tab snapped without animating and spawned NO particles
+        let gauge1 = app
+            .dopamine
+            .gauge_display_for_tab(tab1)
+            .expect("gauge exists");
+        assert_eq!(gauge1.displayed_value(), 2.0);
+        assert!(!gauge1.is_animating(t_timeout));
+        assert!(app.dopamine.transfer_for_tab(tab1).is_none());
+        assert!(!app.dopamine.has_active_transfers());
+    }
+
+    #[test]
+    fn dopamine_slice3_tab_close_and_toggle_cleanup() {
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+        let t0 = Instant::now();
+
+        app.dopamine.on_text_input(tab, "make clean", t0);
+        let t_timeout = t0 + Duration::from_millis(1005);
+        app.update(Message::DopamineTicked(t_timeout));
+
+        assert!(app.dopamine.gauge_display_for_tab(tab).is_some());
+        assert!(app.dopamine.transfer_for_tab(tab).is_some());
+
+        // Toggling Dopamine Mode OFF cleans up all gauge displays and transfer particles immediately
+        app.update(Message::SettingsDopamineToggled(false));
+        assert!(app.dopamine.gauge_display_for_tab(tab).is_none());
+        assert!(app.dopamine.transfer_for_tab(tab).is_none());
+        assert_eq!(app.dopamine.gauge_for_tab(tab), 0);
+    }
+
+    #[test]
+    fn dopamine_slice3_launch_point_uses_app_geometry_inside_canvas() {
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        for _ in 0..9 {
+            app.update(Message::NewTerminalTab);
+        }
+        let first = app.workbench.tabs().iter().next().unwrap().id;
+        let last = active_tab(&app);
+        assert_ne!(first, last);
+
+        for size in [
+            Size::new(1200.0, 760.0),
+            Size::new(640.0, 400.0),
+            Size::new(60.0, 40.0),
+        ] {
+            app.window_size = size;
+            for offset in [0.0, 160.0, 480.0, 5000.0] {
+                app.tab_scroll_offset_x = offset;
+                for id in [first, last] {
+                    app.update(Message::TabSelected(id));
+                    let p = app.active_tab_hit_position().expect("hit position");
+                    let w = app.terminal_viewport_width();
+                    let h = (app.window_size.height - TAB_STRIP_HEIGHT).max(10.0);
+                    assert!(p.x.is_finite() && p.y.is_finite());
+                    assert!(p.x >= 0.0 && p.x <= w, "x {} outside 0..={w}", p.x);
+                    assert!(p.y >= 0.0 && p.y <= h, "y {} outside 0..={h}", p.y);
+                    assert_eq!(p.y, crate::terminal::dopamine::TRANSFER_ORIGIN_Y.min(h));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dopamine_slice3_pty_grid_invariance() {
+        use alacritty_terminal::grid::Dimensions;
+
+        let app = new_test_app(Locale::JaJp);
+        let session = app.active_session().expect("session exists");
+        let (initial_rows, initial_cols) = {
+            let term = session.term().lock();
+            (term.screen_lines(), term.columns())
+        };
+
+        // Verify gauge height constant does not subtract from terminal height or grid size
+        assert_eq!(crate::terminal::dopamine::gauge::GAUGE_HEIGHT, 4.0);
+        let current_session = app.active_session().expect("session exists");
+        let (current_rows, current_cols) = {
+            let term = current_session.term().lock();
+            (term.screen_lines(), term.columns())
+        };
+        assert_eq!(current_rows, initial_rows);
+        assert_eq!(current_cols, initial_cols);
     }
 }

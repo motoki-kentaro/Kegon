@@ -8,20 +8,35 @@ use iced::widget::canvas::{Frame, Geometry, Path, Program};
 use iced::{Color, Point, Rectangle};
 
 use super::border::{ActiveBorder, paint_border};
+use super::gauge::{TabGaugeDisplay, TabTransferManager};
 use super::params::VISUAL;
 use super::particles::{Look, Particle, ParticleKind};
+use std::time::Instant;
 
 pub struct ParticleOverlayProgram<'a> {
     particles: &'a [Particle],
     border: Option<ActiveBorder>,
+    gauge: Option<&'a TabGaugeDisplay>,
+    transfer: Option<&'a TabTransferManager>,
+    now: Instant,
     scale_factor: f32,
 }
 
 impl<'a> ParticleOverlayProgram<'a> {
-    pub fn new(particles: &'a [Particle], border: Option<ActiveBorder>, scale_factor: f32) -> Self {
+    pub fn new(
+        particles: &'a [Particle],
+        border: Option<ActiveBorder>,
+        gauge: Option<&'a TabGaugeDisplay>,
+        transfer: Option<&'a TabTransferManager>,
+        now: Instant,
+        scale_factor: f32,
+    ) -> Self {
         Self {
             particles,
             border,
+            gauge,
+            transfer,
+            now,
             scale_factor,
         }
     }
@@ -89,8 +104,10 @@ impl<'a, Message> Program<Message> for ParticleOverlayProgram<'a> {
     ) -> Vec<Geometry> {
         let has_particles = !self.particles.is_empty();
         let has_border = self.border.is_some();
+        let has_gauge = self.gauge.is_some_and(|g| g.is_visible());
+        let has_transfer = self.transfer.is_some_and(|t| t.is_active());
 
-        if !has_particles && !has_border {
+        if !has_particles && !has_border && !has_gauge && !has_transfer {
             return Vec::new();
         }
 
@@ -100,6 +117,14 @@ impl<'a, Message> Program<Message> for ParticleOverlayProgram<'a> {
             && border.alpha > 0.001
         {
             paint_border(&mut frame, bounds.size(), border, self.scale_factor);
+        }
+
+        if let Some(gauge) = self.gauge {
+            gauge.paint(&mut frame, bounds.size());
+        }
+
+        if let Some(transfer) = self.transfer {
+            transfer.paint(&mut frame, self.now);
         }
 
         if has_particles {
