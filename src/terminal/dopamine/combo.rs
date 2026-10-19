@@ -180,6 +180,7 @@ impl TabComboState {
     /// until timeout processing is applied by `tick`.
     ///
     /// When paused during command execution (C ~ D), or when idle after timeout, this returns false.
+    #[allow(dead_code)]
     pub fn is_clock_ticking(&self, _now: Instant) -> bool {
         matches!(self.clock_state, ClockState::Running { .. }) && self.combo > 0
     }

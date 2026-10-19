@@ -42,6 +42,7 @@ use crate::settings::{
     ShellPathError, TerminalMetric, ThemePreference, resolve_application_locale, save_settings,
     validate_shell_path,
 };
+use crate::terminal::dopamine::tab_rainbow;
 use crate::terminal::{
     BorderKind, CommandState, CompletionReason, DopamineController, DopamineSoundKind, EventSink,
     InputArbiter, InputRoute, MetadataCorrelation, ParticleOverlayProgram, ShellIntegrationStatus,
@@ -54,9 +55,9 @@ use crate::workbench::{ActivityItem, SIDE_BAR_DEFAULT_WIDTH, TabId, TabKind, Wor
 
 const ACTIVITY_BAR_WIDTH: f32 = 48.0;
 const SASH_WIDTH: f32 = 4.0;
-const TAB_STRIP_HEIGHT: f32 = 35.0;
+pub(crate) const TAB_STRIP_HEIGHT: f32 = 35.0;
 /// Width of every tab in the tab strip.
-const TAB_WIDTH: f32 = 160.0;
+pub(crate) const TAB_WIDTH: f32 = 160.0;
 const TAB_CLOSE_WIDTH: f32 = 24.0;
 const TAB_SCROLL_BUTTON_WIDTH: f32 = 24.0;
 const TAB_SCROLLABLE_ID: &str = "workbench_tab_scrollable";
@@ -1698,7 +1699,7 @@ impl Kegon {
         let events = event::listen().map(Message::IcedEventReceived);
         let terminal_events = Subscription::run(terminal_events_stream);
 
-        let dopamine_tick = if self.dopamine.has_active_animations() {
+        let dopamine_tick = if self.dopamine.is_enabled() {
             iced::window::frames().map(Message::DopamineTicked)
         } else {
             Subscription::none()
@@ -2884,29 +2885,52 @@ impl Kegon {
         let geometry =
             calculate_tab_strip_geometry(total_tabs, base_width, self.tab_scroll_offset_x);
 
-        let tab_buttons = tabs.iter().map(|tab| {
+        let is_dopamine = self.dopamine.is_enabled();
+        let now = std::time::Instant::now();
+        let elapsed_secs = self.dopamine.elapsed_animation_seconds(now);
+
+        let tab_buttons = tabs.iter().enumerate().map(|(index, tab)| {
             let is_active = tabs.is_active(tab.id);
             let title = self.tab_title(tab.id);
+            let combo = if is_dopamine {
+                self.dopamine.combo_for_tab(tab.id, now)
+            } else {
+                0
+            };
+
+            let title_widget = container(
+                text(title)
+                    .size(UI_TEXT_SIZE)
+                    .font(self.active_ui_font)
+                    .wrapping(text::Wrapping::None),
+            )
+            .width(Fill)
+            .height(Fill)
+            .clip(true)
+            .align_y(Center);
+
+            let select_content: Element<'_, Message> = if is_dopamine {
+                let badge = tab_rainbow::hit_badge_element(combo, self.active_ui_font);
+                row![title_widget, badge]
+                    .spacing(4.0)
+                    .align_y(Center)
+                    .width(Fill)
+                    .height(Fill)
+                    .into()
+            } else {
+                title_widget.into()
+            };
 
             // Two sibling buttons rather than a nested one, so a click on the close button can
             // never also select the tab.
-            let select_button = button(
-                container(
-                    text(title)
-                        .size(UI_TEXT_SIZE)
-                        .font(self.active_ui_font)
-                        .wrapping(text::Wrapping::None),
-                )
+            let select_button = button(select_content)
                 .width(Fill)
-                .height(Fill)
-                .clip(true)
-                .align_y(Center),
-            )
-            .width(Fill)
-            .height(TAB_STRIP_HEIGHT)
-            .padding(iced::Padding::ZERO.left(12.0).right(4.0))
-            .on_press(Message::TabSelected(tab.id))
-            .style(move |_, status| tab_style(theme, is_active, status));
+                .height(TAB_STRIP_HEIGHT)
+                .padding(iced::Padding::ZERO.left(12.0).right(4.0))
+                .on_press(Message::TabSelected(tab.id))
+                .style(move |_, status| {
+                    tab_rainbow::tab_select_button_style(is_active, status, is_dopamine, theme)
+                });
 
             let select: Element<'_, Message> = if tab.kind == TabKind::Terminal {
                 if let Some(tooltip_content) = self.terminal_tab_tooltip(tab.id) {
@@ -2925,11 +2949,13 @@ impl Kegon {
                             .width(TAB_CLOSE_ICON_SIZE)
                             .height(TAB_CLOSE_ICON_SIZE)
                             .style(move |_, status| {
-                                let color = if matches!(status, svg::Status::Hovered) || is_active {
-                                    theme.icons.active
-                                } else {
-                                    theme.icons.inactive
-                                };
+                                let is_hovered = matches!(status, svg::Status::Hovered);
+                                let color = tab_rainbow::tab_close_icon_color(
+                                    is_active,
+                                    is_hovered,
+                                    is_dopamine,
+                                    theme,
+                                );
                                 svg::Style { color: Some(color) }
                             }),
                     )
@@ -2939,7 +2965,9 @@ impl Kegon {
                 .height(TAB_STRIP_HEIGHT)
                 .padding(0)
                 .on_press(Message::TabClosed(tab.id))
-                .style(move |_, status| tab_style(theme, is_active, status)),
+                .style(move |_, status| {
+                    tab_rainbow::tab_close_button_style(is_active, status, is_dopamine, theme)
+                }),
                 tooltip_label(self.tab_close_tooltip(tab.kind), self.active_ui_font, theme),
                 tooltip::Position::Bottom,
             );
@@ -2947,6 +2975,16 @@ impl Kegon {
             container(row![select, close].height(TAB_STRIP_HEIGHT).align_y(Center))
                 .width(TAB_WIDTH)
                 .height(TAB_STRIP_HEIGHT)
+                .style(move |_| {
+                    tab_rainbow::tab_container_style(
+                        index,
+                        is_active,
+                        is_dopamine,
+                        elapsed_secs,
+                        TAB_WIDTH,
+                        TAB_STRIP_HEIGHT,
+                    )
+                })
                 .into()
         });
 
@@ -3090,7 +3128,11 @@ fn activity_icon_color(theme: &KegonTheme, is_active: bool, is_hovered: bool) ->
     }
 }
 
-fn tab_style(theme: &KegonTheme, is_active: bool, status: button::Status) -> button::Style {
+pub(crate) fn tab_style(
+    theme: &KegonTheme,
+    is_active: bool,
+    status: button::Status,
+) -> button::Style {
     // The active tab merges into the workbench content below it.
     let background = if is_active {
         theme.workbench.background
@@ -7069,5 +7111,240 @@ mod tests {
         app.update(Message::DopamineTicked(t_expired));
         assert_eq!(app.dopamine.gauge_for_tab(tab), 1);
         assert_eq!(app.dopamine.combo_for_tab(tab, t_expired), 0);
+    }
+
+    #[test]
+    fn dopamine_slice2_rainbow_tabs_active_inactive_styling_and_toggle() {
+        let mut app = new_test_app(Locale::JaJp);
+        let tab1 = active_tab(&app);
+        app.update(Message::NewTerminalTab);
+        let tab2 = active_tab(&app);
+        assert_ne!(tab1, tab2);
+
+        // Select tab1
+        app.update(Message::TabSelected(tab1));
+        assert_eq!(active_tab(&app), tab1);
+
+        // 1. Initial state: Dopamine OFF -> standard theme styling
+        assert!(!app.dopamine.is_enabled());
+        let theme = app.active_theme;
+        assert_eq!(
+            tab_rainbow::tab_title_color(true, false, theme),
+            theme.text.emphasis
+        );
+        assert_eq!(
+            tab_rainbow::tab_title_color(false, false, theme),
+            theme.text.muted
+        );
+        assert_eq!(
+            tab_rainbow::tab_close_icon_color(true, false, false, theme),
+            theme.icons.active
+        );
+        assert_eq!(
+            tab_rainbow::tab_close_icon_color(false, false, false, theme),
+            theme.icons.inactive
+        );
+
+        // 2. Toggle Dopamine Mode ON
+        app.update(Message::SettingsDopamineToggled(true));
+        assert!(app.dopamine.is_enabled());
+
+        // tab1 is active: black title and black close icon
+        assert_eq!(active_tab(&app), tab1);
+        assert_eq!(
+            tab_rainbow::tab_title_color(true, true, theme),
+            Color::BLACK
+        );
+        assert_eq!(
+            tab_rainbow::tab_close_icon_color(true, false, true, theme),
+            Color::BLACK
+        );
+
+        // tab2 is inactive: primary text and inactive icon
+        assert_eq!(
+            tab_rainbow::tab_title_color(false, true, theme),
+            theme.text.primary
+        );
+        assert_eq!(
+            tab_rainbow::tab_close_icon_color(false, false, true, theme),
+            theme.icons.inactive
+        );
+        assert_eq!(
+            tab_rainbow::tab_close_icon_color(false, true, true, theme),
+            theme.icons.active
+        );
+
+        // 3. Switch active tab to tab2
+        app.update(Message::TabSelected(tab2));
+        assert_eq!(active_tab(&app), tab2);
+
+        // 4. Toggle Dopamine Mode OFF: reverts to exact standard theme styling
+        app.update(Message::SettingsDopamineToggled(false));
+        assert!(!app.dopamine.is_enabled());
+        assert_eq!(
+            tab_rainbow::tab_title_color(true, false, theme),
+            theme.text.emphasis
+        );
+        assert_eq!(
+            tab_rainbow::tab_title_color(false, false, theme),
+            theme.text.muted
+        );
+    }
+
+    #[test]
+    fn dopamine_slice2_hit_badge_fixed_width_and_combo_update() {
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+        let now = Instant::now();
+
+        // 1. Initial combo is 0: HIT text is None (hidden), reserved width is maintained
+        assert_eq!(app.dopamine.combo_for_tab(tab, now), 0);
+        assert_eq!(tab_rainbow::format_hit_text(0), None);
+        assert_eq!(tab_rainbow::HIT_BADGE_WIDTH, 42.0);
+
+        // 2. Single token input -> combo = 1
+        app.dopamine.on_char_input(tab, 'g', now);
+        assert_eq!(app.dopamine.combo_for_tab(tab, now), 1);
+        assert_eq!(tab_rainbow::format_hit_text(1), Some("1!".to_string()));
+
+        // 3. Multi-word input -> combo grows
+        app.dopamine.on_text_input(tab, "it status", now);
+        assert_eq!(app.dopamine.combo_for_tab(tab, now), 2);
+        assert_eq!(tab_rainbow::format_hit_text(2), Some("2!".to_string()));
+
+        // 4. Three-digit combo
+        for i in 3..=128 {
+            app.dopamine.on_text_input(tab, " a", now);
+            assert_eq!(app.dopamine.combo_for_tab(tab, now), i);
+        }
+        assert_eq!(app.dopamine.combo_for_tab(tab, now), 128);
+        assert_eq!(tab_rainbow::format_hit_text(128), Some("128!".to_string()));
+
+        // 5. Capped at 999
+        assert_eq!(tab_rainbow::format_hit_text(999), Some("999!".to_string()));
+        assert_eq!(tab_rainbow::format_hit_text(1000), Some("999!".to_string()));
+
+        // 6. Timeout -> combo resets to 0, HIT text returns to None
+        let t_expired = now + Duration::from_millis(1001);
+        assert_eq!(app.dopamine.combo_for_tab(tab, t_expired), 0);
+        assert_eq!(tab_rainbow::format_hit_text(0), None);
+    }
+
+    #[test]
+    fn dopamine_slice2_tab_strip_view_does_not_mutate_titles_or_tooltips() {
+        use std::time::Instant;
+
+        let mut app = new_test_app(Locale::JaJp);
+        let tab = active_tab(&app);
+        let initial_title = app.tab_title(tab);
+
+        // Dopamine ON and accumulating combo
+        app.update(Message::SettingsDopamineToggled(true));
+        app.dopamine
+            .on_text_input(tab, "echo hello", Instant::now());
+        assert!(app.dopamine.combo_for_tab(tab, Instant::now()) > 0);
+
+        // Title string remains pristine (combo is NOT appended to title)
+        assert_eq!(app.tab_title(tab), initial_title);
+
+        // Tab strip builds without panic
+        let _view = app.tab_strip();
+        drop(_view);
+
+        // Dopamine OFF
+        app.update(Message::SettingsDopamineToggled(false));
+        assert_eq!(app.tab_title(tab), initial_title);
+        let _view_off = app.tab_strip();
+        drop(_view_off);
+    }
+
+    #[test]
+    fn dopamine_slice2_tab_close_and_right_neighbor_fallback() {
+        use std::time::Instant;
+
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab1 = active_tab(&app);
+        app.update(Message::NewTerminalTab);
+        let tab2 = active_tab(&app);
+        app.update(Message::NewTerminalTab);
+        let tab3 = active_tab(&app);
+        assert_ne!(tab1, tab2);
+        assert_ne!(tab2, tab3);
+
+        // Select tab2
+        app.update(Message::TabSelected(tab2));
+        assert_eq!(active_tab(&app), tab2);
+
+        // Add combo to tab2
+        app.dopamine.on_char_input(tab2, 'x', Instant::now());
+        assert_eq!(app.dopamine.combo_for_tab(tab2, Instant::now()), 1);
+
+        // Close tab2
+        app.update(Message::TabClosed(tab2));
+
+        // tab2 is removed and its combo state cleared
+        assert_eq!(app.dopamine.combo_for_tab(tab2, Instant::now()), 0);
+
+        // Right-neighbor fallback selects tab3
+        assert_eq!(active_tab(&app), tab3);
+
+        // Remaining tab count is 2 (tab1 and tab3)
+        assert_eq!(app.workbench.tabs().len(), 2);
+
+        // Tab strip renders cleanly with 2 tabs
+        let _view = app.tab_strip();
+    }
+
+    #[test]
+    fn dopamine_slice2_rainbow_wave_tab_count_invariance_and_time_monotonicity() {
+        use std::time::{Duration, Instant};
+
+        let mut app = new_test_app(Locale::JaJp);
+        let t0 = Instant::now();
+
+        // 1. Off: elapsed seconds is 0.0
+        assert_eq!(app.dopamine.elapsed_animation_seconds(t0), 0.0);
+
+        // 2. Toggled ON: animation_start is set to now
+        app.update(Message::SettingsDopamineToggled(true));
+        assert!(app.dopamine.is_enabled());
+
+        // Use deterministic time offset
+        let t1 = t0 + Duration::from_millis(500);
+        let t2 = t0 + Duration::from_secs(5);
+        app.dopamine.set_animation_start(t0);
+
+        let e1 = app.dopamine.elapsed_animation_seconds(t1);
+        let e2 = app.dopamine.elapsed_animation_seconds(t2);
+        assert!((e1 - 0.5).abs() < 1e-4);
+        assert!((e2 - 5.0).abs() < 1e-4);
+        assert!(e2 > e1);
+
+        // 3. Tab count invariance:
+        // Tab 0 hue at any given time t is strictly identical whether there is 1 tab, 2 tabs, or 10 tabs
+        let tab0_hue_1tab = tab_rainbow::rainbow_wave_hue(0.0, e1);
+        app.update(Message::NewTerminalTab);
+        let tab0_hue_2tabs = tab_rainbow::rainbow_wave_hue(0.0, e1);
+        app.update(Message::NewTerminalTab);
+        let tab0_hue_3tabs = tab_rainbow::rainbow_wave_hue(0.0, e1);
+
+        assert_eq!(tab0_hue_1tab, tab0_hue_2tabs);
+        assert_eq!(tab0_hue_2tabs, tab0_hue_3tabs);
+
+        // 4. Tab strip dimensions and style rendering with layout constants
+        assert_eq!(TAB_WIDTH, 160.0);
+        assert_eq!(TAB_STRIP_HEIGHT, 35.0);
+        let _style =
+            tab_rainbow::tab_container_style(0, true, true, e1, TAB_WIDTH, TAB_STRIP_HEIGHT);
+        let _view = app.tab_strip();
+        drop(_view);
+
+        // 5. Toggling OFF resets animation timer to 0.0
+        app.update(Message::SettingsDopamineToggled(false));
+        assert_eq!(app.dopamine.elapsed_animation_seconds(t2), 0.0);
     }
 }

@@ -10,6 +10,7 @@ pub mod overlay;
 pub mod params;
 pub mod particles;
 pub mod synth;
+pub mod tab_rainbow;
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -27,9 +28,16 @@ pub use overlay::ParticleOverlayProgram;
 #[cfg(test)]
 pub use particles::BACKSPACE_BURST_COUNT;
 pub use particles::{MAX_PARTICLES_PER_TAB, Particle, ParticleKind, TabParticles};
+pub use tab_rainbow::{
+    HIT_BADGE_HEIGHT, HIT_BADGE_WIDTH, MAX_DISPLAY_COMBO, RAINBOW_SCROLL_SPEED, RAINBOW_WAVELENGTH,
+    WAVE_AMPLITUDE, WAVE_SPATIAL_PERIOD, WAVE_TEMPORAL_HZ, active_rainbow_color, format_hit_text,
+    hit_badge_element, inactive_rainbow_color, rainbow_wave_color, rainbow_wave_hue,
+    rainbow_wave_phase, tab_close_button_style, tab_close_icon_color, tab_container_style,
+    tab_diagonal_coord, tab_rainbow_gradient, tab_select_button_style, tab_title_color,
+};
 
 /// High-level controller managing particle simulations, border effects, audio feedback,
-/// and typing combo/gauge calculation across terminal tabs.
+/// typing combo/gauge calculation, and Rainbow Wave animation across terminal tabs.
 pub struct DopamineController {
     enabled: bool,
     tab_particles: HashMap<TabId, TabParticles>,
@@ -37,6 +45,7 @@ pub struct DopamineController {
     tab_combos: HashMap<TabId, TabComboState>,
     audio: DopamineAudio,
     last_tick: Option<Instant>,
+    animation_start: Option<Instant>,
 }
 
 impl DopamineController {
@@ -49,6 +58,7 @@ impl DopamineController {
             tab_combos: HashMap::new(),
             audio: DopamineAudio::new(),
             last_tick: None,
+            animation_start: if enabled { Some(Instant::now()) } else { None },
         }
     }
 
@@ -57,13 +67,36 @@ impl DopamineController {
         self.enabled
     }
 
-    /// Sets the enabled state. If disabled, all active particles and sounds are terminated immediately.
+    /// Sets the enabled state. If disabled, all active particles, sounds, and animation
+    /// timelines are terminated immediately.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
             self.clear_all();
             self.audio.stop_all();
+            self.animation_start = None;
+        } else if self.animation_start.is_none() {
+            self.animation_start = Some(Instant::now());
         }
+    }
+
+    /// Returns elapsed animation time in seconds for the Rainbow Wave.
+    ///
+    /// Monotonically advances while Dopamine Mode is enabled. Returns 0.0 when disabled.
+    pub fn elapsed_animation_seconds(&self, now: Instant) -> f64 {
+        if !self.enabled {
+            return 0.0;
+        }
+        self.animation_start
+            .map(|start| now.saturating_duration_since(start).as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// Injects an explicit animation start timestamp for deterministic testing.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn set_animation_start(&mut self, start: Instant) {
+        self.animation_start = Some(start);
     }
 
     /// Sets the active sound profile.
@@ -178,11 +211,13 @@ impl DopamineController {
     }
 
     /// Whether any terminal tab currently has an active border effect requiring frame redraws.
+    #[allow(dead_code)]
     pub fn has_active_borders(&self, now: Instant) -> bool {
         self.enabled && self.tab_borders.values().any(|b| !b.is_expired(now))
     }
 
     /// Whether any tab has active particles, borders, or active combo timer requiring animation frame redraws.
+    #[allow(dead_code)]
     pub fn has_active_animations(&self) -> bool {
         if !self.enabled {
             return false;
@@ -192,6 +227,7 @@ impl DopamineController {
     }
 
     /// Whether any terminal tab currently has alive particles that require animation frames.
+    #[allow(dead_code)]
     pub fn has_active_particles(&self) -> bool {
         self.enabled && self.tab_particles.values().any(|tp| !tp.is_empty())
     }
@@ -261,6 +297,7 @@ impl DopamineController {
     /// Whether any tab has an active combo countdown ticking that requires animation frame redraws.
     ///
     /// When combo clocks are paused during command execution (C ~ D), this returns false to conserve CPU.
+    #[allow(dead_code)]
     pub fn has_active_combos(&self, now: Instant) -> bool {
         self.enabled && self.tab_combos.values().any(|s| s.is_clock_ticking(now))
     }
