@@ -3,7 +3,7 @@
 Status: accepted (Issue #13)
 Date: 2026-10-07
 
-Kegon provides a typed, persistent application settings foundation with runtime localization switching and an Activity Bar Settings entry point.
+Kegon provides a typed, persistent application settings foundation with runtime localization switching and a Settings entry point at the right end of the tab bar.
 
 ## Scope
 
@@ -136,25 +136,19 @@ When a user selects a new language in the Settings UI (without `--locale` overri
 3. The UI re-renders immediately with localized strings in the newly selected language.
 4. **Terminal Session Preservation**: The `TerminalSession` child process, shell state, PTY, and scrollback history are preserved intact and are never restarted or recreated.
 
-## UI Surface & Activity Bar Layout
+## UI Surface & Tab Bar Layout
 
-The Activity Bar layout separates primary activities from global bottom actions:
+Kegon has no Activity Bar or Side Bar. The tab bar is the only chrome above the terminal:
 
 ```text
-Activity Bar
-├─ File Explorer
-├─ Search
-├─ Source Control
-│
-│  [flexible vertical space]
-│
-└─ ⚙ Settings (bottom action)
+[ Tab 1 × ][ Tab 2 × ][ ＋ ]                       [ ⚙ ]
 ```
 
-- **Asset**: Uses `assets/icons/codicons/activity-bar/settings-gear.svg`.
-- **Command**: Activity Bar gear click dispatches stable `CommandId::WorkbenchSettingsOpen` (`workbench.settings.open`).
-- **Minimum Window Layout**: At the minimum logical client size of 640x400, top activity icons and bottom gear remain separated by flexible space without overlap.
-- **Settings Surface**: The Settings gear at the bottom of the Activity Bar opens the Settings tab (a single-instance Special Tab, see `TabKind::Settings`) in the main tab strip, or activates it when it is already open. The Side Bar is not touched. The tab lists the settings by category (General, Appearance, Terminal) in a scrollable page; every control saves immediately through the messages described above.
+- **Tab strip**: the tabs and the new-tab button `＋` form one horizontally scrolling strip. `＋` always follows the last tab.
+- **Settings gear**: `⚙` is fixed at the right end of the tab bar, outside the scrolling strip, so it never overlaps the tabs.
+- **Asset**: Uses `assets/icons/codicons/general/settings-gear.svg`.
+- **Command**: The gear opens the Settings tab through `Message::OpenSettingsTab` (the same path as `CommandId::WorkbenchSettingsOpen`).
+- **Settings Surface**: The gear opens the Settings tab (a single-instance Special Tab, see `TabKind::Settings`) in the tab strip, or activates it when it is already open. The tab lists the settings by category (General, Appearance, Terminal) in a scrollable page; every control saves immediately through the messages described above.
 
 ## Runtime Theme Switching
 

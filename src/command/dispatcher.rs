@@ -2,7 +2,7 @@
 
 use super::command_id::CommandId;
 use crate::terminal::{SystemClipboard, TerminalSession, format_paste};
-use crate::workbench::{ActivityItem, TabKind, Workbench};
+use crate::workbench::{TabKind, Workbench};
 
 /// Outcome of attempting to dispatch a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,18 +23,6 @@ impl CommandDispatcher {
         system_clipboard: &mut SystemClipboard,
     ) -> CommandOutcome {
         match command_id {
-            CommandId::WorkbenchExplorerFocus => {
-                workbench.select_activity(ActivityItem::Explorer);
-                CommandOutcome::Executed
-            }
-            CommandId::WorkbenchSearchFocus => {
-                workbench.select_activity(ActivityItem::Search);
-                CommandOutcome::Executed
-            }
-            CommandId::WorkbenchSourceControlFocus => {
-                workbench.select_activity(ActivityItem::Git);
-                CommandOutcome::Executed
-            }
             CommandId::TerminalCopy => {
                 if let Some(session) = terminal_session {
                     if let Some(selected_text) = session.copy_selection() {

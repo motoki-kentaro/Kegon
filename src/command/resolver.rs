@@ -116,24 +116,15 @@ mod tests {
     fn resolve_windows_default_keymap() {
         let resolver = KeybindingResolver::default_for_platform(Platform::Windows);
 
-        // Workbench context
-        let ctrl_shift_e = KeyChord::ctrl_shift_char('e');
-        assert_eq!(
-            resolver.resolve(CommandContext::Workbench, &ctrl_shift_e),
-            Some(CommandId::WorkbenchExplorerFocus)
-        );
-
-        let ctrl_shift_f = KeyChord::ctrl_shift_char('f');
-        assert_eq!(
-            resolver.resolve(CommandContext::Workbench, &ctrl_shift_f),
-            Some(CommandId::WorkbenchSearchFocus)
-        );
-
-        let ctrl_shift_g = KeyChord::ctrl_shift_char('g');
-        assert_eq!(
-            resolver.resolve(CommandContext::Workbench, &ctrl_shift_g),
-            Some(CommandId::WorkbenchSourceControlFocus)
-        );
+        // The side bar shortcuts are gone: Ctrl+Shift+E/F/G are no longer Kegon commands.
+        for ch in ['e', 'f', 'g'] {
+            let chord = KeyChord::ctrl_shift_char(ch);
+            assert_eq!(resolver.resolve(CommandContext::Workbench, &chord), None);
+            assert_eq!(
+                resolver.resolve(CommandContext::TerminalFocused, &chord),
+                None
+            );
+        }
 
         // Terminal context
         let ctrl_c = KeyChord::ctrl_char('c');
@@ -153,11 +144,10 @@ mod tests {
     fn resolve_macos_default_keymap() {
         let resolver = KeybindingResolver::default_for_platform(Platform::MacOS);
 
-        let cmd_shift_e = KeyChord::cmd_shift_char('e');
-        assert_eq!(
-            resolver.resolve(CommandContext::Workbench, &cmd_shift_e),
-            Some(CommandId::WorkbenchExplorerFocus)
-        );
+        for ch in ['e', 'f', 'g'] {
+            let chord = KeyChord::cmd_shift_char(ch);
+            assert_eq!(resolver.resolve(CommandContext::Workbench, &chord), None);
+        }
 
         let cmd_c = KeyChord::cmd_char('c');
         assert_eq!(
@@ -180,13 +170,19 @@ mod tests {
 
     #[test]
     fn resolve_terminal_focused_fallback_to_workbench() {
-        let resolver = KeybindingResolver::default_for_platform(Platform::Windows);
-
-        // Ctrl+Shift+E pressed when Terminal is focused falls back to Workbench context
-        let ctrl_shift_e = KeyChord::ctrl_shift_char('e');
+        // The default keymap has no Workbench rules any more, but the fallback still works for
+        // any rule bound in the global context.
+        let mut keymap = Keymap::default();
+        let chord = KeyChord::ctrl_shift_char('o');
+        keymap.add_rule(
+            CommandContext::Workbench,
+            chord.clone(),
+            CommandId::WorkbenchSettingsOpen,
+        );
+        let resolver = KeybindingResolver::new(Platform::Windows, keymap).expect("no conflicts");
         assert_eq!(
-            resolver.resolve(CommandContext::TerminalFocused, &ctrl_shift_e),
-            Some(CommandId::WorkbenchExplorerFocus)
+            resolver.resolve(CommandContext::TerminalFocused, &chord),
+            Some(CommandId::WorkbenchSettingsOpen)
         );
     }
 

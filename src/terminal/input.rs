@@ -3,7 +3,6 @@ use crate::terminal::arbitration::{InputArbiter, InputRoute};
 use crate::terminal::input_event::TerminalInputEvent;
 use crate::terminal::key_encoder::TerminalKeyEncoder;
 use crate::terminal::mode::TerminalKeyboardMode;
-use crate::workbench::ActivityItem;
 use iced::keyboard::{Modifiers, key};
 
 /// Result of processing a keyboard event in the terminal.
@@ -16,8 +15,6 @@ pub enum InputAction {
     CopySelection,
     /// Perform a paste operation (Ctrl+V).
     PasteFromClipboard,
-    /// Intercepted application shortcut (e.g. Ctrl+Shift+E).
-    WorkbenchShortcut(ActivityItem),
     /// Open (or re-select) the Settings tab.
     OpenSettingsTab,
     /// Ignore event (not handled by terminal).
@@ -82,13 +79,6 @@ pub fn process_key_event_with_resolver(
     match route {
         InputRoute::Modal | InputRoute::Ime => InputAction::Ignore,
         InputRoute::Command(command) => match command {
-            CommandId::WorkbenchExplorerFocus => {
-                InputAction::WorkbenchShortcut(ActivityItem::Explorer)
-            }
-            CommandId::WorkbenchSearchFocus => InputAction::WorkbenchShortcut(ActivityItem::Search),
-            CommandId::WorkbenchSourceControlFocus => {
-                InputAction::WorkbenchShortcut(ActivityItem::Git)
-            }
             CommandId::TerminalCopy => InputAction::CopySelection,
             CommandId::TerminalInterrupt => InputAction::SendToPty(vec![0x03]),
             CommandId::TerminalCopyOrInterrupt => {
@@ -179,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_shortcuts_are_intercepted() {
+    fn former_side_bar_shortcuts_are_sent_to_the_terminal() {
         let action = process_key_event(
             code(key::Code::KeyE),
             &key::Key::Character("e".into()),
@@ -188,9 +178,9 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(
-            action,
-            InputAction::WorkbenchShortcut(ActivityItem::Explorer)
+        assert!(
+            matches!(action, InputAction::SendToPty(_) | InputAction::Ignore),
+            "{action:?}"
         );
     }
 

@@ -205,7 +205,7 @@ Logical key events are mapped to terminal escape sequences and characters:
 - **Function Keys**: F1..F12 (`\x1bOP`..`\x1b[24~`)
 - **Ctrl+A..Z**: Control characters `\x01`..`\x1a`
 - **Alt+Key**: ESC prefix `\x1b<char>`
-- **Workbench Shortcuts**: `Ctrl+Shift+E/F/G` are intercepted and routed to the Workbench Activity Bar, bypassing the terminal PTY.
+- **No workbench shortcuts**: `Ctrl+Shift+E/F/G` are no longer intercepted; they reach the terminal like any other key.
 
 ## Text Selection & Scrollback Mapping
 

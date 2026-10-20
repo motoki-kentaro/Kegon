@@ -15,8 +15,6 @@ pub static NIGHT_DARK: KegonTheme = KegonTheme {
     id: ThemeId::NightDark,
     workbench: WorkbenchColors {
         background: hex(0x1E1E1E),
-        activity_bar_background: hex(0x2C2C2C),
-        side_bar_background: hex(0x252526),
         tab_bar_background: hex(0x252526),
         surface_background: hex(0x252526),
         surface_elevated: hex(0x2D2D30),
@@ -92,8 +90,6 @@ mod tests {
     fn workbench_tokens_match_schema() {
         let w = NIGHT_DARK.workbench;
         assert_eq!(rgb(w.background), 0x1E1E1E);
-        assert_eq!(rgb(w.activity_bar_background), 0x2C2C2C);
-        assert_eq!(rgb(w.side_bar_background), 0x252526);
         assert_eq!(rgb(w.tab_bar_background), 0x252526);
         assert_eq!(rgb(w.surface_background), 0x252526);
         assert_eq!(rgb(w.surface_elevated), 0x2D2D30);

@@ -4,21 +4,10 @@
 # from Rust through `MessageKey` in src/i18n/key.rs; see
 # docs/architecture/i18n.md for conventions.
 
-## Activity Bar (tooltips)
+## Tab bar (tooltips)
 
-activity-explorer = File Explorer
-activity-search = Search
-activity-git = Git
-activity-settings = Settings
+tab-bar-settings-tooltip = Settings
 
-## Side Bar
-
-side-bar-explorer-title = EXPLORER
-side-bar-explorer-placeholder = File Explorer is not implemented yet.
-side-bar-search-title = SEARCH
-side-bar-search-placeholder = Project-wide search is not implemented yet.
-side-bar-git-title = SOURCE CONTROL
-side-bar-git-placeholder = Git integration is not implemented yet.
 settings-language-label = Application Language
 settings-language-system = System default
 settings-cli-override-note = Application language is overridden by --locale for this session.
@@ -38,7 +27,7 @@ settings-terminal-font-not-installed = { $family } (not installed)
 ## Terminal tab strip
 
 terminal-tab-default-title = Terminal
-terminal-new-tab-tooltip = New Terminal
+terminal-new-tab-tooltip = New Tab
 terminal-close-tab-tooltip = Close Terminal
 terminal-process-exited = Process exited with code { $code }.
 terminal-tooltip-shell-integration = Shell Integration

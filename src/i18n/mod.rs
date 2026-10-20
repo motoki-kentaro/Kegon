@@ -197,7 +197,11 @@ mod tests {
     fn english_lookup() {
         let localizer = Localizer::new(Locale::EnUs);
         assert_eq!(localizer.locale(), Locale::EnUs);
-        assert_eq!(localizer.text(MessageKey::SideBarExplorerTitle), "EXPLORER");
+        assert_eq!(
+            localizer.text(MessageKey::TabBarSettingsTooltip),
+            "Settings"
+        );
+        assert_eq!(localizer.text(MessageKey::TerminalNewTabTooltip), "New Tab");
         assert_eq!(
             localizer.text(MessageKey::TerminalTabDefaultTitle),
             "Terminal"
@@ -208,7 +212,11 @@ mod tests {
     fn japanese_lookup() {
         let localizer = Localizer::new(Locale::JaJp);
         assert_eq!(localizer.locale(), Locale::JaJp);
-        assert_eq!(localizer.text(MessageKey::SideBarGitTitle), "ソース管理");
+        assert_eq!(localizer.text(MessageKey::TabBarSettingsTooltip), "設定");
+        assert_eq!(
+            localizer.text(MessageKey::TerminalNewTabTooltip),
+            "新しいタブ"
+        );
         assert_eq!(
             localizer.text(MessageKey::TerminalTabDefaultTitle),
             "ターミナル"
@@ -219,7 +227,10 @@ mod tests {
     fn unsupported_locale_resolves_to_english_text() {
         let localizer = Localizer::new(resolve(Some("fr-FR"), ["ja-JP"]));
         assert_eq!(localizer.locale(), Locale::EnUs);
-        assert_eq!(localizer.text(MessageKey::SideBarSearchTitle), "SEARCH");
+        assert_eq!(
+            localizer.text(MessageKey::TabBarSettingsTooltip),
+            "Settings"
+        );
     }
 
     // The tests below use small fixture resources, not Kegon's UI strings.

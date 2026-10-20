@@ -9,7 +9,7 @@ Kegon's colors come from a typed theme. Kegon ships one built-in theme, **Night 
 
 A `KegonTheme` owns every color that Kegon itself chooses:
 
-- the Activity Bar, Side Bar, tab strip, and workbench background
+- the tab strip and workbench background
 - buttons, drop-downs, tooltips, and the sash
 - the Confirmation Dialog and Font Picker
 - the terminal's default colors, cursor, selection, IME composition, and ANSI palette
@@ -69,8 +69,6 @@ Token names below are the semantic names; the Rust field is in parentheses.
 | Token | Color | Use |
 |---|---|---|
 | `workbench.background` (`background`) | `#1E1E1E` | Main workbench content, the active tab, inset fields |
-| `activity_bar.background` (`activity_bar_background`) | `#2C2C2C` | Activity Bar |
-| `side_bar.background` (`side_bar_background`) | `#252526` | Side Bar, sash |
 | `tab_bar.background` (`tab_bar_background`) | `#252526` | Tab strip |
 | `surface.background` (`surface_background`) | `#252526` | Dialog panels |
 | `surface.elevated` (`surface_elevated`) | `#2D2D30` | Tooltips, secondary buttons, drop-down menus |
@@ -99,9 +97,9 @@ Token names below are the semantic names; the Rust field is in parentheses.
 
 | Token | Color | Use |
 |---|---|---|
-| `icon.active` (`active`) | `#FFFFFF` | Selected Activity Bar icon and its indicator, Question dialog icon |
-| `icon.hovered` (`hovered`) | `#CCCCCC` | Hovered, unselected Activity Bar icon |
-| `icon.inactive` (`inactive`) | `#858585` | Unselected Activity Bar icon |
+| `icon.active` (`active`) | `#FFFFFF` | Hovered tab-bar buttons, Question dialog icon |
+| `icon.hovered` (`hovered`) | `#CCCCCC` | Hovered, unselected icon |
+| `icon.inactive` (`inactive`) | `#858585` | Unselected icon (tab-bar buttons) |
 
 ### Semantic status (`semantic`)
 
@@ -144,7 +142,7 @@ Issue #19 defined the schema above, except for these tokens. Each one covers an 
 | `surface.backdrop` | The modal scrim is a translucent black overlay. No surface token is translucent, and a surface color at an arbitrary opacity would change the dimming. |
 | `text.emphasis` | Titles, the active tab, and font names were already white, distinct from `#CCCCCC` body text. Mapping them to `text.primary` would flatten that hierarchy. Reusing `icon.active` would tie text to an icon role. |
 | `text.on_accent` | Labels on blue and red fills need a color that contrasts with the fill. `text.primary` (`#CCCCCC`) on `#007ACC` drops to about 2.8:1. A future light theme will want `emphasis` dark but `on_accent` still light, so the two are separate. |
-| `icon.hovered` | The hovered Activity Bar icon (`#CCCCCC`) is an icon state between `active` and `inactive`. Reusing `text.primary` would couple an icon state to body text in future themes. |
+| `icon.hovered` | The hovered icon (`#CCCCCC`) is an icon state between `active` and `inactive`. Reusing `text.primary` would couple an icon state to body text in future themes. |
 | `terminal.preedit_background`, `terminal.preedit_foreground` | IME composition is drawn on its own background (`#3A3D41`), which matches no schema color. Mapping it to `interaction.hover` would visibly change IME rendering. |
 
 ### Derived colors

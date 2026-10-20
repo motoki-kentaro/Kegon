@@ -76,16 +76,31 @@ mod tests {
         let resolver = KeybindingResolver::default_for_platform(Platform::Windows);
         let route = InputArbiter::arbitrate_key_event(
             &resolver,
-            CommandContext::Workbench,
-            &key::Key::Character("e".into()),
-            Modifiers::COMMAND | Modifiers::SHIFT,
+            CommandContext::TerminalFocused,
+            &key::Key::Character("v".into()),
+            Modifiers::COMMAND,
             false,
             false,
         );
-        assert_eq!(
-            route,
-            InputRoute::Command(CommandId::WorkbenchExplorerFocus)
-        );
+        assert_eq!(route, InputRoute::Command(CommandId::TerminalPaste));
+    }
+
+    #[test]
+    fn former_side_bar_shortcuts_now_belong_to_the_terminal() {
+        let resolver = KeybindingResolver::default_for_platform(Platform::Windows);
+        for ch in ["e", "f", "g"] {
+            for context in [CommandContext::TerminalFocused, CommandContext::Workbench] {
+                let route = InputArbiter::arbitrate_key_event(
+                    &resolver,
+                    context,
+                    &key::Key::Character(ch.into()),
+                    Modifiers::COMMAND | Modifiers::SHIFT,
+                    false,
+                    false,
+                );
+                assert_eq!(route, InputRoute::Terminal, "{ch} in {context:?}");
+            }
+        }
     }
 
     #[test]
