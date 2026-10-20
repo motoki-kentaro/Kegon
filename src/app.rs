@@ -1195,6 +1195,10 @@ impl Kegon {
                                 let valid_correlation = execution_result.completion
                                     == CompletionReason::DObserved
                                     && execution_result.correlation == MetadataCorrelation::Matched;
+                                // The application's active tab at this very event decides whether
+                                // a Burst may start; a hidden tab must not spend its Gauge.
+                                let tab_is_active =
+                                    self.workbench.tabs().active().map(|t| t.id) == Some(tab);
 
                                 if self.dopamine.is_enabled()
                                     && is_integration_active
@@ -1208,11 +1212,12 @@ impl Kegon {
                                                 BorderKind::Rainbow,
                                                 std::time::Instant::now(),
                                             );
-                                            self.dopamine.on_command_finished(
+                                            self.dopamine.on_command_finished_in(
                                                 tab,
                                                 command_id,
                                                 true,
                                                 true,
+                                                tab_is_active,
                                                 std::time::Instant::now(),
                                             );
                                         }
@@ -1224,20 +1229,22 @@ impl Kegon {
                                                 BorderKind::Red,
                                                 std::time::Instant::now(),
                                             );
-                                            self.dopamine.on_command_finished(
+                                            self.dopamine.on_command_finished_in(
                                                 tab,
                                                 command_id,
                                                 false,
                                                 true,
+                                                tab_is_active,
                                                 std::time::Instant::now(),
                                             );
                                         }
                                         ShellReportedStatus::Unknown => {
-                                            self.dopamine.on_command_finished(
+                                            self.dopamine.on_command_finished_in(
                                                 tab,
                                                 command_id,
                                                 false,
                                                 true,
+                                                tab_is_active,
                                                 std::time::Instant::now(),
                                             );
                                         }
@@ -1246,8 +1253,14 @@ impl Kegon {
                                     let is_missing_d =
                                         execution_result.completion == CompletionReason::MissingD;
                                     let now = std::time::Instant::now();
-                                    self.dopamine
-                                        .on_command_finished(tab, command_id, false, false, now);
+                                    self.dopamine.on_command_finished_in(
+                                        tab,
+                                        command_id,
+                                        false,
+                                        false,
+                                        tab_is_active,
+                                        now,
+                                    );
                                     if is_missing_d {
                                         self.dopamine.on_prompt_started(tab, now);
                                     }
@@ -7764,5 +7777,94 @@ mod tests {
             app.screen_shake_offset(started + Duration::from_millis(1100)),
             iced::Vector::ZERO
         );
+    }
+
+    /// One shell command's OSC 133 sequence, delivered to `tab` the way production does.
+    fn run_command(
+        app: &mut Kegon,
+        tab: TabId,
+        seq: u64,
+        status: crate::terminal::integration::ShellReportedStatus,
+    ) {
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+        let metadata = |status| Osc133Metadata {
+            version: 1,
+            session_id: "HIDDEN_BURST".into(),
+            seq,
+            shell_status: status,
+        };
+        for marker in [
+            Osc133Marker::PromptStarted,
+            Osc133Marker::InputStarted,
+            Osc133Marker::CommandStartedWithMetadata(metadata(ShellReportedStatus::Unknown)),
+            Osc133Marker::IndependentMetadata(metadata(status)),
+            Osc133Marker::CommandFinished(Some(0)),
+        ] {
+            app.update(Message::TerminalEventReceived(
+                tab,
+                TerminalEvent::ShellIntegration(marker),
+            ));
+        }
+    }
+
+    #[test]
+    fn dopamine_hidden_tab_success_neither_bursts_nor_spends_the_gauge_until_the_next_active_success()
+     {
+        use crate::terminal::dopamine::COMBO_TIMEOUT;
+        use crate::terminal::integration::ShellReportedStatus;
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        app.dopamine.audio_mut().enable_fake_tickets();
+        app.dopamine.audio().install_burst_pcm_for_test();
+        let a = active_tab(&app);
+        let b = add_terminal_tab(&mut app);
+        for tab in [a, b] {
+            app.terminals
+                .command_state_machine_mut(tab)
+                .unwrap()
+                .set_expected_session_id(Some("HIDDEN_BURST".into()));
+        }
+        // Tab A reaches Gauge 100 while it is visible.
+        let now = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.dopamine.on_text_input(a, &"x ".repeat(100), now);
+        app.update(Message::DopamineTicked(now + COMBO_TIMEOUT));
+        assert_eq!(app.dopamine.gauge_for_tab(a), 100);
+        // The user switches to B; A's commands finish in the background.
+        app.update(Message::TabSelected(b));
+        assert_eq!(active_tab(&app), b);
+        for (seq, status) in [
+            (1, ShellReportedStatus::Failure),
+            (2, ShellReportedStatus::Unknown),
+            (3, ShellReportedStatus::Success),
+            (3, ShellReportedStatus::Success), // the same completion delivered twice
+        ] {
+            run_command(&mut app, a, seq, status);
+            assert!(app.dopamine.burst_for_tab(a).is_none(), "seq {seq}");
+            assert_eq!(app.dopamine.gauge_for_tab(a), 100, "seq {seq}");
+        }
+        assert!(app.dopamine.audio().burst_started_log().is_empty());
+        assert_eq!(app.dopamine.audio().burst_voice_count(), 0);
+        assert!(app.dopamine.burst_for_tab(b).is_none());
+        assert_eq!(app.dopamine.gauge_for_tab(b), 0);
+        // Returning to A does not celebrate old news.
+        app.update(Message::TabSelected(a));
+        app.update(Message::DopamineTicked(std::time::Instant::now()));
+        assert!(app.dopamine.burst_for_tab(a).is_none());
+        assert_eq!(app.dopamine.gauge_for_tab(a), 100);
+        assert!(app.dopamine.audio().burst_started_log().is_empty());
+        // The old completion replayed after returning is still ignored.
+        run_command(&mut app, a, 3, ShellReportedStatus::Success);
+        assert!(app.dopamine.burst_for_tab(a).is_none());
+        // The next trusted success on the visible tab is the Burst.
+        run_command(&mut app, a, 4, ShellReportedStatus::Success);
+        assert!(app.dopamine.burst_for_tab(a).is_some());
+        assert_eq!(app.dopamine.gauge_for_tab(a), 0);
+        assert_eq!(app.dopamine.audio().burst_started_log().len(), 1);
+        assert_eq!(app.dopamine.audio().burst_voice_count(), 1);
+        // Switching away mid-Burst cancels it as before, and the Gauge stays spent.
+        app.update(Message::TabSelected(b));
+        assert!(app.dopamine.burst_for_tab(a).is_none());
+        assert_eq!(app.dopamine.audio().burst_voice_count(), 0);
+        assert_eq!(app.dopamine.gauge_for_tab(a), 0);
     }
 }

@@ -627,13 +627,32 @@ impl DopamineController {
             .on_command_started(command_id, now);
     }
 
-    /// Forwards verified command completion result to `tab_id`'s combo state machine, resuming the clock.
+    /// [`Self::on_command_finished_in`] for a tab that is the active tab.
+    #[cfg(test)]
     pub fn on_command_finished(
         &mut self,
         tab_id: TabId,
         command_id: u64,
         success: bool,
         valid_correlation: bool,
+        now: Instant,
+    ) {
+        self.on_command_finished_in(tab_id, command_id, success, valid_correlation, true, now);
+    }
+
+    /// Forwards verified command completion result to `tab_id`'s combo state machine, resuming the clock.
+    ///
+    /// `tab_is_active` is whether `tab_id` is the tab the user is looking at, as decided by the
+    /// application when it handled the event. Everything else (dedup, combo doubling, clock) runs
+    /// for any tab, but a Burst can only start on the active tab: a hidden tab keeps its full
+    /// Gauge and nothing is remembered, so coming back never triggers a Burst by itself.
+    pub fn on_command_finished_in(
+        &mut self,
+        tab_id: TabId,
+        command_id: u64,
+        success: bool,
+        valid_correlation: bool,
+        tab_is_active: bool,
         now: Instant,
     ) {
         if !self.enabled {
@@ -657,7 +676,14 @@ impl DopamineController {
             .tab_bursts
             .get(&tab_id)
             .is_some_and(|b| b.progress(now) < 1.0);
-        if success && valid_correlation && fresh && !busy && state.consume_gauge_burst() {
+        // The active-tab check comes first: `consume_gauge_burst` spends the Gauge.
+        if success
+            && valid_correlation
+            && fresh
+            && !busy
+            && tab_is_active
+            && state.consume_gauge_burst()
+        {
             state.begin_burst(now);
             self.tab_transfers.remove(&tab_id);
             self.pending_transfers.remove_tab(tab_id);
@@ -2402,5 +2428,83 @@ mod tests {
         ctrl.on_command_finished(a, 1, true, true, full);
         assert!(ctrl.burst_for_tab(a).is_some());
         assert_eq!(ctrl.audio().burst_voice_count(), 0);
+    }
+
+    #[test]
+    fn a_hidden_tab_never_starts_a_burst_or_spends_its_gauge_and_keeps_nothing_pending() {
+        for outcome in 0..3 {
+            let (mut ctrl, a, b) = burst_ready_controller();
+            let t0 = Instant::now();
+            let full = fill_for_burst(&mut ctrl, a, t0);
+            // Some combo is running in the hidden tab; the completion must still be processed.
+            ctrl.on_text_input(a, &typed_tokens(10), full);
+            let hidden = |ctrl: &mut DopamineController, id: u64, at: Instant| match outcome {
+                0 => ctrl.on_command_finished_in(a, id, true, true, false, at),
+                1 => ctrl.on_command_finished_in(a, id, false, true, false, at),
+                _ => ctrl.on_command_finished_in(a, id, true, false, false, at),
+            };
+            hidden(&mut ctrl, 1, full);
+            assert_eq!(ctrl.gauge_for_tab(a), 100, "outcome {outcome}: gauge kept");
+            assert!(ctrl.burst_for_tab(a).is_none(), "outcome {outcome}");
+            assert!(
+                ctrl.audio().burst_started_log().is_empty(),
+                "outcome {outcome}"
+            );
+            assert_eq!(ctrl.audio().burst_voice_count(), 0);
+            if outcome == 0 {
+                // Normal completion handling still ran: the combo was doubled.
+                assert_eq!(ctrl.combo_for_tab(a, full), 20);
+            }
+            // The other tab is untouched.
+            assert_eq!(ctrl.gauge_for_tab(b), 0);
+            assert!(ctrl.burst_for_tab(b).is_none());
+            // The same completion delivered again changes nothing.
+            hidden(&mut ctrl, 1, full);
+            assert!(ctrl.burst_for_tab(a).is_none());
+            // Coming back does not fire anything by itself: ticks and tab selection are not events.
+            ctrl.retain_active_burst(Some(a), full);
+            ctrl.tick_with_viewport(
+                full + std::time::Duration::from_millis(100),
+                800.0,
+                600.0,
+                Some(a),
+                None,
+            );
+            assert!(ctrl.burst_for_tab(a).is_none(), "outcome {outcome}");
+            assert_eq!(ctrl.gauge_for_tab(a), 100);
+            // The first trusted success after returning starts exactly one Burst.
+            let back = full + std::time::Duration::from_secs(5);
+            // The earlier hidden id 1 stays deduplicated; a new command id succeeds.
+            if outcome < 2 {
+                // Completions recorded as valid stay deduplicated; an untrusted one never was.
+                ctrl.on_command_finished_in(a, 1, true, true, true, back);
+                assert!(
+                    ctrl.burst_for_tab(a).is_none(),
+                    "a replayed old id cannot Burst"
+                );
+            }
+            ctrl.on_command_finished_in(a, 2, true, true, true, back);
+            assert!(ctrl.burst_for_tab(a).is_some(), "outcome {outcome}");
+            assert_eq!(ctrl.gauge_for_tab(a), 0);
+            assert_eq!(ctrl.audio().burst_started_log().len(), 1);
+            assert_eq!(ctrl.audio().burst_voice_count(), 1);
+        }
+    }
+
+    #[test]
+    fn a_burst_started_on_the_active_tab_still_cancels_on_a_later_switch_with_the_gauge_spent() {
+        let (mut ctrl, a, b) = burst_ready_controller();
+        let full = fill_for_burst(&mut ctrl, a, Instant::now());
+        ctrl.on_command_finished_in(a, 1, true, true, true, full);
+        assert!(ctrl.burst_for_tab(a).is_some());
+        assert_eq!(ctrl.gauge_for_tab(a), 0);
+        ctrl.retain_active_burst(Some(b), full + std::time::Duration::from_secs(1));
+        assert!(ctrl.burst_for_tab(a).is_none());
+        assert_eq!(ctrl.audio().burst_voice_count(), 0);
+        assert_eq!(
+            ctrl.gauge_for_tab(a),
+            0,
+            "existing contract: the gauge stays spent"
+        );
     }
 }
