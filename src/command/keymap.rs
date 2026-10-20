@@ -52,23 +52,6 @@ impl Keymap {
 
         match platform {
             Platform::Windows | Platform::Linux => {
-                // Workbench activity focus shortcuts
-                keymap.add_rule(
-                    CommandContext::Workbench,
-                    KeyChord::ctrl_shift_char('e'),
-                    CommandId::WorkbenchExplorerFocus,
-                );
-                keymap.add_rule(
-                    CommandContext::Workbench,
-                    KeyChord::ctrl_shift_char('f'),
-                    CommandId::WorkbenchSearchFocus,
-                );
-                keymap.add_rule(
-                    CommandContext::Workbench,
-                    KeyChord::ctrl_shift_char('g'),
-                    CommandId::WorkbenchSourceControlFocus,
-                );
-
                 // Terminal shortcuts
                 keymap.add_rule(
                     CommandContext::TerminalFocused,
@@ -82,23 +65,6 @@ impl Keymap {
                 );
             }
             Platform::MacOS => {
-                // Workbench activity focus shortcuts
-                keymap.add_rule(
-                    CommandContext::Workbench,
-                    KeyChord::cmd_shift_char('e'),
-                    CommandId::WorkbenchExplorerFocus,
-                );
-                keymap.add_rule(
-                    CommandContext::Workbench,
-                    KeyChord::cmd_shift_char('f'),
-                    CommandId::WorkbenchSearchFocus,
-                );
-                keymap.add_rule(
-                    CommandContext::Workbench,
-                    KeyChord::cmd_shift_char('g'),
-                    CommandId::WorkbenchSourceControlFocus,
-                );
-
                 // Terminal shortcuts
                 keymap.add_rule(
                     CommandContext::TerminalFocused,

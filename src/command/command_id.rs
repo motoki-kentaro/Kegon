@@ -6,12 +6,6 @@ use std::str::FromStr;
 /// Stable identifier for a command in Kegon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandId {
-    /// Focus the Explorer view in the side bar.
-    WorkbenchExplorerFocus,
-    /// Focus the Search view in the side bar.
-    WorkbenchSearchFocus,
-    /// Focus the Source Control (Git) view in the side bar.
-    WorkbenchSourceControlFocus,
     /// Copy selection in the terminal to clipboard.
     TerminalCopy,
     /// Copy selection if present, otherwise send interrupt (SIGINT) to PTY.
@@ -32,9 +26,6 @@ impl CommandId {
     /// Returns the stable string identifier for this command.
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::WorkbenchExplorerFocus => "workbench.explorer.focus",
-            Self::WorkbenchSearchFocus => "workbench.search.focus",
-            Self::WorkbenchSourceControlFocus => "workbench.sourceControl.focus",
             Self::TerminalCopy => "terminal.copy",
             Self::TerminalCopyOrInterrupt => "terminal.copyOrInterrupt",
             Self::TerminalInterrupt => "terminal.interrupt",
@@ -68,9 +59,6 @@ impl FromStr for CommandId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "workbench.explorer.focus" => Ok(Self::WorkbenchExplorerFocus),
-            "workbench.search.focus" => Ok(Self::WorkbenchSearchFocus),
-            "workbench.sourceControl.focus" => Ok(Self::WorkbenchSourceControlFocus),
             "terminal.copy" => Ok(Self::TerminalCopy),
             "terminal.copyOrInterrupt" => Ok(Self::TerminalCopyOrInterrupt),
             "terminal.interrupt" => Ok(Self::TerminalInterrupt),
@@ -90,9 +78,6 @@ mod tests {
     #[test]
     fn command_id_string_roundtrip() {
         let commands = [
-            CommandId::WorkbenchExplorerFocus,
-            CommandId::WorkbenchSearchFocus,
-            CommandId::WorkbenchSourceControlFocus,
             CommandId::TerminalCopy,
             CommandId::TerminalCopyOrInterrupt,
             CommandId::TerminalInterrupt,
@@ -107,6 +92,17 @@ mod tests {
             let parsed: CommandId = s.parse().expect("should parse successfully");
             assert_eq!(cmd, parsed);
             assert_eq!(cmd.to_string(), s);
+        }
+    }
+
+    #[test]
+    fn removed_side_bar_commands_no_longer_parse() {
+        for id in [
+            "workbench.explorer.focus",
+            "workbench.search.focus",
+            "workbench.sourceControl.focus",
+        ] {
+            assert!(id.parse::<CommandId>().is_err(), "{id}");
         }
     }
 

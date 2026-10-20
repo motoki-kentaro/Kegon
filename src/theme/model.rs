@@ -64,10 +64,6 @@ impl KegonTheme {
 pub struct WorkbenchColors {
     /// Main workbench / content background (`workbench.background`).
     pub background: Color,
-    /// `activity_bar.background`
-    pub activity_bar_background: Color,
-    /// `side_bar.background`
-    pub side_bar_background: Color,
     /// `tab_bar.background`
     pub tab_bar_background: Color,
     /// Dialogs and other general surfaces (`surface.background`).

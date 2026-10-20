@@ -63,6 +63,7 @@ impl KeyChord {
         Self { key, modifiers }
     }
 
+    #[cfg(test)]
     pub fn ctrl_shift_char(c: char) -> Self {
         Self {
             key: Key::Character(c.to_lowercase().to_string()),
@@ -75,6 +76,7 @@ impl KeyChord {
         }
     }
 
+    #[cfg(test)]
     pub fn cmd_shift_char(c: char) -> Self {
         Self {
             key: Key::Character(c.to_lowercase().to_string()),

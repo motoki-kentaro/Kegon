@@ -3,21 +3,10 @@
 # Messages missing here fall back to en-US at runtime, but the test suite
 # expects this locale to be complete.
 
-## Activity Bar (tooltips)
+## Tab bar (tooltips)
 
-activity-explorer = エクスプローラー
-activity-search = 検索
-activity-git = Git
-activity-settings = 設定
+tab-bar-settings-tooltip = 設定
 
-## Side Bar
-
-side-bar-explorer-title = エクスプローラー
-side-bar-explorer-placeholder = ファイルエクスプローラーはまだ実装されていません。
-side-bar-search-title = 検索
-side-bar-search-placeholder = プロジェクト全体の検索はまだ実装されていません。
-side-bar-git-title = ソース管理
-side-bar-git-placeholder = Git 連携はまだ実装されていません。
 settings-language-label = 表示言語
 settings-language-system = システム設定に従う
 settings-cli-override-note = このセッションでは --locale により言語が上書きされています。
@@ -37,7 +26,7 @@ settings-terminal-font-not-installed = { $family } (未インストール)
 ## Terminal tab strip
 
 terminal-tab-default-title = ターミナル
-terminal-new-tab-tooltip = 新しいターミナル
+terminal-new-tab-tooltip = 新しいタブ
 terminal-close-tab-tooltip = ターミナルを閉じる
 terminal-process-exited = プロセスがコード { $code } で終了しました。
 terminal-tooltip-shell-integration = Shell Integration

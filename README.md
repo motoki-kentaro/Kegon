@@ -56,7 +56,7 @@ Kegon is **experimental and under active development**. It runs day to day, but 
 
 ### What works today
 
-- A native desktop window built with [iced](https://github.com/iced-rs/iced), laid out as a workbench: Activity Bar, Side Bar, and a terminal tab strip.
+- A native desktop window built with [iced](https://github.com/iced-rs/iced), laid out as tabs and a terminal: a tab strip (with a new-tab button after the last tab and a Settings gear at the right end) above the terminal.
 - A real terminal session: the default shell runs in a PTY (ConPTY on Windows), with emulation provided by [alacritty_terminal](https://github.com/alacritty/alacritty). On Windows, PowerShell 7 (`pwsh`) is preferred, falling back to Windows PowerShell and then `cmd.exe`.
 - Terminal rendering with font fallback, cursor, text selection, and scrollback.
 - Keyboard input, including Japanese IME composition.
@@ -71,7 +71,6 @@ Kegon is **experimental and under active development**. It runs day to day, but 
 
 ### Not yet implemented
 
-- File Explorer, Search, and Git views: their Side Bar panels are placeholders.
 - Terminal profiles and session/workspace management.
 
 ### Known limitations

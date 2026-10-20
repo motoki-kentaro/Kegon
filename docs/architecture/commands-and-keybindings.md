@@ -31,9 +31,6 @@ This architecture decouples OS-specific keyboard layout and platform shortcut co
 
 `CommandId` (`src/command/command_id.rs`) is a typo-resistant Rust `enum` representing stable, internal command identifiers:
 
-- `workbench.explorer.focus`
-- `workbench.search.focus`
-- `workbench.sourceControl.focus`
 - `terminal.copy`
 - `terminal.copyOrInterrupt`
 - `terminal.interrupt`
@@ -79,14 +76,8 @@ Default keymaps (`src/command/keymap.rs`) are defined explicitly for each platfo
 
 | Platform | Context | Key Chord | Command ID |
 |---|---|---|---|
-| **Windows / Linux** | `Workbench` | `Ctrl+Shift+E` | `workbench.explorer.focus` |
-| **Windows / Linux** | `Workbench` | `Ctrl+Shift+F` | `workbench.search.focus` |
-| **Windows / Linux** | `Workbench` | `Ctrl+Shift+G` | `workbench.sourceControl.focus` |
 | **Windows / Linux** | `TerminalFocused` | `Ctrl+C` | `terminal.copyOrInterrupt` |
 | **Windows / Linux** | `TerminalFocused` | `Ctrl+V` | `terminal.paste` |
-| **macOS** | `Workbench` | `Cmd+Shift+E` | `workbench.workbench.explorer.focus` |
-| **macOS** | `Workbench` | `Cmd+Shift+F` | `workbench.search.focus` |
-| **macOS** | `Workbench` | `Cmd+Shift+G` | `workbench.sourceControl.focus` |
 | **macOS** | `TerminalFocused` | `Cmd+C` | `terminal.copy` |
 | **macOS** | `macOS` | `Cmd+V` | `terminal.paste` |
 | **macOS** | `TerminalFocused` | `Ctrl+C` | `terminal.interrupt` |
@@ -114,7 +105,7 @@ When a key event occurs:
 
 The terminal layer handles keyboard input in two distinct stages:
 
-1. **Command Consumption**: Shortcuts recognized by `KeybindingResolver` (such as `workbench.explorer.focus`, `terminal.copyOrInterrupt`, `terminal.paste`) are intercepted and dispatched to application targets. They are **never** sent to the underlying PTY child process.
+1. **Command Consumption**: Shortcuts recognized by `KeybindingResolver` (such as `terminal.copyOrInterrupt`, `terminal.paste`) are intercepted and dispatched to application targets. They are **never** sent to the underlying PTY child process.
 2. **Raw PTY Fallthrough**: Unmatched key events (normal typing, cursor arrows, function keys, control codes like `Ctrl+A` or `Ctrl+Z`, and Japanese IME commits) pass through to `process_key_event` to produce ANSI/escape sequences sent directly to the PTY.
 
 ---

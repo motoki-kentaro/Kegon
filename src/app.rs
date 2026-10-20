@@ -12,8 +12,7 @@ use iced::widget::canvas::Canvas;
 use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::scrollable::{self, Direction, Scrollbar};
 use iced::widget::{
-    Id, Space, button, column, container, mouse_area, pick_list, row, space, stack, svg, text,
-    text_input, tooltip,
+    Id, Space, button, column, container, pick_list, row, stack, svg, text, text_input, tooltip,
 };
 use iced::{
     Border, Center, Color, Element, Event, Fill, Font, Point, Size, Subscription, Task, Theme,
@@ -34,8 +33,8 @@ use crate::font::{
 };
 use crate::i18n::{self, FluentArgs, Locale, Localizer, MessageKey};
 use crate::icons::{
-    ICON_SIZE, TAB_ADD_ICON_SIZE, TAB_CLOSE_ICON_SIZE, TAB_SCROLL_ICON_SIZE, activity_icon,
-    settings_icon, tab_add_icon, tab_close_icon, tab_scroll_left_icon, tab_scroll_right_icon,
+    ICON_SIZE, TAB_ADD_ICON_SIZE, TAB_CLOSE_ICON_SIZE, TAB_SCROLL_ICON_SIZE, settings_icon,
+    tab_add_icon, tab_close_icon, tab_scroll_left_icon, tab_scroll_right_icon,
 };
 use crate::settings::{
     AppearanceSettings, ApplicationSettings, LocalePreference, ShellIntegrationMode, ShellMode,
@@ -51,31 +50,22 @@ use crate::terminal::{
     calculate_cursor_rectangle, registry::TerminalEntry,
 };
 use crate::theme::{KegonTheme, ThemeId, resolve_theme, style};
-use crate::workbench::{ActivityItem, SIDE_BAR_DEFAULT_WIDTH, TabId, TabKind, Workbench};
+use crate::workbench::{TabId, TabKind, Workbench};
 
-const ACTIVITY_BAR_WIDTH: f32 = 48.0;
-const SASH_WIDTH: f32 = 4.0;
 pub(crate) const TAB_STRIP_HEIGHT: f32 = 35.0;
 /// Width of every tab in the tab strip.
 pub(crate) const TAB_WIDTH: f32 = 160.0;
 const TAB_CLOSE_WIDTH: f32 = 24.0;
 const TAB_SCROLL_BUTTON_WIDTH: f32 = 24.0;
+/// Width of the new-tab button that follows the last tab inside the scrolling strip.
+const NEW_TAB_BUTTON_WIDTH: f32 = TAB_STRIP_HEIGHT;
+/// Width of the Settings gear fixed at the right end of the tab bar, outside the strip.
+const SETTINGS_BUTTON_WIDTH: f32 = TAB_STRIP_HEIGHT;
 const TAB_SCROLLABLE_ID: &str = "workbench_tab_scrollable";
 const SCROLL_EPSILON: f32 = 1.0;
 const UI_TEXT_SIZE: f32 = 13.0;
 /// Widest the Settings page grows, so lines stay readable on wide windows.
 const SETTINGS_PAGE_MAX_WIDTH: f32 = 560.0;
-
-/// Everything one Activity Bar button needs.
-struct ActivityButton {
-    icon: iced::widget::svg::Handle,
-    label: String,
-    is_active: bool,
-    is_hovered: bool,
-    press: Message,
-    enter: Message,
-    exit: Message,
-}
 
 /// Text the user is typing into the terminal metric fields of the Settings tab.
 ///
@@ -242,10 +232,10 @@ fn terminal_events_stream() -> impl iced::futures::Stream<Item = Message> {
 pub fn calculate_terminal_cell_point(
     position: Point,
     window_size: Size,
-    side_bar_width: f32,
     metrics: &TerminalCellMetrics,
 ) -> (usize, usize) {
-    let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + side_bar_width;
+    // The terminal fills the window below the tab bar: it starts at the left edge.
+    let term_x = 0.0;
     let term_y = TAB_STRIP_HEIGHT;
     let term_w = (window_size.width - term_x).max(1.0);
     let term_h = (window_size.height - term_y).max(1.0);
@@ -265,13 +255,9 @@ pub fn calculate_terminal_cell_point(
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    ActivitySelected(ActivityItem),
-    ActivityHovered(ActivityItem),
-    ActivityUnhovered(ActivityItem),
-    /// The Settings gear at the bottom of the Activity Bar: opens (or re-selects) the Settings
-    /// tab. It does not touch the Side Bar.
+    /// The Settings gear at the right end of the tab bar: opens (or re-selects) the Settings
+    /// tab.
     OpenSettingsTab,
-    SettingsGearHovered(bool),
     /// The window scale factor became known or changed.
     ScaleFactorChanged(f32),
     TabSelected(TabId),
@@ -285,9 +271,6 @@ pub enum Message {
     ScrollTabsLeft,
     /// Scroll tabs to the right by one tab width.
     ScrollTabsRight,
-    SashPressed,
-    SashDragged(f32),
-    SashReleased,
     IcedEventReceived(Event),
     TerminalEventReceived(TabId, TerminalEvent),
     DialogPrimaryClicked,
@@ -336,12 +319,6 @@ pub struct Kegon {
     /// Fixed for the lifetime of the application; chosen at startup or updated on settings change.
     localizer: Localizer,
     workbench: Workbench,
-    /// Whether the Side Bar sash is being dragged.
-    resizing_side_bar: bool,
-    /// The Activity Bar entry under the pointer, if any.
-    hovered_activity: Option<ActivityItem>,
-    /// Whether the pointer is over the Settings gear.
-    settings_gear_hovered: bool,
     /// Drafts of the terminal metric fields while the Settings tab is open.
     metric_drafts: Option<MetricDrafts>,
     /// Window scale factor (physical pixels per logical pixel); 1.0 until the window reports it.
@@ -413,8 +390,6 @@ enum TabScrollTask {
 impl std::fmt::Debug for Kegon {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Kegon")
-            .field("resizing_side_bar", &self.resizing_side_bar)
-            .field("hovered_activity", &self.hovered_activity)
             .field("terminal_focused", &self.terminal_focused)
             .field("modal", &self.modal)
             .field("settings", &self.settings)
@@ -442,10 +417,8 @@ impl Kegon {
             &mut font_cache,
         );
 
-        let initial_window_size = Size::new(1200.0, 760.0);
-        let side_bar_w = SIDE_BAR_DEFAULT_WIDTH;
-        let main_w =
-            (initial_window_size.width - ACTIVITY_BAR_WIDTH - SASH_WIDTH - side_bar_w).max(10.0);
+        let initial_window_size = Size::new(1200.0_f32, 760.0_f32);
+        let main_w = initial_window_size.width.max(10.0);
         let main_h = (initial_window_size.height - TAB_STRIP_HEIGHT).max(10.0);
         let (cols, rows) = terminal_font_config.metrics.grid_size(main_w, main_h);
 
@@ -475,9 +448,6 @@ impl Kegon {
         let mut app = Self {
             localizer: Localizer::new(locale),
             workbench,
-            resizing_side_bar: false,
-            hovered_activity: None,
-            settings_gear_hovered: false,
             metric_drafts: None,
             scale_factor: 1.0,
             terminals,
@@ -635,9 +605,7 @@ impl Kegon {
 
     /// Terminal grid size (columns, rows) for the current viewport and cell metrics.
     fn terminal_grid_size(&self) -> (u16, u16) {
-        let side_bar_w = self.workbench.side_bar_width();
-        let main_w =
-            (self.window_size.width - ACTIVITY_BAR_WIDTH - SASH_WIDTH - side_bar_w).max(10.0);
+        let main_w = self.window_size.width.max(10.0);
         let main_h = (self.window_size.height - TAB_STRIP_HEIGHT).max(10.0);
         self.terminal_font_config.metrics.grid_size(main_w, main_h)
     }
@@ -971,20 +939,15 @@ impl Kegon {
         self.modal.is_some() || self.font_picker.is_some()
     }
 
-    /// Available width for tab buttons without any scroll navigation triangles or new tab button.
+    /// Width available to the scrolling strip (tabs plus the new-tab button), before any scroll
+    /// navigation triangles: the whole window minus the Settings gear fixed at the right end.
     fn tab_strip_base_width(&self) -> f32 {
-        (self.window_size.width
-            - ACTIVITY_BAR_WIDTH
-            - SASH_WIDTH
-            - self.workbench.side_bar_width()
-            - TAB_STRIP_HEIGHT)
-            .max(0.0)
+        (self.window_size.width - SETTINGS_BUTTON_WIDTH).max(0.0)
     }
 
     /// Viewport width available for the main terminal drawing canvas.
     fn terminal_viewport_width(&self) -> f32 {
-        let side_bar_w = self.workbench.side_bar_width();
-        (self.window_size.width - ACTIVITY_BAR_WIDTH - SASH_WIDTH - side_bar_w).max(10.0)
+        self.window_size.width.max(10.0)
     }
 
     /// Computes the transfer particle launch point for the active tab's HIT badge, in terminal
@@ -1096,18 +1059,10 @@ impl Kegon {
 
     pub fn update(&mut self, message: Message) {
         match message {
-            Message::ActivitySelected(item) => self.workbench.select_activity(item),
             Message::OpenSettingsTab => {
                 self.open_special_tab(TabKind::Settings);
             }
-            Message::SettingsGearHovered(hovered) => self.settings_gear_hovered = hovered,
             Message::ScaleFactorChanged(factor) => self.set_scale_factor(factor),
-            Message::ActivityHovered(item) => self.hovered_activity = Some(item),
-            Message::ActivityUnhovered(item) => {
-                if self.hovered_activity == Some(item) {
-                    self.hovered_activity = None;
-                }
-            }
             Message::TabSelected(id) => {
                 let previous = self.workbench.tabs().active().map(|tab| tab.id);
                 self.workbench.select_tab(id);
@@ -1149,18 +1104,6 @@ impl Kegon {
                     self.tab_scroll_offset_x = target_x;
                     self.pending_tab_scroll_task = Some(TabScrollTask::ScrollTo(target_x));
                 }
-            }
-            Message::SashPressed => self.resizing_side_bar = true,
-            Message::SashDragged(cursor_x) => {
-                if self.resizing_side_bar {
-                    self.workbench
-                        .resize_side_bar(cursor_x - ACTIVITY_BAR_WIDTH - SASH_WIDTH / 2.0);
-                    self.clamp_tab_scroll_and_follow_active();
-                }
-            }
-            Message::SashReleased => {
-                self.resizing_side_bar = false;
-                self.clamp_tab_scroll_and_follow_active();
             }
             // Events from removed sessions are dropped by the registry.
             Message::TerminalEventReceived(tab, event) => {
@@ -1669,16 +1612,14 @@ impl Kegon {
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if !self.is_modal_open() {
-                    let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + self.workbench.side_bar_width();
                     let term_y = TAB_STRIP_HEIGHT;
 
-                    if self.cursor_position.x >= term_x && self.cursor_position.y >= term_y {
+                    if self.cursor_position.y >= term_y {
                         self.terminal_focused = true;
                         if let Some(session) = self.active_session() {
                             let (col, line) = calculate_terminal_cell_point(
                                 self.cursor_position,
                                 self.window_size,
-                                self.workbench.side_bar_width(),
                                 &self.terminal_font_config.metrics,
                             );
                             session.start_selection(col, line);
@@ -1698,7 +1639,6 @@ impl Kegon {
                     let (col, line) = calculate_terminal_cell_point(
                         position,
                         self.window_size,
-                        self.workbench.side_bar_width(),
                         &self.terminal_font_config.metrics,
                     );
                     session.update_selection(col, line);
@@ -1710,10 +1650,9 @@ impl Kegon {
                 }
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + self.workbench.side_bar_width();
                 let is_over_tab_strip = self.cursor_position.y >= 0.0
                     && self.cursor_position.y < TAB_STRIP_HEIGHT
-                    && self.cursor_position.x >= term_x
+                    && self.cursor_position.x >= 0.0
                     && self.cursor_position.x <= self.window_size.width;
 
                 if is_over_tab_strip {
@@ -1742,7 +1681,7 @@ impl Kegon {
                         }
                     }
                 } else {
-                    let is_over_terminal = self.cursor_position.x >= term_x
+                    let is_over_terminal = self.cursor_position.x >= 0.0
                         && self.cursor_position.y >= TAB_STRIP_HEIGHT
                         && self.cursor_position.x <= self.window_size.width
                         && self.cursor_position.y <= self.window_size.height;
@@ -1775,39 +1714,12 @@ impl Kegon {
             Subscription::none()
         };
 
-        if self.resizing_side_bar {
-            let drag = event::listen_with(|event, _status, _window| match event {
-                Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                    Some(Message::SashDragged(position.x))
-                }
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                    Some(Message::SashReleased)
-                }
-                _ => None,
-            });
-
-            Subscription::batch([events, terminal_events, dopamine_tick, drag])
-        } else {
-            Subscription::batch([events, terminal_events, dopamine_tick])
-        }
+        Subscription::batch([events, terminal_events, dopamine_tick])
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let body = row![
-            self.activity_bar(),
-            self.side_bar(),
-            self.sash(),
-            self.main_area(),
-        ]
-        .height(Fill);
-
-        let content: Element<'_, Message> = if self.resizing_side_bar {
-            mouse_area(body)
-                .interaction(mouse::Interaction::ResizingHorizontally)
-                .into()
-        } else {
-            body.into()
-        };
+        // The tab bar and the terminal fill the whole window.
+        let content: Element<'_, Message> = self.main_area();
 
         if let Some(font_picker) = &self.font_picker {
             render_font_picker_overlay(
@@ -1838,134 +1750,6 @@ impl Kegon {
         } else {
             content
         }
-    }
-
-    fn activity_bar(&self) -> Element<'_, Message> {
-        let active = self.workbench.active_activity();
-
-        let top_items = ActivityItem::TOP_ITEMS
-            .into_iter()
-            .map(|item| self.activity_bar_item(item, active));
-
-        // The gear is an action, not an activity: it opens the Settings tab and leaves the
-        // Side Bar as it is.
-        let settings_active =
-            self.workbench.tabs().active().map(|tab| tab.kind) == Some(TabKind::Settings);
-        let settings_item = self.activity_button(ActivityButton {
-            icon: settings_icon(),
-            label: self.localizer.text(MessageKey::ActivitySettings),
-            is_active: settings_active,
-            is_hovered: self.settings_gear_hovered,
-            press: Message::OpenSettingsTab,
-            enter: Message::SettingsGearHovered(true),
-            exit: Message::SettingsGearHovered(false),
-        });
-
-        let content = column![column(top_items), Space::new().height(Fill), settings_item,];
-
-        let theme = self.active_theme;
-        container(content)
-            .width(ACTIVITY_BAR_WIDTH)
-            .height(Fill)
-            .style(move |_| activity_bar_style(theme))
-            .into()
-    }
-
-    fn activity_bar_item(&self, item: ActivityItem, active: ActivityItem) -> Element<'_, Message> {
-        self.activity_button(ActivityButton {
-            icon: activity_icon(item),
-            label: self.localizer.text(activity_label(item)),
-            is_active: item == active,
-            is_hovered: self.hovered_activity == Some(item),
-            press: Message::ActivitySelected(item),
-            enter: Message::ActivityHovered(item),
-            exit: Message::ActivityUnhovered(item),
-        })
-    }
-
-    fn activity_button(&self, spec: ActivityButton) -> Element<'_, Message> {
-        let ActivityButton {
-            icon,
-            label,
-            is_active,
-            is_hovered,
-            press,
-            enter,
-            exit,
-        } = spec;
-        let theme = self.active_theme;
-        let color = activity_icon_color(theme, is_active, is_hovered);
-
-        let icon = svg(icon)
-            .width(ICON_SIZE)
-            .height(ICON_SIZE)
-            .style(move |_, _| svg::Style { color: Some(color) });
-
-        let indicator = container(space())
-            .width(2)
-            .height(ACTIVITY_BAR_WIDTH)
-            .style(move |_| {
-                container::Style::default().background(if is_active {
-                    theme.icons.active
-                } else {
-                    Color::TRANSPARENT
-                })
-            });
-
-        let entry = button(container(icon).center(Fill))
-            .width(ACTIVITY_BAR_WIDTH - 2.0)
-            .height(ACTIVITY_BAR_WIDTH)
-            .padding(0)
-            .on_press(press)
-            .style(|_, _| button::Style::default());
-
-        let entry = mouse_area(row![indicator, entry])
-            .on_enter(enter)
-            .on_exit(exit);
-
-        tooltip(
-            entry,
-            tooltip_label(label, self.active_ui_font, theme),
-            tooltip::Position::Right,
-        )
-        .into()
-    }
-
-    fn side_bar(&self) -> Element<'_, Message> {
-        let theme = self.active_theme;
-        let active_item = self.workbench.active_activity();
-        let (title_key, placeholder_key) = side_bar_text(active_item);
-
-        let header = container(
-            text(self.localizer.text(title_key))
-                .size(11)
-                .font(Font {
-                    weight: font::Weight::Bold,
-                    ..self.active_ui_font
-                })
-                .color(theme.text.primary),
-        )
-        .height(TAB_STRIP_HEIGHT)
-        .padding([0, 20])
-        .align_y(Center);
-
-        let content: Element<'_, Message> = column![
-            header,
-            container(
-                text(self.localizer.text(placeholder_key))
-                    .size(UI_TEXT_SIZE)
-                    .font(self.active_ui_font)
-                    .color(theme.text.muted)
-            )
-            .padding([8, 20]),
-        ]
-        .into();
-
-        container(content)
-            .width(self.workbench.side_bar_width())
-            .height(Fill)
-            .style(move |_| side_bar_style(theme))
-            .into()
     }
 
     /// One terminal metric row of the Settings tab: label, description, current value, a draft input
@@ -2446,30 +2230,6 @@ impl Kegon {
             .width(Fill)
             .style(move |_, status| pick_list_style(theme, status))
             .menu_style(move |_| pick_list_menu_style(theme))
-            .into()
-    }
-
-    fn sash(&self) -> Element<'_, Message> {
-        let theme = self.active_theme;
-        let line = container(Space::new().width(1).height(Fill))
-            .style(move |_| container::Style::default().background(theme.workbench.border));
-
-        let highlight = self.resizing_side_bar;
-        let handle = container(line)
-            .width(SASH_WIDTH)
-            .height(Fill)
-            .align_x(Center)
-            .style(move |_| {
-                container::Style::default().background(if highlight {
-                    theme.interaction.accent
-                } else {
-                    theme.workbench.side_bar_background
-                })
-            });
-
-        mouse_area(handle)
-            .on_press(Message::SashPressed)
-            .interaction(mouse::Interaction::ResizingHorizontally)
             .into()
     }
 
@@ -3090,13 +2850,6 @@ impl Kegon {
                 .into()
         });
 
-        let scrollable_tabs = iced::widget::scrollable(row(tab_buttons).height(TAB_STRIP_HEIGHT))
-            .direction(Direction::Horizontal(Scrollbar::hidden()))
-            .id(Id::new(TAB_SCROLLABLE_ID))
-            .on_scroll(Message::TabStripScrolled)
-            .width(Fill)
-            .height(TAB_STRIP_HEIGHT);
-
         let new_tab = tooltip(
             button(
                 container(
@@ -3114,13 +2867,56 @@ impl Kegon {
                 )
                 .center(Fill),
             )
-            .width(TAB_STRIP_HEIGHT)
+            .width(NEW_TAB_BUTTON_WIDTH)
             .height(TAB_STRIP_HEIGHT)
             .padding(0)
             .on_press(Message::NewTerminalTab)
             .style(move |_, status| tab_icon_button_style(theme, status)),
             tooltip_label(
                 self.localizer.text(MessageKey::TerminalNewTabTooltip),
+                self.active_ui_font,
+                theme,
+            ),
+            tooltip::Position::Bottom,
+        );
+
+        // The new-tab button is the last item of the scrolling strip: it follows the last tab and
+        // scrolls with it, so it stays reachable however many tabs there are.
+        let scrollable_tabs =
+            iced::widget::scrollable(row(tab_buttons).push(new_tab).height(TAB_STRIP_HEIGHT))
+                .direction(Direction::Horizontal(Scrollbar::hidden()))
+                .id(Id::new(TAB_SCROLLABLE_ID))
+                .on_scroll(Message::TabStripScrolled)
+                .width(Fill)
+                .height(TAB_STRIP_HEIGHT);
+
+        let settings_active =
+            self.workbench.tabs().active().map(|tab| tab.kind) == Some(TabKind::Settings);
+        let settings = tooltip(
+            button(
+                container(
+                    svg(settings_icon())
+                        .width(ICON_SIZE)
+                        .height(ICON_SIZE)
+                        .style(move |_, status| {
+                            let color = if settings_active || matches!(status, svg::Status::Hovered)
+                            {
+                                theme.icons.active
+                            } else {
+                                theme.icons.inactive
+                            };
+                            svg::Style { color: Some(color) }
+                        }),
+                )
+                .center(Fill),
+            )
+            .width(SETTINGS_BUTTON_WIDTH)
+            .height(TAB_STRIP_HEIGHT)
+            .padding(0)
+            .on_press(Message::OpenSettingsTab)
+            .style(move |_, status| tab_icon_button_style(theme, status)),
+            tooltip_label(
+                self.localizer.text(MessageKey::TabBarSettingsTooltip),
                 self.active_ui_font,
                 theme,
             ),
@@ -3183,7 +2979,7 @@ impl Kegon {
             strip = strip.push(right_btn);
         }
 
-        strip = strip.push(new_tab);
+        strip = strip.push(settings);
 
         container(strip)
             .width(Fill)
@@ -3191,14 +2987,6 @@ impl Kegon {
             .style(move |_| tab_bar_style(theme))
             .into()
     }
-}
-
-fn activity_bar_style(theme: &KegonTheme) -> container::Style {
-    container::Style::default().background(theme.workbench.activity_bar_background)
-}
-
-fn side_bar_style(theme: &KegonTheme) -> container::Style {
-    container::Style::default().background(theme.workbench.side_bar_background)
 }
 
 fn tab_bar_style(theme: &KegonTheme) -> container::Style {
@@ -3218,16 +3006,6 @@ fn exit_banner_style(theme: &KegonTheme) -> container::Style {
         theme.semantic.destructive,
         TINT,
     ))
-}
-
-fn activity_icon_color(theme: &KegonTheme, is_active: bool, is_hovered: bool) -> Color {
-    if is_active {
-        theme.icons.active
-    } else if is_hovered {
-        theme.icons.hovered
-    } else {
-        theme.icons.inactive
-    }
 }
 
 pub(crate) fn tab_style(
@@ -3306,7 +3084,7 @@ pub fn calculate_tab_strip_geometry(
     base_width: f32,
     scroll_offset_x: f32,
 ) -> TabStripGeometry {
-    let content_width = total_tabs as f32 * TAB_WIDTH;
+    let content_width = total_tabs as f32 * TAB_WIDTH + NEW_TAB_BUTTON_WIDTH;
     let is_overflowing = content_width > base_width + SCROLL_EPSILON;
 
     if !is_overflowing {
@@ -3428,31 +3206,6 @@ fn pick_list_menu_style(theme: &KegonTheme) -> iced::overlay::menu::Style {
     }
 }
 
-fn activity_label(item: ActivityItem) -> MessageKey {
-    match item {
-        ActivityItem::Explorer => MessageKey::ActivityExplorer,
-        ActivityItem::Search => MessageKey::ActivitySearch,
-        ActivityItem::Git => MessageKey::ActivityGit,
-    }
-}
-
-fn side_bar_text(item: ActivityItem) -> (MessageKey, MessageKey) {
-    match item {
-        ActivityItem::Explorer => (
-            MessageKey::SideBarExplorerTitle,
-            MessageKey::SideBarExplorerPlaceholder,
-        ),
-        ActivityItem::Search => (
-            MessageKey::SideBarSearchTitle,
-            MessageKey::SideBarSearchPlaceholder,
-        ),
-        ActivityItem::Git => (
-            MessageKey::SideBarGitTitle,
-            MessageKey::SideBarGitPlaceholder,
-        ),
-    }
-}
-
 fn tooltip_label<'a>(label: String, ui_font: Font, theme: &'a KegonTheme) -> Element<'a, Message> {
     container(
         text(label)
@@ -3565,25 +3318,19 @@ impl std::fmt::Display for ShellIntegrationOption {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::{CommandId, KeyChord, Modifiers};
+    use crate::command::{KeyChord, Modifiers};
     use crate::terminal::CommandResult;
 
     #[test]
-    fn shortcuts_select_activity_items() {
+    fn side_bar_shortcuts_are_no_longer_bound() {
         let resolver = KeybindingResolver::default_for_platform(Platform::Windows);
 
-        assert_eq!(
-            resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_shift_char('e')),
-            Some(CommandId::WorkbenchExplorerFocus)
-        );
-        assert_eq!(
-            resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_shift_char('f')),
-            Some(CommandId::WorkbenchSearchFocus)
-        );
-        assert_eq!(
-            resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_shift_char('g')),
-            Some(CommandId::WorkbenchSourceControlFocus)
-        );
+        for ch in ['e', 'f', 'g'] {
+            assert_eq!(
+                resolver.resolve(CommandContext::Workbench, &KeyChord::ctrl_shift_char(ch)),
+                None
+            );
+        }
     }
 
     #[test]
@@ -3646,8 +3393,6 @@ mod tests {
     fn synthetic_theme() -> &'static KegonTheme {
         let mut theme = *resolve_theme(ThemeId::NightDark);
         theme.workbench.background = Color::from_rgb8(1, 0, 0);
-        theme.workbench.activity_bar_background = Color::from_rgb8(2, 0, 0);
-        theme.workbench.side_bar_background = Color::from_rgb8(3, 0, 0);
         theme.workbench.tab_bar_background = Color::from_rgb8(4, 0, 0);
         theme.interaction.hover = Color::from_rgb8(5, 0, 0);
         theme.interaction.accent = Color::from_rgb8(6, 0, 0);
@@ -3660,41 +3405,8 @@ mod tests {
     }
 
     #[test]
-    fn each_activity_has_its_own_messages() {
-        let keys: std::collections::HashSet<_> = ActivityItem::TOP_ITEMS
-            .into_iter()
-            .flat_map(|item| {
-                let (title, placeholder) = side_bar_text(item);
-                [activity_label(item), title, placeholder]
-            })
-            .collect();
-
-        assert_eq!(keys.len(), ActivityItem::TOP_ITEMS.len() * 3);
-    }
-
-    #[test]
-    fn activity_icon_color_reflects_state() {
-        let theme = synthetic_theme();
-        assert_eq!(
-            activity_icon_color(theme, false, false),
-            theme.icons.inactive
-        );
-        assert_eq!(activity_icon_color(theme, false, true), theme.icons.hovered);
-        assert_eq!(activity_icon_color(theme, true, false), theme.icons.active);
-        assert_eq!(activity_icon_color(theme, true, true), theme.icons.active);
-    }
-
-    #[test]
     fn workbench_areas_take_their_backgrounds_from_the_theme() {
         let theme = synthetic_theme();
-        assert_eq!(
-            background(&activity_bar_style(theme)),
-            Some(theme.workbench.activity_bar_background)
-        );
-        assert_eq!(
-            background(&side_bar_style(theme)),
-            Some(theme.workbench.side_bar_background)
-        );
         assert_eq!(
             background(&tab_bar_style(theme)),
             Some(theme.workbench.tab_bar_background)
@@ -3800,74 +3512,21 @@ mod tests {
     }
 
     #[test]
-    fn hover_tracks_the_entry_under_the_pointer() {
+    fn settings_gear_opens_the_tab_and_a_second_press_reselects_it() {
         let mut app = new_test_app(Locale::EnUs);
-
-        app.update(Message::ActivityHovered(ActivityItem::Search));
-        assert_eq!(app.hovered_activity, Some(ActivityItem::Search));
-
-        app.update(Message::ActivityHovered(ActivityItem::Git));
-        app.update(Message::ActivityUnhovered(ActivityItem::Search));
-        assert_eq!(app.hovered_activity, Some(ActivityItem::Git));
-
-        app.update(Message::ActivityUnhovered(ActivityItem::Git));
-        assert_eq!(app.hovered_activity, None);
-    }
-
-    #[test]
-    fn activity_messages_update_the_workbench() {
-        let mut app = new_test_app(Locale::EnUs);
-
-        app.update(Message::ActivitySelected(ActivityItem::Git));
-        assert_eq!(app.workbench.active_activity(), ActivityItem::Git);
-    }
-
-    #[test]
-    fn settings_gear_opens_the_tab_and_leaves_the_side_bar_alone() {
-        let mut app = new_test_app(Locale::EnUs);
-        app.update(Message::ActivitySelected(ActivityItem::Git));
-        app.update(Message::SashDragged(ACTIVITY_BAR_WIDTH + 300.0));
-        let width = app.workbench.side_bar_width();
+        assert!(settings_tab_of(&app).is_none());
 
         app.update(Message::OpenSettingsTab);
+        let settings = settings_tab_of(&app).expect("settings tab");
+        assert_eq!(active_tab(&app), settings);
 
-        assert_eq!(app.workbench.active_activity(), ActivityItem::Git);
-        assert_eq!(app.workbench.side_bar_width(), width);
-        assert!(settings_tab_of(&app).is_some());
-    }
-
-    #[test]
-    fn settings_gear_hover_is_tracked_separately_from_activities() {
-        let mut app = new_test_app(Locale::EnUs);
-        app.update(Message::ActivityHovered(ActivityItem::Git));
-        app.update(Message::SettingsGearHovered(true));
-        assert!(app.settings_gear_hovered);
-        assert_eq!(app.hovered_activity, Some(ActivityItem::Git));
-        app.update(Message::SettingsGearHovered(false));
-        assert!(!app.settings_gear_hovered);
-    }
-
-    #[test]
-    fn sash_drag_resizes_the_side_bar_only_while_pressed() {
-        let mut app = new_test_app(Locale::EnUs);
-        let initial = app.workbench.side_bar_width();
-
-        app.update(Message::SashDragged(350.0));
-        assert_eq!(app.workbench.side_bar_width(), initial);
-
-        app.update(Message::SashPressed);
-        app.update(Message::SashDragged(350.0));
-        assert_eq!(
-            app.workbench.side_bar_width(),
-            350.0 - ACTIVITY_BAR_WIDTH - SASH_WIDTH / 2.0
-        );
-
-        app.update(Message::SashReleased);
-        app.update(Message::SashDragged(200.0));
-        assert_eq!(
-            app.workbench.side_bar_width(),
-            350.0 - ACTIVITY_BAR_WIDTH - SASH_WIDTH / 2.0
-        );
+        // Pressing the gear again, from another tab, reuses the single Settings tab.
+        let terminal = app.workbench.tabs().iter().next().unwrap().id;
+        app.update(Message::TabSelected(terminal));
+        let tab_count = app.workbench.tabs().len();
+        app.update(Message::OpenSettingsTab);
+        assert_eq!(app.workbench.tabs().len(), tab_count);
+        assert_eq!(active_tab(&app), settings);
     }
 
     #[test]
@@ -5263,11 +4922,11 @@ mod tests {
     #[test]
     fn runtime_locale_switch_preserves_terminal_session() {
         let mut app = new_test_app(Locale::EnUs);
-        let initial_text = app.localizer.text(MessageKey::ActivitySettings);
+        let initial_text = app.localizer.text(MessageKey::TabBarSettingsTooltip);
         assert_eq!(initial_text, "Settings");
 
         app.update(Message::SettingsLocaleChanged(LocalePreference::JaJp));
-        let updated_text = app.localizer.text(MessageKey::ActivitySettings);
+        let updated_text = app.localizer.text(MessageKey::TabBarSettingsTooltip);
         assert_eq!(updated_text, "設定");
     }
 
@@ -5409,21 +5068,19 @@ mod tests {
     fn terminal_cell_point_calculation_and_clamping() {
         let metrics = TerminalCellMetrics::new(10.0, 20.0, 13.0);
         let window_size = Size::new(1000.0, 600.0);
-        let side_bar_w = 200.0;
 
-        let pt = Point::new(272.0, 75.0);
-        let (col, line) = calculate_terminal_cell_point(pt, window_size, side_bar_w, &metrics);
+        // The terminal starts at the window's left edge and just below the tab bar.
+        let pt = Point::new(25.0, 75.0);
+        let (col, line) = calculate_terminal_cell_point(pt, window_size, &metrics);
         assert_eq!((col, line), (2, 2));
 
         let pt_neg = Point::new(-100.0, -50.0);
-        let (col_neg, line_neg) =
-            calculate_terminal_cell_point(pt_neg, window_size, side_bar_w, &metrics);
+        let (col_neg, line_neg) = calculate_terminal_cell_point(pt_neg, window_size, &metrics);
         assert_eq!((col_neg, line_neg), (0, 0));
 
         let pt_far = Point::new(5000.0, 5000.0);
-        let (col_far, line_far) =
-            calculate_terminal_cell_point(pt_far, window_size, side_bar_w, &metrics);
-        let (max_cols, max_rows) = metrics.grid_size(1000.0 - 252.0, 600.0 - 35.0);
+        let (col_far, line_far) = calculate_terminal_cell_point(pt_far, window_size, &metrics);
+        let (max_cols, max_rows) = metrics.grid_size(1000.0, 600.0 - 35.0);
         assert_eq!(
             (col_far, line_far),
             ((max_cols - 1) as usize, (max_rows - 1) as usize)
@@ -5469,7 +5126,7 @@ mod tests {
         app.terminal_focused = true;
 
         // Terminal click keeps focus when no modal
-        let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + app.workbench.side_bar_width();
+        let term_x = 0.0_f32;
         let term_y = TAB_STRIP_HEIGHT;
         app.cursor_position = Point::new(term_x + 5.0, term_y + 5.0);
         app.update(Message::IcedEventReceived(Event::Mouse(
@@ -5509,7 +5166,7 @@ mod tests {
 
         assert!(!app.active_session().unwrap().has_selection());
 
-        let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + app.workbench.side_bar_width();
+        let term_x = 0.0_f32;
         let term_y = TAB_STRIP_HEIGHT;
 
         // Press mouse down at (0,0) cell position
@@ -5557,16 +5214,28 @@ mod tests {
     }
 
     #[test]
+    fn the_new_tab_button_counts_as_strip_content_so_it_stays_reachable() {
+        // 2 tabs (320px) plus the 35px button need 355px: that just fits, 350px does not.
+        assert!(!calculate_tab_strip_geometry(2, 355.0, 0.0).is_overflowing());
+        let tight = calculate_tab_strip_geometry(2, 350.0, 0.0);
+        assert!(tight.is_overflowing());
+        // Scrolled to the end, the button is inside the visible window.
+        let end = calculate_tab_strip_geometry(2, 350.0, tight.max_scroll);
+        let content = 2.0 * TAB_WIDTH + NEW_TAB_BUTTON_WIDTH;
+        assert!((end.max_scroll + end.effective_viewport_width - content).abs() < 0.001);
+    }
+
+    #[test]
     fn tab_geometry_overflow_left_edge_shows_right_triangle_only() {
-        // 5 tabs * 160px = 800px in base_width 400px, scroll_offset_x = 0.0
+        // 5 tabs * 160px + new-tab button 35px = 835px in base_width 400px, scroll_offset_x = 0.0
         let geom = calculate_tab_strip_geometry(5, 400.0, 0.0);
         assert!(!geom.show_left_triangle);
         assert!(geom.show_right_triangle);
         assert!(geom.is_overflowing());
         // base_width - TAB_SCROLL_BUTTON_WIDTH = 400 - 24 = 376
         assert_eq!(geom.effective_viewport_width, 376.0);
-        // content_width (800) - 376 = 424
-        assert_eq!(geom.max_scroll, 424.0);
+        // content_width (5 * 160 + 35 for the new-tab button = 835) - 376 = 459
+        assert_eq!(geom.max_scroll, 459.0);
     }
 
     #[test]
@@ -5578,19 +5247,19 @@ mod tests {
         assert!(geom.is_overflowing());
         // base_width - 2 * TAB_SCROLL_BUTTON_WIDTH = 400 - 48 = 352
         assert_eq!(geom.effective_viewport_width, 352.0);
-        assert_eq!(geom.max_scroll, 424.0);
+        assert_eq!(geom.max_scroll, 459.0);
     }
 
     #[test]
     fn tab_geometry_overflow_right_edge_shows_left_triangle_only() {
-        // 5 tabs in 400px base_width, scroll_offset_x = 424.0 (max_scroll)
-        let geom = calculate_tab_strip_geometry(5, 400.0, 424.0);
+        // 5 tabs in 400px base_width, scroll_offset_x = 459.0 (max_scroll = 459)
+        let geom = calculate_tab_strip_geometry(5, 400.0, 459.0);
         assert!(geom.show_left_triangle);
         assert!(!geom.show_right_triangle);
         assert!(geom.is_overflowing());
         // base_width - TAB_SCROLL_BUTTON_WIDTH = 400 - 24 = 376
         assert_eq!(geom.effective_viewport_width, 376.0);
-        assert_eq!(geom.max_scroll, 424.0);
+        assert_eq!(geom.max_scroll, 459.0);
     }
 
     #[test]
@@ -5612,16 +5281,16 @@ mod tests {
         assert!(g_just_past.show_left_triangle);
         assert!(g_just_past.show_right_triangle);
 
-        // Test near right edge (max_scroll = 424.0)
-        let g_before_max = calculate_tab_strip_geometry(5, 400.0, 422.9);
+        // Test near right edge (max_scroll = 459.0)
+        let g_before_max = calculate_tab_strip_geometry(5, 400.0, 457.9);
         assert!(g_before_max.show_left_triangle);
         assert!(g_before_max.show_right_triangle);
 
-        let g_at_max_eps = calculate_tab_strip_geometry(5, 400.0, 423.0);
+        let g_at_max_eps = calculate_tab_strip_geometry(5, 400.0, 458.0);
         assert!(g_at_max_eps.show_left_triangle);
         assert!(!g_at_max_eps.show_right_triangle);
 
-        let g_at_max = calculate_tab_strip_geometry(5, 400.0, 424.0);
+        let g_at_max = calculate_tab_strip_geometry(5, 400.0, 459.0);
         assert!(g_at_max.show_left_triangle);
         assert!(!g_at_max.show_right_triangle);
     }
@@ -5637,7 +5306,7 @@ mod tests {
         let g_zero = calculate_tab_strip_geometry(4, 0.0, 0.0);
         assert!(g_zero.is_overflowing());
         assert_eq!(g_zero.effective_viewport_width, 0.0);
-        assert_eq!(g_zero.max_scroll, 640.0);
+        assert_eq!(g_zero.max_scroll, 4.0 * TAB_WIDTH + NEW_TAB_BUTTON_WIDTH);
     }
 
     #[test]
@@ -5755,9 +5424,9 @@ mod tests {
         app.tab_scroll_offset_x = 0.0;
         app.pending_tab_scroll_task = None;
 
-        let term_x = ACTIVITY_BAR_WIDTH + SASH_WIDTH + app.workbench.side_bar_width();
+        let term_x = 0.0_f32;
 
-        // 1. Wheel over Side Bar (x < term_x):
+        // 1. Wheel outside the window (x < 0):
         // Does NOT scroll tab strip and does NOT scroll terminal
         app.cursor_position = Point::new(term_x - 10.0, 10.0);
         app.handle_iced_event(Event::Mouse(mouse::Event::WheelScrolled {
@@ -5807,7 +5476,7 @@ mod tests {
             app.open_terminal_tab();
         }
         let total_tabs = app.workbench.tabs().len(); // 6 tabs = 960px
-        let content_width = total_tabs as f32 * TAB_WIDTH;
+        let content_width = total_tabs as f32 * TAB_WIDTH + NEW_TAB_BUTTON_WIDTH;
         let base_width = app.tab_strip_base_width();
 
         // 1. Left edge: offset = 0.0
@@ -5850,25 +5519,21 @@ mod tests {
         let g_left2 = calculate_tab_strip_geometry(total_tabs, base_width, 0.0);
         assert_eq!(g_left, g_left2);
 
-        // 6. Sash drag resize audit:
+        // 6. Window resize audit: the strip follows the whole window width.
         app.tab_scroll_offset_x = g_left.max_scroll;
-        // Drag sash to make sidebar wider (shrinking tab strip base width)
-        app.update(Message::SashPressed);
-        app.update(Message::SashDragged(ACTIVITY_BAR_WIDTH + 350.0));
-        app.update(Message::SashReleased);
+        app.update(Message::IcedEventReceived(Event::Window(
+            iced::window::Event::Resized(Size::new(900.0, 600.0)),
+        )));
         let new_base = app.tab_strip_base_width();
-        let g_sash_wide =
-            calculate_tab_strip_geometry(total_tabs, new_base, app.tab_scroll_offset_x);
-        assert!(app.tab_scroll_offset_x <= g_sash_wide.max_scroll);
+        let g_wide = calculate_tab_strip_geometry(total_tabs, new_base, app.tab_scroll_offset_x);
+        assert!(app.tab_scroll_offset_x <= g_wide.max_scroll);
 
-        // Drag sash back to default narrow sidebar (expanding tab strip base width)
-        app.update(Message::SashPressed);
-        app.update(Message::SashDragged(ACTIVITY_BAR_WIDTH + 170.0));
-        app.update(Message::SashReleased);
+        app.update(Message::IcedEventReceived(Event::Window(
+            iced::window::Event::Resized(Size::new(600.0, 600.0)),
+        )));
         let new_base2 = app.tab_strip_base_width();
-        let g_sash_narrow =
-            calculate_tab_strip_geometry(total_tabs, new_base2, app.tab_scroll_offset_x);
-        assert!(app.tab_scroll_offset_x <= g_sash_narrow.max_scroll);
+        let g_narrow = calculate_tab_strip_geometry(total_tabs, new_base2, app.tab_scroll_offset_x);
+        assert!(app.tab_scroll_offset_x <= g_narrow.max_scroll);
     }
 
     // --- Dopamine Mode tests ---
@@ -7866,5 +7531,179 @@ mod tests {
         assert!(app.dopamine.burst_for_tab(a).is_none());
         assert_eq!(app.dopamine.audio().burst_voice_count(), 0);
         assert_eq!(app.dopamine.gauge_for_tab(a), 0);
+    }
+
+    #[test]
+    fn the_terminal_uses_the_whole_window_below_the_tab_bar() {
+        let mut app = new_test_app(Locale::EnUs);
+        for size in [
+            Size::new(1200.0, 760.0),
+            Size::new(640.0, 400.0),
+            Size::new(2400.0, 1300.0),
+        ] {
+            app.window_size = size;
+            assert_eq!(app.terminal_viewport_width(), size.width.max(10.0));
+            let expected = app
+                .terminal_font_config
+                .metrics
+                .grid_size(size.width, size.height - TAB_STRIP_HEIGHT);
+            assert_eq!(app.terminal_grid_size(), expected, "{size:?}");
+        }
+        // A click at the very left edge of the terminal area hits the terminal.
+        app.window_size = Size::new(1000.0, 600.0);
+        app.terminal_focused = false;
+        app.cursor_position = Point::new(0.0, TAB_STRIP_HEIGHT + 1.0);
+        app.update(Message::IcedEventReceived(Event::Mouse(
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+        )));
+        assert!(app.terminal_focused);
+    }
+
+    #[test]
+    fn the_settings_gear_never_moves_and_never_overlaps_the_strip() {
+        let mut app = new_test_app(Locale::EnUs);
+        for width in [640.0_f32, 700.0, 1000.0, 1920.0, 3000.0] {
+            app.window_size = Size::new(width, 700.0);
+            for extra_tabs in [0usize, 1, 8] {
+                while app.workbench.tabs().len() < extra_tabs + 1 {
+                    app.open_terminal_tab();
+                }
+                let tabs = app.workbench.tabs().len();
+                // The gear owns the last SETTINGS_BUTTON_WIDTH of the window whatever the tabs do.
+                let base = app.tab_strip_base_width();
+                assert_eq!(base + SETTINGS_BUTTON_WIDTH, width, "{width} / {tabs} tabs");
+                // Tabs, new-tab button and scroll triangles always fit left of the gear.
+                for scroll in [0.0, 100.0, 1.0e6] {
+                    let g = calculate_tab_strip_geometry(tabs, base, scroll);
+                    let triangles = (g.show_left_triangle as u8 + g.show_right_triangle as u8)
+                        as f32
+                        * TAB_SCROLL_BUTTON_WIDTH;
+                    assert!(
+                        g.effective_viewport_width + triangles + SETTINGS_BUTTON_WIDTH
+                            <= width + 0.001,
+                        "{width} / {tabs} tabs / scroll {scroll}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_new_tab_button_follows_the_last_tab_and_stays_reachable() {
+        let mut app = new_test_app(Locale::EnUs);
+        app.window_size = Size::new(640.0, 600.0);
+        for _ in 0..8 {
+            app.open_terminal_tab();
+            let tabs = app.workbench.tabs().len();
+            // It sits right after the last tab: its offset in the strip is the tabs' total width.
+            let button_start = tabs as f32 * TAB_WIDTH;
+            let content = button_start + NEW_TAB_BUTTON_WIDTH;
+            let base = app.tab_strip_base_width();
+            let end = calculate_tab_strip_geometry(tabs, base, f32::MAX);
+            assert!(end.max_scroll + end.effective_viewport_width >= content - 0.001);
+            // Scrolled as far as possible, the whole button is inside the visible window.
+            assert!(content - end.max_scroll <= end.effective_viewport_width + 0.001);
+        }
+        // Closing a tab moves the button left by exactly one tab.
+        let before = app.workbench.tabs().len();
+        let last = app.workbench.tabs().iter().last().unwrap().id;
+        app.update(Message::TabClosed(last));
+        assert_eq!(app.workbench.tabs().len(), before - 1);
+    }
+
+    #[test]
+    fn tab_bar_buttons_use_plain_theme_styles_with_no_rainbow() {
+        let theme = synthetic_theme();
+        for status in [
+            button::Status::Active,
+            button::Status::Hovered,
+            button::Status::Pressed,
+            button::Status::Disabled,
+        ] {
+            let style = tab_icon_button_style(theme, status);
+            let expected = if matches!(status, button::Status::Hovered) {
+                theme.interaction.hover
+            } else {
+                theme.workbench.tab_bar_background
+            };
+            assert_eq!(style.background, Some(expected.into()), "{status:?}");
+        }
+        assert_eq!(
+            background(&tab_bar_style(theme)),
+            Some(theme.workbench.tab_bar_background),
+            "empty tab bar space is the plain bar colour"
+        );
+    }
+
+    #[test]
+    fn the_tab_bar_and_view_build_for_every_dopamine_and_width_combination() {
+        for dopamine in [false, true] {
+            let mut app = new_test_app(Locale::JaJp);
+            app.update(Message::SettingsDopamineToggled(dopamine));
+            for width in [640.0_f32, 1200.0] {
+                app.window_size = Size::new(width, 500.0);
+                for _ in 0..2 {
+                    app.open_terminal_tab();
+                    let _ = app.tab_strip();
+                    let _ = app.view();
+                }
+                app.update(Message::OpenSettingsTab);
+                let _ = app.view();
+            }
+        }
+    }
+
+    #[test]
+    fn gear_and_new_tab_buttons_manage_terminal_focus_and_tooltips_follow_the_language() {
+        let mut app = new_test_app(Locale::EnUs);
+        let terminal = active_tab(&app);
+        assert!(app.terminal_focused);
+        // The gear opens Settings, which takes no terminal input.
+        app.update(Message::OpenSettingsTab);
+        assert!(!app.terminal_focused);
+        // The new-tab button focuses the new terminal.
+        app.update(Message::NewTerminalTab);
+        assert!(app.terminal_focused);
+        assert_ne!(active_tab(&app), terminal);
+        // Going back to a terminal gives it the focus too.
+        app.update(Message::OpenSettingsTab);
+        app.update(Message::TabSelected(terminal));
+        assert!(app.terminal_focused);
+
+        assert_eq!(
+            app.localizer.text(MessageKey::TabBarSettingsTooltip),
+            "Settings"
+        );
+        assert_eq!(
+            app.localizer.text(MessageKey::TerminalNewTabTooltip),
+            "New Tab"
+        );
+        app.update(Message::SettingsLocaleChanged(LocalePreference::JaJp));
+        assert_eq!(
+            app.localizer.text(MessageKey::TabBarSettingsTooltip),
+            "設定"
+        );
+        assert_eq!(
+            app.localizer.text(MessageKey::TerminalNewTabTooltip),
+            "新しいタブ"
+        );
+    }
+
+    #[test]
+    fn former_side_bar_shortcuts_reach_the_terminal_not_the_application() {
+        let app = new_test_app(Locale::EnUs);
+        for ch in ["e", "f", "g"] {
+            for context in [CommandContext::TerminalFocused, CommandContext::Workbench] {
+                let route = InputArbiter::arbitrate_key_event(
+                    &app.keybinding_resolver,
+                    context,
+                    &keyboard::Key::Character(ch.into()),
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                    false,
+                    false,
+                );
+                assert_eq!(route, InputRoute::Terminal, "{ch} in {context:?}");
+            }
+        }
     }
 }

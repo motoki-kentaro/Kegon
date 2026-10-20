@@ -29,17 +29,8 @@ macro_rules! message_keys {
 }
 
 message_keys! {
-    ActivityExplorer => "activity-explorer",
-    ActivitySearch => "activity-search",
-    ActivityGit => "activity-git",
-    ActivitySettings => "activity-settings",
+    TabBarSettingsTooltip => "tab-bar-settings-tooltip",
 
-    SideBarExplorerTitle => "side-bar-explorer-title",
-    SideBarExplorerPlaceholder => "side-bar-explorer-placeholder",
-    SideBarSearchTitle => "side-bar-search-title",
-    SideBarSearchPlaceholder => "side-bar-search-placeholder",
-    SideBarGitTitle => "side-bar-git-title",
-    SideBarGitPlaceholder => "side-bar-git-placeholder",
     SettingsLanguageLabel => "settings-language-label",
     SettingsLanguageSystem => "settings-language-system",
     SettingsCliOverrideNote => "settings-cli-override-note",
