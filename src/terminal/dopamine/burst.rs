@@ -226,6 +226,9 @@ impl Piece {
 #[derive(Debug, Clone)]
 pub struct Burst {
     pub started: Instant,
+    /// Identifies this Burst instance for its sound, so a stale cancel can never stop a newer
+    /// Burst. Assigned by the controller when the Burst is accepted; 0 until then.
+    pub audio_id: u64,
     /// Gauge value (0..=100) captured when the Burst fired. The wave/fountain geometry is
     /// anchored to it as a fraction of the canvas width and never follows the shrinking display.
     anchor_gauge: f32,
@@ -367,6 +370,7 @@ impl Burst {
             .collect();
         Self {
             started: now,
+            audio_id: 0,
             anchor_gauge: MAX_ANCHOR_GAUGE,
             effects,
             text: pick_text(rng),

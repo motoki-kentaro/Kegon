@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod border;
 pub mod burst;
+pub mod burst_sfx;
 pub mod chime;
 pub mod combo;
 pub mod fail;
@@ -83,6 +84,8 @@ pub struct DopamineController {
     chime_seq: u32,
     /// Counts failure sounds, so every one gets its own seed.
     fail_seq: u32,
+    /// Gives every accepted Burst its own id, shared by its visuals and its sound.
+    burst_seq: u64,
     /// Highest command id per tab that already played its failure sound (one sound per command).
     failed_commands: HashMap<TabId, u64>,
     /// Transfers waiting for their Gain Chime to start.
@@ -110,6 +113,7 @@ impl DopamineController {
             audio: DopamineAudio::new(),
             chime_seq: 0,
             fail_seq: 0,
+            burst_seq: 0,
             failed_commands: HashMap::new(),
             pending_transfers: pending::PendingTransfers::default(),
             last_tick: None,
@@ -240,6 +244,7 @@ impl DopamineController {
         self.tab_borders.retain(|_, b| !b.is_expired(now));
 
         self.tab_bursts.retain(|_, b| b.progress(now) < 1.0);
+        self.sync_burst_audio();
 
         // Transfers to start this tick: (transfer, shared start instant).
         let mut launches: Vec<(pending::PendingTransfer, Instant)> = Vec::new();
@@ -657,9 +662,27 @@ impl DopamineController {
             self.tab_transfers.remove(&tab_id);
             self.pending_transfers.remove_tab(tab_id);
             self.tab_gauges.insert(tab_id, TabGaugeDisplay::new(100));
-            self.tab_bursts
-                .insert(tab_id, burst::Burst::new(now, &mut self.burst_rng));
+            let mut accepted = burst::Burst::new(now, &mut self.burst_rng);
+            self.burst_seq += 1;
+            accepted.audio_id = self.burst_seq;
+            self.tab_bursts.insert(tab_id, accepted);
+            // The Burst was just accepted: its sound starts now, or is skipped if the cached PCM
+            // is not ready. Nothing here waits, and the visuals never depend on it.
+            self.audio.play_burst(tab_id, self.burst_seq);
         }
+    }
+
+    /// Stops the sound of every Burst that is no longer the live Burst of its tab (cancelled,
+    /// replaced or expired). Matching on the Burst id keeps a stale cancel from touching a
+    /// newer Burst. The cached PCM is never discarded.
+    fn sync_burst_audio(&mut self) {
+        let live: std::collections::HashSet<(TabId, u64)> = self
+            .tab_bursts
+            .iter()
+            .map(|(tab, burst)| (*tab, burst.audio_id))
+            .collect();
+        self.audio
+            .retain_burst_voices(|tab, id| live.contains(&(tab, id)));
     }
 
     /// Forwards PromptStarted (OSC 133 A) to `tab_id`'s combo state machine for anomaly recovery.
@@ -740,6 +763,7 @@ impl DopamineController {
                 gauge.snap_to(0);
             }
         }
+        self.sync_burst_audio();
     }
 
     /// Consumes maximum gauge for a Burst effect on `tab_id`.
@@ -771,6 +795,7 @@ impl DopamineController {
         self.tab_gauges.remove(&tab_id);
         self.tab_transfers.remove(&tab_id);
         self.pending_transfers.remove_tab(tab_id);
+        self.sync_burst_audio();
     }
 
     /// Handles child shell exit for `tab_id` by safely discarding its combo state.
@@ -789,6 +814,7 @@ impl DopamineController {
         self.tab_gauges.remove(&tab_id);
         self.tab_transfers.remove(&tab_id);
         self.pending_transfers.remove_tab(tab_id);
+        self.sync_burst_audio();
     }
 
     /// Clears all particles, border effects, and combo/gauge states across all tabs.
@@ -803,6 +829,7 @@ impl DopamineController {
         self.tab_transfers.clear();
         self.pending_transfers.clear();
         self.last_tick = None;
+        self.sync_burst_audio();
     }
 
     /// Reference to the audio subsystem.
@@ -2222,5 +2249,158 @@ mod tests {
         ctrl.set_enabled(false);
         ctrl.on_command_failed(a, 9);
         assert_eq!(ctrl.audio().fail_request_log().len(), n, "Mode OFF again");
+    }
+
+    fn burst_ready_controller() -> (DopamineController, TabId, TabId) {
+        let mut ctrl = DopamineController::new(true);
+        ctrl.audio_mut().enable_fake_tickets();
+        ctrl.audio().install_burst_pcm_for_test();
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let b = tabs.add(TabKind::Terminal);
+        (ctrl, a, b)
+    }
+
+    #[test]
+    fn burst_sound_starts_once_with_the_accepted_burst_and_only_then() {
+        let (mut ctrl, a, _b) = burst_ready_controller();
+        let t0 = Instant::now();
+        // Typing, Enter-like activity and a full gauge alone are not a Burst.
+        let full = fill_for_burst(&mut ctrl, a, t0);
+        assert_eq!(ctrl.gauge_for_tab(a), 100);
+        assert!(
+            ctrl.audio().burst_started_log().is_empty(),
+            "gauge MAX alone"
+        );
+        // A failed command, an untrusted success and an unknown result do not start it.
+        ctrl.on_command_finished(a, 1, false, true, full);
+        ctrl.on_command_finished(a, 2, true, false, full);
+        ctrl.on_command_failed(a, 3);
+        assert!(ctrl.audio().burst_started_log().is_empty());
+        // A trusted success below a full gauge does not either.
+        let (mut low, la, _) = burst_ready_controller();
+        transfer_once(&mut low, la, 40, t0);
+        low.on_command_finished(la, 1, true, true, t0 + std::time::Duration::from_secs(2));
+        assert!(low.audio().burst_started_log().is_empty());
+        // The accepted Burst starts exactly one sound, tied to the Burst instance.
+        ctrl.on_command_finished(a, 4, true, true, full);
+        let burst = ctrl.burst_for_tab(a).expect("burst");
+        assert_eq!(ctrl.audio().burst_started_log(), &[(a, burst.audio_id)]);
+        assert_ne!(burst.audio_id, 0);
+        // The same completion again, or one during the Burst, never doubles it.
+        ctrl.on_command_finished(a, 4, true, true, full);
+        ctrl.on_command_finished(a, 5, true, true, full + std::time::Duration::from_secs(1));
+        assert_eq!(ctrl.audio().burst_started_log().len(), 1);
+        assert_eq!(ctrl.audio().burst_voice_count(), 1);
+    }
+
+    #[test]
+    fn a_burst_before_the_cache_is_ready_keeps_its_visuals_and_skips_the_sound_for_good() {
+        let mut ctrl = DopamineController::new(true);
+        ctrl.audio_mut().enable_fake_tickets();
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let full = fill_for_burst(&mut ctrl, a, Instant::now());
+        assert!(!ctrl.audio().burst_pcm_ready());
+        ctrl.on_command_finished(a, 1, true, true, full);
+        assert!(
+            ctrl.burst_for_tab(a).is_some(),
+            "the visuals are not delayed"
+        );
+        assert!(
+            ctrl.audio().burst_started_log().is_empty(),
+            "no sound without the cache"
+        );
+        // The cache becoming ready later does not make an old Burst start sounding midway.
+        ctrl.audio().install_burst_pcm_for_test();
+        ctrl.tick_with_viewport(
+            full + std::time::Duration::from_secs(1),
+            800.0,
+            600.0,
+            Some(a),
+            None,
+        );
+        assert!(ctrl.audio().burst_started_log().is_empty());
+        assert_eq!(ctrl.audio().burst_voice_count(), 0);
+    }
+
+    #[test]
+    fn cancelling_a_burst_stops_only_its_voice_and_keeps_the_cache() {
+        for cancel in 0..5 {
+            let (mut ctrl, a, b) = burst_ready_controller();
+            let t0 = Instant::now();
+            let full = fill_for_burst(&mut ctrl, a, t0);
+            ctrl.on_command_finished(a, 1, true, true, full);
+            // A second tab bursts too; cancelling `a` must leave `b` sounding.
+            let full_b = fill_for_burst(&mut ctrl, b, full + std::time::Duration::from_millis(50));
+            ctrl.on_command_finished(b, 1, true, true, full_b);
+            assert_eq!(ctrl.audio().burst_voice_count(), 2, "cancel {cancel}");
+            let id_b = ctrl.burst_for_tab(b).unwrap().audio_id;
+            match cancel {
+                0 => ctrl.clear_tab(a),
+                1 => ctrl.on_shell_exited(a),
+                2 => ctrl.retain_active_burst(Some(b), full_b),
+                3 => {
+                    // Switching to Settings cancels both.
+                    ctrl.retain_active_burst(None, full_b);
+                    assert_eq!(ctrl.audio().burst_voice_count(), 0);
+                    assert!(ctrl.audio().burst_pcm_ready());
+                    continue;
+                }
+                _ => {
+                    ctrl.set_enabled(false);
+                    assert_eq!(ctrl.audio().burst_voice_count(), 0, "Mode OFF");
+                    assert!(
+                        ctrl.audio().burst_pcm_ready(),
+                        "the cache outlives Mode OFF"
+                    );
+                    continue;
+                }
+            }
+            assert_eq!(ctrl.audio().burst_voice_count(), 1, "cancel {cancel}");
+            assert_eq!(ctrl.audio().burst_started_log().last().unwrap().1, id_b);
+            assert!(ctrl.audio().burst_pcm_ready(), "cache kept");
+        }
+    }
+
+    #[test]
+    fn a_stale_cancel_never_stops_a_newer_burst_and_a_finished_burst_frees_its_voice() {
+        let (mut ctrl, a, _b) = burst_ready_controller();
+        let t0 = Instant::now();
+        let full = fill_for_burst(&mut ctrl, a, t0);
+        ctrl.on_command_finished(a, 1, true, true, full);
+        let first = ctrl.burst_for_tab(a).unwrap().audio_id;
+        ctrl.retain_active_burst(None, full);
+        assert_eq!(ctrl.audio().burst_voice_count(), 0);
+        // A new Burst on the same tab gets a new id; repeating the old cancel leaves it alone.
+        let t1 = full + std::time::Duration::from_secs(10);
+        let full2 = fill_for_burst(&mut ctrl, a, t1);
+        ctrl.on_command_finished(a, 2, true, true, full2);
+        let second = ctrl.burst_for_tab(a).unwrap().audio_id;
+        assert_ne!(first, second);
+        ctrl.on_shell_exited(a);
+        assert_eq!(ctrl.audio().burst_voice_count(), 0);
+        let full3 = fill_for_burst(&mut ctrl, a, full2 + std::time::Duration::from_secs(10));
+        ctrl.on_command_finished(a, 3, true, true, full3);
+        ctrl.sync_burst_audio();
+        ctrl.sync_burst_audio();
+        assert_eq!(ctrl.audio().burst_voice_count(), 1);
+        // When the Burst ends on its own, the next tick releases its voice.
+        ctrl.tick_with_viewport(full3 + burst::DURATION, 800.0, 600.0, Some(a), None);
+        assert_eq!(ctrl.audio().burst_voice_count(), 0);
+        assert!(ctrl.audio().burst_pcm_ready());
+    }
+
+    #[test]
+    fn a_burst_sound_request_without_any_device_is_a_harmless_no_op() {
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let full = fill_for_burst(&mut ctrl, a, Instant::now());
+        ctrl.audio().install_burst_pcm_for_test();
+        // Ready cache but no device and no test double: nothing plays, the Burst runs.
+        ctrl.on_command_finished(a, 1, true, true, full);
+        assert!(ctrl.burst_for_tab(a).is_some());
+        assert_eq!(ctrl.audio().burst_voice_count(), 0);
     }
 }

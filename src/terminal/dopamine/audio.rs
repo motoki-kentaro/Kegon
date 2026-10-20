@@ -3,9 +3,9 @@
 //! The voices are synthesised once at start (see [`super::synth`]) and played from memory.
 //! Without an audio device nothing is played and nothing fails.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle, StaticSoundSettings};
@@ -13,7 +13,8 @@ use kira::{AudioManager, AudioManagerSettings, DefaultBackend, Frame, Tween};
 
 use super::params::SFX;
 use super::synth::{self, Voice};
-use super::{chime, fail};
+use super::{burst_sfx, chime, fail};
+use crate::workbench::TabId;
 
 /// Sound profile choices for Dopamine Mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -92,6 +93,20 @@ const MAX_FAIL_JOBS: usize = 2;
 const MAX_FAIL_VOICES: usize = 2;
 const FAIL_VOLUME_DB: f32 = -2.0;
 
+/// Burst sounds that may ring at once (one per Burst; Bursts are per tab and short).
+const MAX_BURST_VOICES: usize = 2;
+const BURST_VOLUME_DB: f32 = -2.0;
+/// Fade used when a Burst is cancelled, so the cut has no click.
+const BURST_CANCEL_FADE: Duration = Duration::from_millis(40);
+
+/// One playing Burst sound, tied to the Burst instance that started it.
+struct BurstVoice {
+    tab: TabId,
+    id: u64,
+    /// `None` only in tests that run without a device.
+    handle: Option<StaticSoundHandle>,
+}
+
 /// Chimes sit a little below the Backspace sounds so that both can overlap without clipping.
 const CHIME_VOLUME_DB: f32 = -3.0;
 /// Older chimes make room for a newer one.
@@ -130,6 +145,15 @@ pub struct DopamineAudio {
     chimes: Vec<StaticSoundHandle>,
     /// Failure sounds that may still be playing.
     fails: Vec<StaticSoundHandle>,
+    /// The 4 s Burst PCM, rendered once at start-up on a worker and then shared read-only.
+    /// Empty until the worker finishes (or for ever if it fails): a Burst before that is silent.
+    burst_pcm: Arc<OnceLock<Arc<[Frame]>>>,
+    /// Tells a still-running start-up worker to drop its result when the audio is gone.
+    burst_cancel: Arc<AtomicBool>,
+    burst_voices: Vec<BurstVoice>,
+    /// Burst sounds started, as `(tab, burst id)`, for tests.
+    #[cfg(test)]
+    burst_started: Vec<(TabId, u64)>,
     fail_jobs: Arc<AtomicUsize>,
     chime_tx: Sender<ChimeBuffer>,
     chime_rx: Receiver<ChimeBuffer>,
@@ -153,7 +177,7 @@ impl DopamineAudio {
     /// Starts the audio engine and builds every sound buffer in memory.
     pub fn new() -> Self {
         let (chime_tx, chime_rx) = mpsc::channel();
-        Self {
+        let audio = Self {
             // Unit tests never open a real output device, so they behave the same everywhere.
             manager: if cfg!(test) {
                 None
@@ -169,6 +193,11 @@ impl DopamineAudio {
             playing: Vec::new(),
             chimes: Vec::new(),
             fails: Vec::new(),
+            burst_pcm: Arc::new(OnceLock::new()),
+            burst_cancel: Arc::new(AtomicBool::new(false)),
+            burst_voices: Vec::new(),
+            #[cfg(test)]
+            burst_started: Vec::new(),
             fail_jobs: Arc::new(AtomicUsize::new(0)),
             chime_tx,
             chime_rx,
@@ -181,7 +210,118 @@ impl DopamineAudio {
             fake_tickets: false,
             #[cfg(test)]
             fail_requests: Vec::new(),
+        };
+        // Once per application start, off the UI thread.
+        audio.start_burst_prerender();
+        audio
+    }
+
+    /// Renders the Burst PCM once, on a background thread, and stores it for the life of the
+    /// application. Never blocks the caller; without a device there is nothing to play, so it is
+    /// skipped. A panicking or failing worker leaves the cache empty and Bursts silent.
+    fn start_burst_prerender(&self) {
+        if self.manager.is_none() {
+            return;
         }
+        let cell = Arc::clone(&self.burst_pcm);
+        let cancel = Arc::clone(&self.burst_cancel);
+        let _ = std::thread::Builder::new()
+            .name("kegon-burst-sfx".into())
+            .spawn(move || {
+                let pcm = burst_sfx::render_burst(burst_sfx::DEFAULT_SEED);
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                let frames: Arc<[Frame]> = pcm.iter().map(|f| Frame::new(f[0], f[1])).collect();
+                let _ = cell.set(frames);
+            });
+    }
+
+    /// Whether the Burst PCM is ready to play.
+    #[allow(dead_code)]
+    pub fn burst_pcm_ready(&self) -> bool {
+        self.burst_pcm.get().is_some()
+    }
+
+    /// Starts the Burst sound for Burst `id` of `tab`. Silently skipped (returns `false`) when the
+    /// PCM is not ready yet, there is no device, or playing fails: never waits, never renders,
+    /// never delays the visuals. The 4 s PCM is shared, not copied.
+    pub fn play_burst(&mut self, tab: TabId, id: u64) -> bool {
+        let Some(frames) = self.burst_pcm.get().map(Arc::clone) else {
+            return false;
+        };
+        self.burst_voices.retain(|v| {
+            v.handle
+                .as_ref()
+                .is_none_or(|h| h.state() != kira::sound::PlaybackState::Stopped)
+        });
+        let handle = match &mut self.manager {
+            Some(manager) => {
+                let data = StaticSoundData {
+                    sample_rate: burst_sfx::SAMPLE_RATE,
+                    frames,
+                    settings: StaticSoundSettings::default().volume(BURST_VOLUME_DB),
+                    slice: None,
+                };
+                match manager.play(data) {
+                    Ok(handle) => Some(handle),
+                    Err(_) => return false,
+                }
+            }
+            #[cfg(test)]
+            None if self.fake_tickets => None,
+            None => return false,
+        };
+        while self.burst_voices.len() >= MAX_BURST_VOICES {
+            if let Some(mut old) = self.burst_voices.remove(0).handle {
+                old.stop(Tween {
+                    duration: BURST_CANCEL_FADE,
+                    ..Tween::default()
+                });
+            }
+        }
+        self.burst_voices.push(BurstVoice { tab, id, handle });
+        #[cfg(test)]
+        self.burst_started.push((tab, id));
+        true
+    }
+
+    /// Stops every Burst voice for which `keep(tab, id)` is false, with a short fade. The cached
+    /// PCM is untouched.
+    pub fn retain_burst_voices(&mut self, keep: impl Fn(TabId, u64) -> bool) {
+        let fade = Tween {
+            duration: BURST_CANCEL_FADE,
+            ..Tween::default()
+        };
+        self.burst_voices.retain_mut(|v| {
+            if keep(v.tab, v.id) {
+                return true;
+            }
+            if let Some(handle) = &mut v.handle {
+                handle.stop(fade);
+            }
+            false
+        });
+    }
+
+    /// Burst voices that may still be playing.
+    #[cfg(test)]
+    pub fn burst_voice_count(&self) -> usize {
+        self.burst_voices.len()
+    }
+
+    /// Burst sounds started so far as `(tab, burst id)`.
+    #[cfg(test)]
+    pub fn burst_started_log(&self) -> &[(TabId, u64)] {
+        &self.burst_started
+    }
+
+    /// Tests: installs a Burst PCM without rendering it.
+    #[cfg(test)]
+    pub fn install_burst_pcm_for_test(&self) {
+        let _ = self
+            .burst_pcm
+            .set(Arc::from(vec![Frame::from_mono(0.0); 16]));
     }
 
     pub fn set_sound_kind(&mut self, kind: DopamineSoundKind) {
@@ -431,6 +571,11 @@ impl DopamineAudio {
         for mut handle in self.chimes.drain(..).chain(self.fails.drain(..)) {
             handle.stop(quick);
         }
+        for mut voice in self.burst_voices.drain(..) {
+            if let Some(handle) = &mut voice.handle {
+                handle.stop(quick);
+            }
+        }
         // Chimes still being rendered belong to the old generation and are dropped on arrival.
         self.chime_generation = self.chime_generation.wrapping_add(1);
         while self.chime_rx.try_recv().is_ok() {}
@@ -450,6 +595,13 @@ impl DopamineAudio {
     }
 }
 
+impl Drop for DopamineAudio {
+    fn drop(&mut self) {
+        // A start-up render that is still running discards its result instead of publishing it.
+        self.burst_cancel.store(true, Ordering::Release);
+    }
+}
+
 impl Default for DopamineAudio {
     fn default() -> Self {
         Self::new()
@@ -465,6 +617,10 @@ mod tests {
         DopamineAudio {
             chimes: Vec::new(),
             fails: Vec::new(),
+            burst_pcm: Arc::new(OnceLock::new()),
+            burst_cancel: Arc::new(AtomicBool::new(false)),
+            burst_voices: Vec::new(),
+            burst_started: Vec::new(),
             fail_jobs: Arc::new(AtomicUsize::new(0)),
             fail_requests: Vec::new(),
             chime_tx,

@@ -38,7 +38,7 @@ fn samples(secs: f64) -> usize {
 }
 
 /// Frequency of each sample of a `secs`-long exponential sweep from `f0` to `f1`.
-fn expsweep(f0: f64, f1: f64, secs: f64) -> Vec<f64> {
+pub(super) fn expsweep(f0: f64, f1: f64, secs: f64) -> Vec<f64> {
     (0..samples(secs))
         .map(|i| f0 * (f1 / f0).powf((i as f64 / SR) / secs))
         .collect()
@@ -47,14 +47,14 @@ fn expsweep(f0: f64, f1: f64, secs: f64) -> Vec<f64> {
 /// Chamberlin state-variable filter, as in the prototype:
 /// `f = 2 sin(pi min(fc, 0.22 SR) / SR); low += f band; high = x - low - band / q; band += f high`.
 /// Every layer owns its own state.
-struct Svf {
+pub(super) struct Svf {
     low: f64,
     band: f64,
     inv_q: f64,
 }
 
 impl Svf {
-    fn new(q: f64) -> Self {
+    pub(super) fn new(q: f64) -> Self {
         Self {
             low: 0.0,
             band: 0.0,
@@ -64,7 +64,7 @@ impl Svf {
 
     /// Advances one sample and returns `(low, band)`. Non-finite state is reset to silence, so a
     /// numerical blow-up can never leave the filter.
-    fn step(&mut self, x: f64, cutoff_hz: f64) -> (f64, f64) {
+    pub(super) fn step(&mut self, x: f64, cutoff_hz: f64) -> (f64, f64) {
         let f = 2.0 * (PI * cutoff_hz.min(SR * 0.22) / SR).sin();
         self.low += f * self.band;
         let high = x - self.low - self.band * self.inv_q;
@@ -239,10 +239,10 @@ fn gaussian(rng: &mut Rng) -> f64 {
 
 /// Decaying-noise impulse response (60 dB in RT60), differenced to remove low frequencies and
 /// scaled to unit energy. An independent response per channel gives the stereo width.
-fn reverb_impulse(rng: &mut Rng) -> Vec<f32> {
-    let n = samples(REVERB_RT60_SECS);
+fn reverb_impulse(rng: &mut Rng, rt60: f64) -> Vec<f32> {
+    let n = samples(rt60);
     let noise: Vec<f64> = (0..n)
-        .map(|i| gaussian(rng) * (-6.907_755 * (i as f64 / SR) / REVERB_RT60_SECS).exp())
+        .map(|i| gaussian(rng) * (-6.907_755 * (i as f64 / SR) / rt60).exp())
         .collect();
     let mut ir: Vec<f64> = (0..n)
         .map(|i| {
@@ -264,13 +264,24 @@ fn reverb_impulse(rng: &mut Rng) -> Vec<f32> {
 /// prototype's IR normalisation was not available; unit energy keeps the wet level close to the
 /// dry level before the 0.12 gain.
 fn add_reverb(left: &mut [f32], right: &mut [f32], rng: &mut Rng) {
+    add_reverb_with(left, right, rng, REVERB_RT60_SECS, REVERB_WET);
+}
+
+/// [`add_reverb`] with its own decay time and wet amount (also used by the Burst sound).
+pub(super) fn add_reverb_with(
+    left: &mut [f32],
+    right: &mut [f32],
+    rng: &mut Rng,
+    rt60: f64,
+    wet_amount: f32,
+) {
     let predelay = samples(REVERB_PREDELAY_SECS);
     for ch in [left, right] {
-        let ir = reverb_impulse(rng);
+        let ir = reverb_impulse(rng, rt60);
         let wet = convolve(ch, &ir);
         for (i, w) in wet.iter().enumerate() {
             if let Some(slot) = ch.get_mut(i + predelay) {
-                *slot += w * REVERB_WET;
+                *slot += w * wet_amount;
             }
         }
     }
@@ -432,7 +443,7 @@ mod tests {
 
     #[test]
     fn reverb_response_decays_and_has_unit_energy_without_low_content() {
-        let ir = reverb_impulse(&mut Rng::new(3));
+        let ir = reverb_impulse(&mut Rng::new(3), REVERB_RT60_SECS);
         assert_eq!(ir.len(), samples(0.5));
         let energy: f32 = ir.iter().map(|v| v * v).sum();
         assert!((energy - 1.0).abs() < 1e-3);
