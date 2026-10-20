@@ -17,12 +17,14 @@ pub const GAUGE_HEIGHT: f32 = 4.0;
 /// Maximum value for the gauge.
 pub const MAX_GAUGE: f32 = 100.0;
 
-/// Default duration for gauge fill interpolation.
-pub const GAUGE_INTERPOLATION_DURATION: Duration = Duration::from_millis(450);
+/// Fill time used when a caller does not provide a Gain Chime timeline (tests, fallbacks).
+#[cfg(test)]
+pub const DEFAULT_FILL_DURATION: Duration = Duration::from_millis(450);
 
-/// Flight duration for transfer particles.
-#[allow(dead_code)]
-pub const TRANSFER_FLIGHT_DURATION: Duration = Duration::from_millis(420);
+/// Typical flight time of a transfer particle is a third of the chime up to its landing bell,
+/// kept inside this range.
+pub const MIN_TRANSFER_FLIGHT: Duration = Duration::from_millis(140);
+pub const MAX_TRANSFER_FLIGHT: Duration = Duration::from_millis(420);
 
 /// Lifetime of sparks bursting on arrival at the gauge tip.
 pub const SPARK_LIFETIME: Duration = Duration::from_millis(160);
@@ -33,20 +35,10 @@ pub const SPARK_LIFETIME: Duration = Duration::from_millis(160);
 /// canvas frame, so launch points are kept on the canvas' top edge instead.
 pub const TRANSFER_ORIGIN_Y: f32 = 4.0;
 
-/// Maximum particles launched in a single transfer to keep performance bounded.
-pub const MAX_TRANSFER_PARTICLES: usize = 24;
-
-/// Minimum particles launched for any non-zero transfer.
-pub const MIN_TRANSFER_PARTICLES: usize = 4;
-
-/// Computes the particle count for a given transferred combo point count.
-/// Scales non-linearly with `sqrt(points)` and clamps between 4 and 24.
-pub fn calculate_particle_count(points: u32) -> usize {
-    if points == 0 {
-        return 0;
-    }
-    ((points as f32).sqrt() * 3.0)
-        .clamp(MIN_TRANSFER_PARTICLES as f32, MAX_TRANSFER_PARTICLES as f32) as usize
+/// One Combo Transfer particle per transferred combo point: 1 HIT = 1 Particle. Never thinned,
+/// never capped; the cost is managed by scheduling, not by dropping particles.
+pub fn transfer_particle_count(points: u32) -> usize {
+    points as usize
 }
 
 /// Returns a transfer launch point guaranteed to lie inside a `viewport_width` x
@@ -95,13 +87,6 @@ fn faded(mut color: Color, factor: f32) -> Color {
     color
 }
 
-/// Cubic ease-out curve mapping `t` in `[0.0, 1.0]` to `[0.0, 1.0]`.
-#[inline]
-pub fn ease_out_cubic(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(3)
-}
-
 /// Visual display state of a tab's Dopamine Gauge.
 ///
 /// Separates the visual interpolated display value from the core ground truth gauge.
@@ -134,20 +119,31 @@ impl TabGaugeDisplay {
             target_value: val,
             anim_start_value: val,
             anim_start_time: None,
-            anim_duration: GAUGE_INTERPOLATION_DURATION,
+            anim_duration: Duration::from_millis(1),
         }
     }
 
-    /// Sets a new target value and begins smooth interpolation from the current display value.
-    pub fn set_target(&mut self, target: u32, now: Instant) {
-        let new_target = (target as f32).clamp(0.0, MAX_GAUGE);
+    /// Fills toward `target` over `duration`, starting at `start`, from the current display value.
+    ///
+    /// `duration` is the Gain Chime's landing time, so the fill completes on the "ラン！". The
+    /// target never moves backwards: a late or re-ordered transfer cannot pull the display down
+    /// (only [`Self::snap_to`] and the Burst do that).
+    pub fn set_target_timed(&mut self, target: u32, start: Instant, duration: Duration) {
+        let new_target = (target as f32).clamp(0.0, MAX_GAUGE).max(self.target_value);
         if (new_target - self.target_value).abs() < f32::EPSILON && self.anim_start_time.is_none() {
             return;
         }
 
         self.anim_start_value = self.displayed_value;
         self.target_value = new_target;
-        self.anim_start_time = Some(now);
+        self.anim_start_time = Some(start);
+        self.anim_duration = duration.max(Duration::from_millis(1));
+    }
+
+    /// [`Self::set_target_timed`] with the default fill time.
+    #[cfg(test)]
+    pub fn set_target(&mut self, target: u32, now: Instant) {
+        self.set_target_timed(target, now, DEFAULT_FILL_DURATION);
     }
 
     /// Advances interpolation toward `target_value`.
@@ -156,7 +152,9 @@ impl TabGaugeDisplay {
             let elapsed = now.saturating_duration_since(start).as_secs_f32();
             let total = self.anim_duration.as_secs_f32().max(0.001);
             let progress = (elapsed / total).clamp(0.0, 1.0);
-            let ease = ease_out_cubic(progress);
+            // Linear: particles land evenly over the same window, so the fill keeps growing
+            // through the whole arpeggio instead of finishing early and idling.
+            let ease = progress;
 
             self.displayed_value = (self.anim_start_value
                 + (self.target_value - self.anim_start_value) * ease)
@@ -401,21 +399,39 @@ impl TabTransferManager {
         }
     }
 
-    /// Spawns transfer particles flying from `origin` (HIT badge) to `target` (Gauge fill tip).
-    pub fn spawn_transfer(&mut self, points: u32, origin: Point, target: Point, now: Instant) {
-        if points == 0 {
+    /// Spawns one particle per transferred combo point, flying from `origin` (HIT badge) to
+    /// `target` (Gauge fill tip). `start` is when the Gain Chime begins and `landing` its landing
+    /// bell: arrivals are spread evenly from one typical flight time after `start` up to exactly
+    /// `start + landing` for the last particle, and each particle launches as late as it can.
+    pub fn spawn_transfer(
+        &mut self,
+        points: u32,
+        origin: Point,
+        target: Point,
+        start: Instant,
+        landing: Duration,
+    ) {
+        let count = transfer_particle_count(points);
+        if count == 0 {
             return;
         }
-
-        let count = calculate_particle_count(points);
         let dx = target.x - origin.x;
         let dy = target.y - origin.y;
+        let landing_s = landing.as_secs_f32();
+        let flight = (landing_s * 0.35).clamp(
+            MIN_TRANSFER_FLIGHT.as_secs_f32(),
+            MAX_TRANSFER_FLIGHT.as_secs_f32(),
+        );
+        let first_arrival = flight.min(landing_s);
+        self.particles.reserve(count);
 
         for i in 0..count {
-            // Stagger launch times so particles stream naturally
-            let delay_secs = (i as f32 / count as f32) * 0.11;
-            let start_time = now + Duration::from_secs_f32(delay_secs);
-            let duration = Duration::from_millis(380 + (i as u64 * 13) % 70);
+            let frac = (i + 1) as f32 / count as f32;
+            let arrival = first_arrival + (landing_s - first_arrival) * frac;
+            let jitter = 0.9 + 0.2 * (((i * 13) % 7) as f32 / 6.0);
+            let flight_i = (flight * jitter).min(arrival).max(0.001);
+            let start_time = start + Duration::from_secs_f32(arrival - flight_i);
+            let duration = Duration::from_secs_f32(flight_i);
 
             // Alternate lateral arc outward from the straight line
             let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
@@ -578,14 +594,11 @@ mod tests {
         assert_eq!(display.displayed_value(), 20.0);
         assert!(display.is_animating(t0));
 
-        // Mid-point of interpolation (225ms of 450ms)
+        // Mid-point of interpolation (225ms of 450ms): linear, 20 + 28 * 0.5 = 34.
         let t_mid = t0 + Duration::from_millis(225);
         display.update(t_mid);
         let val_mid = display.displayed_value();
-        assert!(val_mid > 20.0 && val_mid < 48.0);
-        // Ease-out cubic at 0.5: 1 - 0.125 = 0.875
-        // 20 + 28 * 0.875 = 44.5
-        assert!((val_mid - 44.5).abs() < 0.2);
+        assert!((val_mid - 34.0).abs() < 0.2, "{val_mid}");
 
         // Completion at 450ms
         let t_end = t0 + Duration::from_millis(450);
@@ -666,14 +679,136 @@ mod tests {
     }
 
     #[test]
-    fn particle_count_scaling_is_bounded_and_non_linear() {
-        assert_eq!(calculate_particle_count(0), 0);
-        assert_eq!(calculate_particle_count(1), 4);
-        assert_eq!(calculate_particle_count(4), 6);
-        assert_eq!(calculate_particle_count(10), 9);
-        assert_eq!(calculate_particle_count(25), 15);
-        assert_eq!(calculate_particle_count(100), 24);
-        assert_eq!(calculate_particle_count(999), 24);
+    fn one_hit_is_exactly_one_particle_with_no_compression() {
+        assert_eq!(transfer_particle_count(0), 0);
+        for n in [1, 4, 5, 10, 20, 100, 500, 999] {
+            assert_eq!(transfer_particle_count(n), n as usize, "{n}");
+        }
+    }
+
+    fn spawn(points: u32, start: Instant, landing_ms: u64) -> TabTransferManager {
+        let mut m = TabTransferManager::new();
+        m.spawn_transfer(
+            points,
+            Point::new(115.0, 4.0),
+            Point::new(400.0, 796.0),
+            start,
+            Duration::from_millis(landing_ms),
+        );
+        m
+    }
+
+    #[test]
+    fn every_combo_point_spawns_a_particle_and_the_last_lands_on_the_landing_bell() {
+        let t0 = Instant::now();
+        for (points, landing_ms) in [
+            (1, 165),
+            (4, 165),
+            (10, 330),
+            (100, 900),
+            (500, 1200),
+            (999, 1210),
+        ] {
+            let m = spawn(points, t0, landing_ms);
+            assert_eq!(m.particle_count(), points as usize, "{points}");
+            let landing = Duration::from_millis(landing_ms);
+            let mut last_arrival = Duration::ZERO;
+            for p in m.particles() {
+                let launch = p.start_time.saturating_duration_since(t0);
+                let arrival = (p.start_time + p.duration).saturating_duration_since(t0);
+                assert!(p.start_time >= t0, "never launches before the chime starts");
+                assert!(p.duration > Duration::ZERO && p.duration <= MAX_TRANSFER_FLIGHT * 11 / 10);
+                assert!(arrival <= landing + Duration::from_micros(50), "{points}");
+                assert!(launch <= arrival);
+                last_arrival = last_arrival.max(arrival);
+            }
+            // The last particle arrives on the landing bell, to the microsecond.
+            let diff = landing.abs_diff(last_arrival);
+            assert!(diff < Duration::from_micros(50), "{points}: {diff:?}");
+        }
+    }
+
+    #[test]
+    fn arrivals_are_spread_across_the_performance_not_bunched_at_the_start() {
+        let t0 = Instant::now();
+        let m = spawn(100, t0, 900);
+        let mut arrivals: Vec<f32> = m
+            .particles()
+            .iter()
+            .map(|p| {
+                (p.start_time + p.duration)
+                    .saturating_duration_since(t0)
+                    .as_secs_f32()
+            })
+            .collect();
+        arrivals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Half of them are in by the middle of the window, and nothing arrives before one flight.
+        let half = arrivals.iter().filter(|a| **a <= 0.45 + 0.2).count();
+        assert!((40..=75).contains(&half), "{half}");
+        assert!(arrivals[0] >= MIN_TRANSFER_FLIGHT.as_secs_f32() - 0.001);
+        // No instant takes more than a few percent of all particles.
+        for w in arrivals.windows(10) {
+            assert!(w[9] - w[0] > 0.0);
+        }
+    }
+
+    #[test]
+    fn a_single_hit_is_a_single_particle_landing_with_the_short_chime() {
+        let t0 = Instant::now();
+        let mut m = spawn(1, t0, 165);
+        assert_eq!(m.particle_count(), 1);
+        m.update(t0 + Duration::from_millis(160));
+        assert_eq!(
+            m.particle_count(),
+            1,
+            "still flying just before the landing"
+        );
+        m.update(t0 + Duration::from_millis(166));
+        assert_eq!(m.particle_count(), 0);
+        assert!(m.spark_count() > 0, "landing sparks are kept");
+    }
+
+    #[test]
+    fn nine_hundred_ninety_nine_particles_all_die_in_finite_time_without_leaving_state() {
+        let t0 = Instant::now();
+        let mut m = spawn(999, t0, 1210);
+        assert_eq!(m.particle_count(), 999);
+        m.update(t0 + Duration::from_millis(600));
+        assert!(m.particle_count() > 0 && m.particle_count() < 999);
+        m.update(t0 + Duration::from_millis(1212));
+        assert_eq!(m.particle_count(), 0);
+        m.update(t0 + Duration::from_millis(1212) + SPARK_LIFETIME * 2);
+        assert!(!m.is_active());
+        assert_eq!(m.spark_count(), 0);
+    }
+
+    #[test]
+    fn gauge_fills_linearly_over_the_given_window_and_never_moves_backwards() {
+        let t0 = Instant::now();
+        let mut d = TabGaugeDisplay::new(20);
+        let start = t0 + Duration::from_millis(30);
+        d.set_target_timed(60, start, Duration::from_millis(800));
+        d.update(t0);
+        assert_eq!(d.displayed_value(), 20.0, "waits for the start instant");
+        let mut prev = 20.0;
+        for ms in (30..=830).step_by(10) {
+            d.update(t0 + Duration::from_millis(ms));
+            let v = d.displayed_value();
+            assert!(v >= prev && v <= 60.0, "{ms}ms: {v}");
+            prev = v;
+        }
+        // Growing through the whole window: a quarter in, it is a quarter of the way.
+        let mut q = TabGaugeDisplay::new(20);
+        q.set_target_timed(60, start, Duration::from_millis(800));
+        q.update(start + Duration::from_millis(200));
+        assert!((q.displayed_value() - 30.0).abs() < 0.1);
+        assert_eq!(d.displayed_value(), 60.0);
+        assert!(!d.is_animating(t0));
+        // A late, lower target (re-ordered transfer) cannot pull it down.
+        d.set_target_timed(40, t0 + Duration::from_secs(1), Duration::from_millis(300));
+        assert_eq!(d.target_value(), 60.0);
+        d.update(t0 + Duration::from_secs(2));
+        assert_eq!(d.displayed_value(), 60.0);
     }
 
     #[test]
@@ -705,9 +840,9 @@ mod tests {
         let target = Point::new(400.0, 796.0);
 
         // 1. Spawn transfer
-        manager.spawn_transfer(10, origin, target, t0);
+        manager.spawn_transfer(10, origin, target, t0, Duration::from_millis(330));
         assert!(manager.is_active());
-        assert_eq!(manager.particle_count(), 9); // sqrt(10)*3 = 9.48 -> 9
+        assert_eq!(manager.particle_count(), 10);
         assert_eq!(manager.spark_count(), 0);
 
         // 2. Flight mid-way (250ms): particles actively flying
@@ -716,8 +851,8 @@ mod tests {
         assert!(manager.is_active());
         assert!(manager.particle_count() > 0);
 
-        // 3. Arrival after flight duration (600ms): particles arrive, sparks burst
-        let t_arrive = t0 + Duration::from_millis(600);
+        // 3. Arrival right after the landing bell (330ms): particles arrive, sparks burst
+        let t_arrive = t0 + Duration::from_millis(345);
         manager.update(t_arrive);
         assert!(manager.is_active());
         assert_eq!(manager.particle_count(), 0); // all particles arrived
@@ -735,7 +870,13 @@ mod tests {
     fn clear_resets_manager_immediately() {
         let t0 = Instant::now();
         let mut manager = TabTransferManager::new();
-        manager.spawn_transfer(5, Point::new(0.0, 0.0), Point::new(100.0, 100.0), t0);
+        manager.spawn_transfer(
+            5,
+            Point::new(0.0, 0.0),
+            Point::new(100.0, 100.0),
+            t0,
+            Duration::from_millis(200),
+        );
         assert!(manager.is_active());
 
         manager.clear();

@@ -69,8 +69,13 @@ pub enum ComboEvent {
     ComboIncremented { new_combo: u32 },
     /// Ongoing combo was doubled due to verified command completion success.
     CommandSuccessDoubled { old_combo: u32, new_combo: u32 },
-    /// Combo timed out and points were transferred to the gauge.
-    TransferredToGauge { points: u32, gauge_total: u32 },
+    /// Combo timed out and points were transferred to the gauge. `points` is the original combo
+    /// (even when the gauge saturates) and `gauge_before` the gauge value at that exact moment.
+    TransferredToGauge {
+        points: u32,
+        gauge_before: u32,
+        gauge_total: u32,
+    },
     /// Gauge reached maximum saturation (100).
     GaugeMaxReached,
 }
@@ -273,6 +278,7 @@ impl TabComboState {
                 self.gauge = (self.gauge + points).min(MAX_GAUGE);
                 self.record_event(ComboEvent::TransferredToGauge {
                     points,
+                    gauge_before: old_gauge,
                     gauge_total: self.gauge,
                 });
                 if old_gauge < MAX_GAUGE && self.gauge == MAX_GAUGE {
@@ -518,6 +524,7 @@ impl TabComboState {
         self.gauge = (self.gauge + to_apply).min(MAX_GAUGE);
         self.record_event(ComboEvent::TransferredToGauge {
             points: to_apply,
+            gauge_before: old_gauge,
             gauge_total: self.gauge,
         });
         if old_gauge < MAX_GAUGE && self.gauge == MAX_GAUGE {

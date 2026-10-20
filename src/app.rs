@@ -1217,6 +1217,7 @@ impl Kegon {
                                             );
                                         }
                                         ShellReportedStatus::Failure => {
+                                            self.dopamine.on_command_failed(tab, command_id);
                                             self.dopamine.trigger_command_border(
                                                 tab,
                                                 command_id,
@@ -6500,6 +6501,8 @@ mod tests {
         assert_eq!(border.kind, BorderKind::Rainbow);
         assert!((border.alpha - 1.0).abs() < 1e-4);
         assert!(app.dopamine.has_active_animations());
+        // A trusted success never plays the failure sound.
+        assert!(app.dopamine.audio().fail_request_log().is_empty());
 
         // --- Command 2: Failure -> Red ---
         app.update(Message::TerminalEventReceived(
@@ -6542,6 +6545,8 @@ mod tests {
             .unwrap();
         assert_eq!(border2.kind, BorderKind::Red);
         assert!((border2.alpha - 1.0).abs() < 1e-4);
+        // The trusted failure played the failure sound exactly once.
+        assert_eq!(app.dopamine.audio().fail_request_log().len(), 1);
     }
 
     #[test]
@@ -6683,6 +6688,8 @@ mod tests {
                 .border_for_tab(tab, std::time::Instant::now())
                 .is_none()
         );
+        // None of the untrusted, legacy or successful cases made a failure sound.
+        assert!(app.dopamine.audio().fail_request_log().is_empty());
     }
 
     #[test]

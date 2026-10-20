@@ -6,11 +6,14 @@
 pub mod audio;
 pub mod border;
 pub mod burst;
+pub mod chime;
 pub mod combo;
+pub mod fail;
 pub mod gauge;
 pub mod overlay;
 pub mod params;
 pub mod particles;
+pub mod pending;
 pub mod synth;
 pub mod tab_rainbow;
 
@@ -38,9 +41,8 @@ pub use combo::{
     COMBO_TIMEOUT, ClockState, ComboEvent, MAX_COMBO, MAX_GAUGE, TabComboState, TokenPhase,
 };
 pub use gauge::{
-    ArrivalSpark, GAUGE_HEIGHT, GAUGE_INTERPOLATION_DURATION, SPARK_LIFETIME,
-    TRANSFER_FLIGHT_DURATION, TRANSFER_ORIGIN_Y, TabGaugeDisplay, TabTransferManager,
-    TransferParticle, calculate_particle_count, transfer_origin,
+    ArrivalSpark, GAUGE_HEIGHT, SPARK_LIFETIME, TRANSFER_ORIGIN_Y, TabGaugeDisplay,
+    TabTransferManager, TransferParticle, transfer_origin, transfer_particle_count,
 };
 pub use overlay::ParticleOverlayProgram;
 #[cfg(test)]
@@ -53,6 +55,14 @@ pub use tab_rainbow::{
     rainbow_wave_phase, tab_close_button_style, tab_close_icon_color, tab_container_style,
     tab_diagonal_coord, tab_rainbow_gradient, tab_select_button_style, tab_title_color,
 };
+
+/// Per-event seed for the Gain Chime (SplitMix32 of the event counter and the combo).
+fn chime_seed(seq: u32, points: u32) -> u32 {
+    let mut z = seq.wrapping_mul(0x9E37_79B9) ^ points.rotate_left(16);
+    z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
+    z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
+    z ^ (z >> 16)
+}
 
 /// High-level controller managing particle simulations, border effects, audio feedback,
 /// typing combo/gauge calculation, and Rainbow Wave animation across terminal tabs.
@@ -69,6 +79,14 @@ pub struct DopamineController {
     completed_commands: HashMap<TabId, u64>,
     burst_rng: burst::Rng,
     audio: DopamineAudio,
+    /// Counts Combo Transfers, so every Gain Chime gets its own seed.
+    chime_seq: u32,
+    /// Counts failure sounds, so every one gets its own seed.
+    fail_seq: u32,
+    /// Highest command id per tab that already played its failure sound (one sound per command).
+    failed_commands: HashMap<TabId, u64>,
+    /// Transfers waiting for their Gain Chime to start.
+    pending_transfers: pending::PendingTransfers,
     last_tick: Option<Instant>,
     animation_start: Option<Instant>,
 }
@@ -90,6 +108,10 @@ impl DopamineController {
                 std::collections::hash_map::RandomState::new().hash_one(Instant::now()),
             ),
             audio: DopamineAudio::new(),
+            chime_seq: 0,
+            fail_seq: 0,
+            failed_commands: HashMap::new(),
+            pending_transfers: pending::PendingTransfers::default(),
             last_tick: None,
             animation_start: if enabled { Some(Instant::now()) } else { None },
         }
@@ -219,6 +241,9 @@ impl DopamineController {
 
         self.tab_bursts.retain(|_, b| b.progress(now) < 1.0);
 
+        // Transfers to start this tick: (transfer, shared start instant).
+        let mut launches: Vec<(pending::PendingTransfer, Instant)> = Vec::new();
+
         // Advance combo timers and transfer points across all tabs
         for (&tab_id, state) in self.tab_combos.iter_mut() {
             state.tick(now);
@@ -227,14 +252,23 @@ impl DopamineController {
                 match event {
                     ComboEvent::TransferredToGauge {
                         points,
+                        gauge_before,
                         gauge_total,
                     } => {
-                        let gauge_display = self.tab_gauges.entry(tab_id).or_insert_with(|| {
-                            TabGaugeDisplay::new(gauge_total.saturating_sub(points))
-                        });
+                        let gauge_display = self
+                            .tab_gauges
+                            .entry(tab_id)
+                            .or_insert_with(|| TabGaugeDisplay::new(gauge_before));
 
                         if active_tab == Some(tab_id) {
-                            gauge_display.set_target(gauge_total, now);
+                            // Gain Chime: only for a real Combo Transfer on the visible tab,
+                            // with the exact pre-transfer gauge carried by the event.
+                            self.chime_seq = self.chime_seq.wrapping_add(1);
+                            let ticket = self.audio.request_gain_chime(
+                                points,
+                                gauge_before / 10,
+                                chime_seed(self.chime_seq, points),
+                            );
 
                             let origin = transfer_origin(
                                 hit_origin.map_or(viewport_width / 2.0, |p| p.x),
@@ -244,12 +278,21 @@ impl DopamineController {
                             let target_x = (viewport_width * (gauge_total as f32 / 100.0))
                                 .clamp(8.0, (viewport_width - 8.0).max(8.0));
                             let target_y = viewport_height - GAUGE_HEIGHT / 2.0;
-                            let target = Point::new(target_x, target_y);
-
-                            self.tab_transfers
-                                .entry(tab_id)
-                                .or_default()
-                                .spawn_transfer(points, origin, target, now);
+                            let transfer = pending::PendingTransfer {
+                                tab: tab_id,
+                                ticket: ticket.unwrap_or(0),
+                                points,
+                                gauge_total,
+                                origin,
+                                target: Point::new(target_x, target_y),
+                                event_at: now,
+                            };
+                            match ticket {
+                                // The sound is being rendered: the visuals start with it.
+                                Some(_) => self.pending_transfers.push(transfer),
+                                // No sound is coming: nothing to wait for.
+                                None => launches.push((transfer, now)),
+                            }
                         } else {
                             gauge_display.snap_to(gauge_total);
                         }
@@ -259,6 +302,13 @@ impl DopamineController {
                     | ComboEvent::CommandSuccessDoubled { .. } => {}
                 }
             }
+        }
+
+        // Chimes whose PCM is ready start now (never blocks); their Transfers start with them.
+        let started = self.audio.pump_chimes();
+        launches.extend(self.pending_transfers.take_ready(&started, now));
+        for (transfer, start) in launches {
+            self.launch_transfer(transfer, start);
         }
 
         // Advance gauge interpolation animations
@@ -275,6 +325,10 @@ impl DopamineController {
                     .entry(tab_id)
                     .or_insert_with(|| TabGaugeDisplay::new(0))
                     .set_burst_value(burst.gauge(now));
+                continue;
+            }
+            if self.pending_transfers.has_tab(tab_id) {
+                // A Transfer is about to fill this gauge; do not snap it ahead of the chime.
                 continue;
             }
             let canonical = state.gauge();
@@ -297,6 +351,55 @@ impl DopamineController {
 
         // Prune inactive transfer managers to keep memory bounded
         self.tab_transfers.retain(|_, t| t.is_active());
+    }
+
+    /// Starts the Gauge fill and the particles of one Transfer from the shared start instant.
+    /// Both end on the Gain Chime landing bell, taken from the same [`chime::ChimeTimeline`]
+    /// the synthesiser renders from.
+    fn launch_transfer(&mut self, transfer: pending::PendingTransfer, start: Instant) {
+        let tab_id = transfer.tab;
+        // The Burst owns the display and the Gauge was consumed: no fill, no particles.
+        if self.tab_bursts.contains_key(&tab_id) || !self.tab_combos.contains_key(&tab_id) {
+            return;
+        }
+        let landing = chime::ChimeTimeline::for_delta(transfer.points).landing_duration();
+        self.tab_gauges
+            .entry(tab_id)
+            .or_insert_with(|| {
+                TabGaugeDisplay::new(transfer.gauge_total.saturating_sub(transfer.points))
+            })
+            .set_target_timed(transfer.gauge_total, start, landing);
+        self.tab_transfers
+            .entry(tab_id)
+            .or_default()
+            .spawn_transfer(
+                transfer.points,
+                transfer.origin,
+                transfer.target,
+                start,
+                landing,
+            );
+    }
+
+    /// Plays the failure sound for a command whose failure is trusted: the caller has verified
+    /// the OSC 133 start/finish pair, the correlation and the shell-reported failure status.
+    /// One sound per command id and tab; Dopamine Mode OFF stays silent. Independent of the
+    /// Combo Core and the Gauge, which are not touched.
+    pub fn on_command_failed(&mut self, tab_id: TabId, command_id: u64) {
+        if !self.enabled {
+            return;
+        }
+        if self
+            .failed_commands
+            .get(&tab_id)
+            .is_some_and(|last| command_id <= *last)
+        {
+            return;
+        }
+        self.failed_commands.insert(tab_id, command_id);
+        self.fail_seq = self.fail_seq.wrapping_add(1);
+        self.audio
+            .request_fail_sound(chime_seed(self.fail_seq, command_id as u32));
     }
 
     /// Triggers a command completion border effect for the specified tab.
@@ -387,7 +490,9 @@ impl DopamineController {
 
     /// Whether any tab has active transfer particles/sparks requiring animation frame redraws.
     pub fn has_active_transfers(&self) -> bool {
-        self.enabled && self.tab_transfers.values().any(|t| t.is_active())
+        self.enabled
+            && (!self.pending_transfers.is_empty()
+                || self.tab_transfers.values().any(|t| t.is_active()))
     }
 
     /// Whether any tab has an active gauge interpolation requiring animation frame redraws.
@@ -550,6 +655,7 @@ impl DopamineController {
         if success && valid_correlation && fresh && !busy && state.consume_gauge_burst() {
             state.begin_burst(now);
             self.tab_transfers.remove(&tab_id);
+            self.pending_transfers.remove_tab(tab_id);
             self.tab_gauges.insert(tab_id, TabGaugeDisplay::new(100));
             self.tab_bursts
                 .insert(tab_id, burst::Burst::new(now, &mut self.burst_rng));
@@ -661,8 +767,10 @@ impl DopamineController {
         self.tab_combos.remove(&tab_id);
         self.tab_bursts.remove(&tab_id);
         self.completed_commands.remove(&tab_id);
+        self.failed_commands.remove(&tab_id);
         self.tab_gauges.remove(&tab_id);
         self.tab_transfers.remove(&tab_id);
+        self.pending_transfers.remove_tab(tab_id);
     }
 
     /// Handles child shell exit for `tab_id` by safely discarding its combo state.
@@ -677,8 +785,10 @@ impl DopamineController {
         self.tab_combos.remove(&tab_id);
         self.tab_bursts.remove(&tab_id);
         self.completed_commands.remove(&tab_id);
+        self.failed_commands.remove(&tab_id);
         self.tab_gauges.remove(&tab_id);
         self.tab_transfers.remove(&tab_id);
+        self.pending_transfers.remove_tab(tab_id);
     }
 
     /// Clears all particles, border effects, and combo/gauge states across all tabs.
@@ -688,8 +798,10 @@ impl DopamineController {
         self.tab_combos.clear();
         self.tab_bursts.clear();
         self.completed_commands.clear();
+        self.failed_commands.clear();
         self.tab_gauges.clear();
         self.tab_transfers.clear();
+        self.pending_transfers.clear();
         self.last_tick = None;
     }
 
@@ -1270,11 +1382,11 @@ mod tests {
         assert!(mid > 0.0 && mid < 40.0, "mid = {mid}");
         assert!(ctrl.has_active_gauge_animations(t_mid));
 
-        // Monotone, and exactly the truth at 450 ms.
+        // Monotone, and exactly the truth on the Gain Chime landing bell.
         let t_late = t1 + Duration::from_millis(300);
         ctrl.tick_with_viewport(t_late, 800.0, 600.0, Some(tab), None);
         assert!(ctrl.displayed_gauge_for_tab(tab) >= mid);
-        let t_end = t1 + Duration::from_millis(450);
+        let t_end = t1 + chime::ChimeTimeline::for_delta(40).landing_duration();
         ctrl.tick_with_viewport(t_end, 800.0, 600.0, Some(tab), None);
         assert_eq!(ctrl.displayed_gauge_for_tab(tab), 40.0);
         assert!(!ctrl.has_active_gauge_animations(t_end));
@@ -1685,5 +1797,430 @@ mod tests {
         assert!(ctrl.burst_for_tab(a).unwrap().shake_offset(at(1500)) != (0.0, 0.0));
         ctrl.on_shell_exited(a);
         assert!(ctrl.burst_for_tab(a).is_none());
+    }
+
+    fn chime_log(ctrl: &DopamineController) -> Vec<(u32, u32)> {
+        ctrl.audio()
+            .chime_request_log()
+            .iter()
+            .map(|&(d, l, _)| (d, l))
+            .collect()
+    }
+
+    #[test]
+    fn gain_chime_uses_the_exact_delta_and_pre_transfer_level_for_each_transfer() {
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+        let step = |ctrl: &mut DopamineController, tokens: usize, at: Instant| {
+            ctrl.on_text_input(a, &typed_tokens(tokens), at);
+            let end = at + COMBO_TIMEOUT;
+            ctrl.tick_with_viewport(end, 800.0, 600.0, Some(a), None);
+            end
+        };
+        // Typing and Enter alone never chime; only the timeout transfer does.
+        ctrl.on_text_input(a, &typed_tokens(1), t0);
+        assert!(chime_log(&ctrl).is_empty());
+        ctrl.tick_with_viewport(t0 + COMBO_TIMEOUT, 800.0, 600.0, Some(a), None);
+        assert_eq!(chime_log(&ctrl), vec![(1, 0)]);
+        // gauge 1 -> 27 (combo 26, level 0), then 27 -> 35 (combo 8, level 2).
+        let t1 = step(&mut ctrl, 26, t0 + std::time::Duration::from_secs(5));
+        let t2 = step(&mut ctrl, 8, t1 + std::time::Duration::from_secs(5));
+        assert_eq!(ctrl.gauge_for_tab(a), 35);
+        assert_eq!(chime_log(&ctrl), vec![(1, 0), (26, 0), (8, 2)]);
+        // 35 -> 94 (combo 59, level 3); then 94 -> 100 saturates: delta stays the real 12.
+        let t3 = step(&mut ctrl, 59, t2 + std::time::Duration::from_secs(5));
+        let t4 = step(&mut ctrl, 12, t3 + std::time::Duration::from_secs(5));
+        assert_eq!(ctrl.gauge_for_tab(a), 100);
+        assert_eq!(&chime_log(&ctrl)[3..], &[(59, 3), (12, 9)]);
+        // Already full: no gauge gain, but the Combo Transfer still chimes at level 10.
+        step(&mut ctrl, 20, t4 + std::time::Duration::from_secs(5));
+        assert_eq!(chime_log(&ctrl).last(), Some(&(20, 10)));
+        // One event, one request, each with its own seed.
+        let seeds: std::collections::HashSet<u32> = ctrl
+            .audio()
+            .chime_request_log()
+            .iter()
+            .map(|r| r.2)
+            .collect();
+        assert_eq!(seeds.len(), chime_log(&ctrl).len());
+        // Ticking again without a new transfer does not repeat anything.
+        let n = chime_log(&ctrl).len();
+        ctrl.tick_with_viewport(
+            t4 + std::time::Duration::from_secs(60),
+            800.0,
+            600.0,
+            Some(a),
+            None,
+        );
+        assert_eq!(chime_log(&ctrl).len(), n);
+    }
+
+    #[test]
+    fn gain_chime_is_silent_for_commands_burst_inflow_other_tabs_mode_off_and_closed_tabs() {
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let b = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+        let full = fill_for_burst(&mut ctrl, a, t0);
+        assert_eq!(chime_log(&ctrl), vec![(100, 0)]);
+        // A trusted command success starts the Burst but is not a Combo Transfer.
+        ctrl.on_command_finished(a, 1, true, true, full);
+        assert!(ctrl.burst_for_tab(a).is_some());
+        assert_eq!(chime_log(&ctrl).len(), 1);
+        // Inflow during the Burst is discarded: no transfer, no chime.
+        let during = full + std::time::Duration::from_millis(100);
+        ctrl.on_text_input(a, &typed_tokens(10), during);
+        ctrl.tick_with_viewport(during + COMBO_TIMEOUT, 800.0, 600.0, Some(a), None);
+        assert_eq!(chime_log(&ctrl).len(), 1);
+        // A hidden tab's transfer is not played; the visible tab's is.
+        let t1 = full + std::time::Duration::from_secs(10);
+        ctrl.on_text_input(b, &typed_tokens(5), t1);
+        ctrl.tick_with_viewport(t1 + COMBO_TIMEOUT, 800.0, 600.0, Some(a), None);
+        assert_eq!(chime_log(&ctrl).len(), 1);
+        let t2 = t1 + std::time::Duration::from_secs(5);
+        ctrl.on_text_input(b, &typed_tokens(7), t2);
+        ctrl.tick_with_viewport(t2 + COMBO_TIMEOUT, 800.0, 600.0, Some(b), None);
+        assert_eq!(chime_log(&ctrl).len(), 2);
+        // A closed tab's pending combo never chimes.
+        let t3 = t2 + std::time::Duration::from_secs(5);
+        ctrl.on_text_input(b, &typed_tokens(4), t3);
+        ctrl.clear_tab(b);
+        ctrl.tick_with_viewport(t3 + COMBO_TIMEOUT, 800.0, 600.0, Some(b), None);
+        assert_eq!(chime_log(&ctrl).len(), 2);
+        // Mode OFF: nothing is requested even for pending input.
+        let t4 = t3 + std::time::Duration::from_secs(5);
+        ctrl.on_text_input(a, &typed_tokens(4), t4);
+        ctrl.set_enabled(false);
+        ctrl.tick_with_viewport(t4 + COMBO_TIMEOUT, 800.0, 600.0, Some(a), None);
+        assert_eq!(chime_log(&ctrl).len(), 2);
+    }
+
+    /// One transfer of `tokens` on the (active) tab at `at`; returns the event instant.
+    fn transfer_once(
+        ctrl: &mut DopamineController,
+        tab: TabId,
+        tokens: usize,
+        at: Instant,
+    ) -> Instant {
+        ctrl.on_text_input(tab, &typed_tokens(tokens), at);
+        let event = at + COMBO_TIMEOUT;
+        ctrl.tick_with_viewport(event, 800.0, 600.0, Some(tab), None);
+        event
+    }
+
+    fn particles_in_flight(ctrl: &DopamineController, tab: TabId) -> usize {
+        ctrl.transfer_for_tab(tab).map_or(0, |t| t.particle_count())
+    }
+
+    #[test]
+    fn transfer_spawns_exactly_one_particle_per_combo_point_without_thinning() {
+        for tokens in [1usize, 4, 10, 100, 500, 999] {
+            let mut ctrl = DopamineController::new(true);
+            let mut tabs = WorkbenchTabs::default();
+            let tab = tabs.add(TabKind::Terminal);
+            transfer_once(&mut ctrl, tab, tokens, Instant::now());
+            assert_eq!(particles_in_flight(&ctrl, tab), tokens, "{tokens}");
+        }
+    }
+
+    #[test]
+    fn gauge_fill_and_the_last_particle_end_on_the_chime_landing_bell() {
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let tab = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+        let mut ends = Vec::new();
+        for (round, tokens) in [3usize, 20, 60].into_iter().enumerate() {
+            let before = ctrl.gauge_for_tab(tab);
+            let event = transfer_once(
+                &mut ctrl,
+                tab,
+                tokens,
+                t0 + std::time::Duration::from_secs(10 * round as u64),
+            );
+            let landing = chime::ChimeTimeline::for_delta(tokens as u32).landing_duration();
+            ends.push(landing);
+            // Canonical gauge is immediate; the display fills monotonically up to the landing.
+            assert_eq!(ctrl.gauge_for_tab(tab), before + tokens as u32);
+            let mut prev = ctrl.displayed_gauge_for_tab(tab);
+            assert_eq!(prev, before as f32);
+            let steps = 40;
+            for k in 1..steps {
+                let at = event + landing * k / steps;
+                ctrl.tick_with_viewport(at, 800.0, 600.0, Some(tab), None);
+                let v = ctrl.displayed_gauge_for_tab(tab);
+                assert!(
+                    v >= prev && v <= ctrl.gauge_for_tab(tab) as f32,
+                    "{tokens}: {v}"
+                );
+                prev = v;
+            }
+            assert!(
+                prev < ctrl.gauge_for_tab(tab) as f32,
+                "still filling before the landing"
+            );
+            assert!(
+                particles_in_flight(&ctrl, tab) > 0,
+                "particles still flying before the landing"
+            );
+            ctrl.tick_with_viewport(
+                event + landing + std::time::Duration::from_millis(1),
+                800.0,
+                600.0,
+                Some(tab),
+                None,
+            );
+            assert_eq!(
+                ctrl.displayed_gauge_for_tab(tab),
+                ctrl.gauge_for_tab(tab) as f32
+            );
+            assert_eq!(
+                particles_in_flight(&ctrl, tab),
+                0,
+                "the last particle landed"
+            );
+        }
+        // Bigger combos play, and therefore fill, for longer.
+        assert!(ends[0] < ends[1] && ends[1] < ends[2]);
+    }
+
+    #[test]
+    fn the_fill_window_comes_from_the_same_timeline_the_synthesiser_renders_from() {
+        for delta in [1u32, 8, 100, 999] {
+            let tl = chime::ChimeTimeline::for_delta(delta);
+            assert_eq!(
+                tl.landing_duration(),
+                std::time::Duration::from_secs_f64(tl.landing)
+            );
+            assert!((tl.landing - (tl.last_note_start + 0.015)).abs() < 1e-12);
+            assert_eq!(tl.note_start(tl.note_count - 1), tl.last_note_start);
+            assert_eq!(tl.note_count, chime::run_length(delta));
+            assert!(
+                tl.total > tl.landing,
+                "ring and tail follow the landing bell"
+            );
+        }
+    }
+
+    #[test]
+    fn with_a_sound_on_the_way_visuals_wait_for_it_then_start_together() {
+        let mut ctrl = DopamineController::new(true);
+        ctrl.audio_mut().enable_fake_tickets();
+        let mut tabs = WorkbenchTabs::default();
+        let tab = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+        let event = transfer_once(&mut ctrl, tab, 20, t0);
+        // Rendering: nothing visible yet, but the truth is already 20 and is not snapped in.
+        assert_eq!(ctrl.gauge_for_tab(tab), 20);
+        assert_eq!(particles_in_flight(&ctrl, tab), 0);
+        assert!(
+            ctrl.has_active_transfers(),
+            "keeps the animation clock running"
+        );
+        let rendering = event + std::time::Duration::from_millis(60);
+        ctrl.tick_with_viewport(rendering, 800.0, 600.0, Some(tab), None);
+        assert_eq!(ctrl.displayed_gauge_for_tab(tab), 0.0);
+        assert_eq!(particles_in_flight(&ctrl, tab), 0);
+        // The sound starts: particles and fill start from that instant (plus output latency).
+        ctrl.audio().finish_fake_chime(1);
+        let started = event + std::time::Duration::from_millis(110);
+        ctrl.tick_with_viewport(started, 800.0, 600.0, Some(tab), None);
+        assert_eq!(particles_in_flight(&ctrl, tab), 20);
+        let landing = chime::ChimeTimeline::for_delta(20).landing_duration();
+        let audible = started + pending::OUTPUT_LATENCY_ESTIMATE;
+        ctrl.tick_with_viewport(audible + landing / 2, 800.0, 600.0, Some(tab), None);
+        let half = ctrl.displayed_gauge_for_tab(tab);
+        assert!(half > 5.0 && half < 15.0, "{half}");
+        ctrl.tick_with_viewport(
+            audible + landing + std::time::Duration::from_millis(1),
+            800.0,
+            600.0,
+            Some(tab),
+            None,
+        );
+        assert_eq!(ctrl.displayed_gauge_for_tab(tab), 20.0);
+        assert_eq!(particles_in_flight(&ctrl, tab), 0);
+    }
+
+    #[test]
+    fn a_sound_that_never_starts_does_not_stop_the_gauge_or_the_particles() {
+        let mut ctrl = DopamineController::new(true);
+        ctrl.audio_mut().enable_fake_tickets();
+        let mut tabs = WorkbenchTabs::default();
+        let tab = tabs.add(TabKind::Terminal);
+        let event = transfer_once(&mut ctrl, tab, 12, Instant::now());
+        assert_eq!(particles_in_flight(&ctrl, tab), 0);
+        let late = event + pending::MAX_AUDIO_WAIT;
+        ctrl.tick_with_viewport(late, 800.0, 600.0, Some(tab), None);
+        assert_eq!(particles_in_flight(&ctrl, tab), 12);
+        let landing = chime::ChimeTimeline::for_delta(12).landing_duration();
+        ctrl.tick_with_viewport(
+            late + landing + std::time::Duration::from_millis(1),
+            800.0,
+            600.0,
+            Some(tab),
+            None,
+        );
+        assert_eq!(ctrl.displayed_gauge_for_tab(tab), 12.0);
+        assert!(ctrl.pending_transfers.is_empty());
+    }
+
+    #[test]
+    fn consecutive_transfers_never_pull_the_display_back() {
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let tab = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+        let first = transfer_once(&mut ctrl, tab, 30, t0);
+        // The second transfer lands while the first fill is still running.
+        let second_typed = first + std::time::Duration::from_millis(300);
+        let mut prev = 0.0_f32;
+        let mut now = first;
+        ctrl.on_text_input(tab, &typed_tokens(10), second_typed);
+        let end = second_typed + COMBO_TIMEOUT + std::time::Duration::from_secs(3);
+        while now < end {
+            now += std::time::Duration::from_millis(16);
+            ctrl.tick_with_viewport(now, 800.0, 600.0, Some(tab), None);
+            let v = ctrl.displayed_gauge_for_tab(tab);
+            assert!(v >= prev - 1e-4, "went back: {prev} -> {v}");
+            assert!(v <= ctrl.gauge_for_tab(tab) as f32 + 1e-4);
+            prev = v;
+        }
+        assert_eq!(ctrl.gauge_for_tab(tab), 40);
+        assert_eq!(prev, 40.0);
+        assert_eq!(particles_in_flight(&ctrl, tab), 0);
+    }
+
+    #[test]
+    fn hidden_tabs_snap_without_particles_and_tabs_stay_independent() {
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let b = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+        ctrl.on_text_input(b, &typed_tokens(25), t0);
+        ctrl.on_text_input(a, &typed_tokens(7), t0);
+        ctrl.tick_with_viewport(t0 + COMBO_TIMEOUT, 800.0, 600.0, Some(a), None);
+        assert_eq!(
+            ctrl.displayed_gauge_for_tab(b),
+            25.0,
+            "hidden tab snaps at once"
+        );
+        assert_eq!(particles_in_flight(&ctrl, b), 0);
+        assert_eq!(particles_in_flight(&ctrl, a), 7);
+        assert_eq!(ctrl.gauge_for_tab(a), 7);
+    }
+
+    #[test]
+    fn burst_close_exit_and_mode_off_drop_waiting_and_flying_transfers() {
+        for cleanup in 0..4 {
+            let mut ctrl = DopamineController::new(true);
+            ctrl.audio_mut().enable_fake_tickets();
+            let mut tabs = WorkbenchTabs::default();
+            let tab = tabs.add(TabKind::Terminal);
+            let t0 = Instant::now();
+            let full = fill_for_burst(&mut ctrl, tab, t0);
+            assert!(ctrl.pending_transfers.has_tab(tab), "waiting for its sound");
+            match cleanup {
+                // The Burst consumes the gauge and cancels the Transfer that was waiting.
+                0 => {
+                    ctrl.on_command_finished(tab, 1, true, true, full);
+                    assert!(ctrl.burst_for_tab(tab).is_some());
+                    ctrl.audio().finish_fake_chime(1);
+                    ctrl.tick_with_viewport(
+                        full + std::time::Duration::from_millis(50),
+                        800.0,
+                        600.0,
+                        Some(tab),
+                        None,
+                    );
+                    assert_eq!(
+                        particles_in_flight(&ctrl, tab),
+                        0,
+                        "no Transfer fill during a Burst"
+                    );
+                }
+                1 => ctrl.clear_tab(tab),
+                2 => ctrl.on_shell_exited(tab),
+                _ => ctrl.set_enabled(false),
+            }
+            assert!(!ctrl.pending_transfers.has_tab(tab), "cleanup {cleanup}");
+            assert!(ctrl.transfer_for_tab(tab).is_none(), "cleanup {cleanup}");
+        }
+    }
+
+    #[test]
+    fn without_any_audio_the_visuals_start_at_once() {
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let tab = tabs.add(TabKind::Terminal);
+        transfer_once(&mut ctrl, tab, 50, Instant::now());
+        assert!(ctrl.pending_transfers.is_empty());
+        assert_eq!(particles_in_flight(&ctrl, tab), 50);
+    }
+
+    #[test]
+    fn failure_sound_plays_once_per_command_per_tab_and_never_touches_combo_or_gauge() {
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let b = tabs.add(TabKind::Terminal);
+        let t0 = Instant::now();
+        let full = fill_for_burst(&mut ctrl, a, t0);
+        let gauge = ctrl.gauge_for_tab(a);
+        ctrl.on_command_failed(a, 5);
+        ctrl.on_command_failed(a, 5); // the same completion again
+        ctrl.on_command_failed(a, 4); // an older id
+        assert_eq!(ctrl.audio().fail_request_log().len(), 1);
+        ctrl.on_command_failed(a, 6);
+        ctrl.on_command_failed(b, 5); // another tab has its own history
+        assert_eq!(ctrl.audio().fail_request_log().len(), 3);
+        let seeds = ctrl.audio().fail_request_log();
+        assert!(seeds[0] != seeds[1] && seeds[1] != seeds[2] && seeds[0] != seeds[2]);
+        // Combo Core and Gauge are untouched; a failure does not start a Burst either.
+        assert_eq!(ctrl.gauge_for_tab(a), gauge);
+        ctrl.on_command_finished(a, 6, false, true, full);
+        assert!(ctrl.burst_for_tab(a).is_none());
+        assert_eq!(ctrl.gauge_for_tab(a), gauge);
+        assert!(
+            ctrl.audio().chime_request_log().len() <= 1,
+            "no Gain Chime from a failure"
+        );
+    }
+
+    #[test]
+    fn failure_sound_is_silent_in_mode_off_and_forgets_a_tab_on_close_or_exit() {
+        let mut ctrl = DopamineController::new(false);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        ctrl.on_command_failed(a, 1);
+        assert!(ctrl.audio().fail_request_log().is_empty(), "Mode OFF");
+        ctrl.set_enabled(true);
+        for cleanup in 0..3 {
+            ctrl.on_command_failed(a, 1);
+            let n = ctrl.audio().fail_request_log().len();
+            ctrl.on_command_failed(a, 1);
+            assert_eq!(ctrl.audio().fail_request_log().len(), n, "deduplicated");
+            match cleanup {
+                0 => ctrl.clear_tab(a),
+                1 => ctrl.on_shell_exited(a),
+                _ => ctrl.clear_all(),
+            }
+            // A new shell in the same tab restarts command ids at 1 and must sound again.
+            ctrl.on_command_failed(a, 1);
+            assert_eq!(
+                ctrl.audio().fail_request_log().len(),
+                n + 1,
+                "cleanup {cleanup}"
+            );
+            ctrl.clear_tab(a);
+        }
+        let n = ctrl.audio().fail_request_log().len();
+        ctrl.set_enabled(false);
+        ctrl.on_command_failed(a, 9);
+        assert_eq!(ctrl.audio().fail_request_log().len(), n, "Mode OFF again");
     }
 }
