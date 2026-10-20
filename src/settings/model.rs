@@ -429,14 +429,27 @@ pub fn validate_shell_path(raw: &str) -> Result<PathBuf, ShellPathError> {
         return Err(ShellPathError::IsDirectory);
     }
 
-    let ext_is_exe = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("exe"))
-        == Some(true);
+    #[cfg(target_os = "windows")]
+    {
+        let ext_is_exe = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("exe"))
+            == Some(true);
 
-    if !ext_is_exe {
-        return Err(ShellPathError::NotExecutable);
+        if !ext_is_exe {
+            return Err(ShellPathError::NotExecutable);
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = path.metadata() {
+            if meta.permissions().mode() & 0o111 == 0 {
+                return Err(ShellPathError::NotExecutable);
+            }
+        }
     }
 
     if !path.exists() {

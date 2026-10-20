@@ -1825,6 +1825,7 @@ dependencies = [
  "iced",
  "ico",
  "kira",
+ "libc",
  "polling",
  "serde",
  "sys-locale",

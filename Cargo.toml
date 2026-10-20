@@ -39,3 +39,6 @@ winresource = "0.1"
 [dev-dependencies]
 # Lists the message IDs in a Fluent resource, for the i18n completeness tests.
 fluent-syntax = "0.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

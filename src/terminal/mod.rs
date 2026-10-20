@@ -46,5 +46,8 @@ pub use renderer::{DEFAULT_CELL_HEIGHT, DEFAULT_CELL_WIDTH, TerminalProgram, cal
 pub use session::{
     EventSink, SHUTDOWN_WAIT, ShellCleanup, TerminalEvent, TerminalSession, wait_for_shell_cleanup,
 };
-pub use shell::{SESSION_ID_ENV, ShellConfig, ShellIntegrationLaunch, generate_session_id};
+pub use shell::{
+    Launch, ResolvedShell, SESSION_ID_ENV, ShellConfig, ShellEnvironment, ShellIntegrationLaunch,
+    ShellKind, ShellResolveError, ShellResolver, ShellSpec, generate_session_id,
+};
 pub use surface::{TerminalSurface, calculate_cursor_rectangle};
