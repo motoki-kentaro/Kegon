@@ -86,6 +86,7 @@ pub struct TabComboState {
     needs_recovery: bool,
     last_completed_command_id: Option<u64>,
     transfer_paused: bool,
+    burst_until: Option<Instant>,
     pending_transfer_points: u32,
     events: VecDeque<ComboEvent>,
 }
@@ -108,9 +109,24 @@ impl TabComboState {
             needs_recovery: false,
             last_completed_command_id: None,
             transfer_paused: false,
+            burst_until: None,
             pending_transfer_points: 0,
             events: VecDeque::with_capacity(MAX_EVENT_CAPACITY),
         }
+    }
+
+    /// Sets the development gauge on a state that has not accumulated anything yet (shell
+    /// integration events may have created it before the first tick). Returns whether applied.
+    pub fn seed_initial_gauge(&mut self, points: u32) -> bool {
+        let pristine = self.gauge == 0
+            && self.combo == 0
+            && self.pending_transfer_points == 0
+            && self.burst_until.is_none()
+            && self.events.is_empty();
+        if pristine {
+            self.gauge = points.min(MAX_GAUGE);
+        }
+        pristine
     }
 
     /// Current unexpired combo count. Returns 0 if expired.
@@ -143,6 +159,7 @@ impl TabComboState {
             && now.saturating_duration_since(running_since) >= remaining_at_start
             && self.combo > 0
             && !self.transfer_paused
+            && !self.timeout_blocked_by_burst()
         {
             return (self.gauge + self.combo).min(MAX_GAUGE);
         }
@@ -217,13 +234,39 @@ impl TabComboState {
         }
     }
 
+    fn timeout_blocked_by_burst(&self) -> bool {
+        match (self.clock_state, self.burst_until) {
+            (
+                ClockState::Running {
+                    running_since,
+                    remaining_at_start,
+                },
+                Some(end),
+            ) => running_since + remaining_at_start < end,
+            _ => false,
+        }
+    }
+
+    pub fn begin_burst(&mut self, now: Instant) {
+        self.burst_until = Some(now + super::burst::DURATION);
+        self.pending_transfer_points = 0;
+        self.events.clear();
+    }
+
+    pub fn cancel_burst(&mut self, now: Instant) {
+        self.check_timeout(now);
+        self.burst_until = None;
+    }
+
     fn apply_timeout(&mut self) {
         if self.combo > 0 {
             let points = self.combo;
             self.combo = 0;
             self.token_phase = TokenPhase::Whitespace;
 
-            if self.transfer_paused {
+            if self.timeout_blocked_by_burst() {
+                // Burst-time inflow is discarded, never deferred.
+            } else if self.transfer_paused {
                 self.pending_transfer_points = self.pending_transfer_points.saturating_add(points);
             } else {
                 let old_gauge = self.gauge;
@@ -509,6 +552,7 @@ impl TabComboState {
         self.needs_recovery = false;
         self.last_completed_command_id = None;
         self.transfer_paused = false;
+        self.burst_until = None;
         self.pending_transfer_points = 0;
         self.events.clear();
     }

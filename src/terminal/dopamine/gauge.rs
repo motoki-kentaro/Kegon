@@ -196,6 +196,12 @@ impl TabGaugeDisplay {
         self.anim_start_time = None;
     }
 
+    /// Burst owns the display while the canonical gauge is already zero.
+    pub fn set_burst_value(&mut self, value: f32) {
+        self.snap_to(0);
+        self.displayed_value = value.clamp(0.0, MAX_GAUGE);
+    }
+
     /// Current visual displayed value in `0.0..=100.0`.
     pub fn displayed_value(&self) -> f32 {
         self.displayed_value

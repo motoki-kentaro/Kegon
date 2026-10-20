@@ -5,6 +5,7 @@
 
 pub mod audio;
 pub mod border;
+pub mod burst;
 pub mod combo;
 pub mod gauge;
 pub mod overlay;
@@ -14,9 +15,20 @@ pub mod synth;
 pub mod tab_rainbow;
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::time::Instant;
 
 use iced::{Color, Point};
+
+/// Development/dogfood-only initial gauge so Burst can be reproduced with a single combo.
+/// Release builds and unit tests always start at 0. Delete this constant (and
+/// `DopamineController::apply_dev_initial_gauge`) to remove the feature.
+pub const DEV_INITIAL_GAUGE: u32 = dev_initial_gauge(cfg!(debug_assertions), cfg!(test));
+
+/// Pure selector for [`DEV_INITIAL_GAUGE`] so the release/test behavior is testable.
+pub const fn dev_initial_gauge(debug_build: bool, unit_test: bool) -> u32 {
+    if debug_build && !unit_test { 99 } else { 0 }
+}
 
 use crate::workbench::TabId;
 
@@ -51,6 +63,11 @@ pub struct DopamineController {
     tab_combos: HashMap<TabId, TabComboState>,
     tab_gauges: HashMap<TabId, TabGaugeDisplay>,
     tab_transfers: HashMap<TabId, TabTransferManager>,
+    tab_bursts: HashMap<TabId, burst::Burst>,
+    /// One-shot development gauge; `None` once applied (or when not armed).
+    dev_initial_gauge: Option<u32>,
+    completed_commands: HashMap<TabId, u64>,
+    burst_rng: burst::Rng,
     audio: DopamineAudio,
     last_tick: Option<Instant>,
     animation_start: Option<Instant>,
@@ -66,6 +83,12 @@ impl DopamineController {
             tab_combos: HashMap::new(),
             tab_gauges: HashMap::new(),
             tab_transfers: HashMap::new(),
+            tab_bursts: HashMap::new(),
+            dev_initial_gauge: None,
+            completed_commands: HashMap::new(),
+            burst_rng: burst::Rng(
+                std::collections::hash_map::RandomState::new().hash_one(Instant::now()),
+            ),
             audio: DopamineAudio::new(),
             last_tick: None,
             animation_start: if enabled { Some(Instant::now()) } else { None },
@@ -194,6 +217,8 @@ impl DopamineController {
         // Prune expired border effects
         self.tab_borders.retain(|_, b| !b.is_expired(now));
 
+        self.tab_bursts.retain(|_, b| b.progress(now) < 1.0);
+
         // Advance combo timers and transfer points across all tabs
         for (&tab_id, state) in self.tab_combos.iter_mut() {
             state.tick(now);
@@ -245,6 +270,13 @@ impl DopamineController {
         // visual effect; the Combo Core gauge is the single source of truth, so a lost event
         // (e.g. bounded queue overflow) converges here. Running interpolations are left alone.
         for (&tab_id, state) in self.tab_combos.iter() {
+            if let Some(burst) = self.tab_bursts.get(&tab_id) {
+                self.tab_gauges
+                    .entry(tab_id)
+                    .or_insert_with(|| TabGaugeDisplay::new(0))
+                    .set_burst_value(burst.gauge(now));
+                continue;
+            }
             let canonical = state.gauge();
             match self.tab_gauges.get_mut(&tab_id) {
                 Some(display) => {
@@ -317,7 +349,8 @@ impl DopamineController {
             return false;
         }
         let now = Instant::now();
-        self.has_active_particles()
+        !self.tab_bursts.is_empty()
+            || self.has_active_particles()
             || self.has_active_borders(now)
             || self.has_active_combos(now)
             || self.has_active_transfers()
@@ -496,10 +529,31 @@ impl DopamineController {
         if !self.enabled {
             return;
         }
-        self.tab_combos
-            .entry(tab_id)
-            .or_default()
-            .on_command_finished(command_id, success, valid_correlation, now);
+        // Integration command IDs are monotonic per shell; keep a bounded high-water mark
+        // even after the visual effect expires or is cancelled.
+        let fresh = self
+            .completed_commands
+            .get(&tab_id)
+            .is_none_or(|id| command_id > *id);
+        if valid_correlation && !fresh {
+            return;
+        }
+        if valid_correlation {
+            self.completed_commands.insert(tab_id, command_id);
+        }
+        let state = self.tab_combos.entry(tab_id).or_default();
+        state.on_command_finished(command_id, success, valid_correlation, now);
+        let busy = self
+            .tab_bursts
+            .get(&tab_id)
+            .is_some_and(|b| b.progress(now) < 1.0);
+        if success && valid_correlation && fresh && !busy && state.consume_gauge_burst() {
+            state.begin_burst(now);
+            self.tab_transfers.remove(&tab_id);
+            self.tab_gauges.insert(tab_id, TabGaugeDisplay::new(100));
+            self.tab_bursts
+                .insert(tab_id, burst::Burst::new(now, &mut self.burst_rng));
+        }
     }
 
     /// Forwards PromptStarted (OSC 133 A) to `tab_id`'s combo state machine for anomaly recovery.
@@ -534,6 +588,54 @@ impl DopamineController {
             .unwrap_or_default()
     }
 
+    /// Arms the one-shot development gauge. `0` leaves it disarmed.
+    pub fn arm_dev_initial_gauge(&mut self, points: u32) {
+        self.dev_initial_gauge = (points > 0).then_some(points.min(combo::MAX_GAUGE));
+    }
+
+    /// Applies the armed development gauge exactly once, to `tab_id`, only while Dopamine Mode
+    /// is on. The canonical Combo Core gauge is set and the display is created at the same
+    /// value, so nothing is transferred or animated. Never re-applies afterwards (Burst,
+    /// tab switch, Mode OFF/ON, Close and ShellExited all leave it consumed).
+    pub fn apply_dev_initial_gauge(&mut self, tab_id: TabId) {
+        if !self.enabled {
+            return;
+        }
+        let Some(points) = self.dev_initial_gauge.take() else {
+            return;
+        };
+        // The shell's first OSC 133 events usually create the state before the first tick, so
+        // seed an existing-but-untouched state too.
+        let state = self.tab_combos.entry(tab_id).or_default();
+        if state.seed_initial_gauge(points) && !self.tab_bursts.contains_key(&tab_id) {
+            self.tab_gauges
+                .insert(tab_id, TabGaugeDisplay::new(state.gauge()));
+        }
+    }
+
+    pub fn burst_for_tab(&self, tab_id: TabId) -> Option<&burst::Burst> {
+        self.tab_bursts.get(&tab_id)
+    }
+
+    /// Cancel visuals on every active-tab change, including Settings/new/closed tabs.
+    pub fn retain_active_burst(&mut self, active: Option<TabId>, now: Instant) {
+        let cancelled: Vec<_> = self
+            .tab_bursts
+            .keys()
+            .copied()
+            .filter(|id| Some(*id) != active)
+            .collect();
+        for id in cancelled {
+            self.tab_bursts.remove(&id);
+            if let Some(state) = self.tab_combos.get_mut(&id) {
+                state.cancel_burst(now);
+            }
+            if let Some(gauge) = self.tab_gauges.get_mut(&id) {
+                gauge.snap_to(0);
+            }
+        }
+    }
+
     /// Consumes maximum gauge for a Burst effect on `tab_id`.
     #[allow(dead_code)]
     pub fn consume_gauge_burst(&mut self, tab_id: TabId) -> bool {
@@ -557,6 +659,8 @@ impl DopamineController {
     /// Combo transfer is NOT performed (points are discarded).
     pub fn clear_tab_combo(&mut self, tab_id: TabId) {
         self.tab_combos.remove(&tab_id);
+        self.tab_bursts.remove(&tab_id);
+        self.completed_commands.remove(&tab_id);
         self.tab_gauges.remove(&tab_id);
         self.tab_transfers.remove(&tab_id);
     }
@@ -571,6 +675,8 @@ impl DopamineController {
         self.tab_particles.remove(&tab_id);
         self.tab_borders.remove(&tab_id);
         self.tab_combos.remove(&tab_id);
+        self.tab_bursts.remove(&tab_id);
+        self.completed_commands.remove(&tab_id);
         self.tab_gauges.remove(&tab_id);
         self.tab_transfers.remove(&tab_id);
     }
@@ -580,6 +686,8 @@ impl DopamineController {
         self.tab_particles.clear();
         self.tab_borders.clear();
         self.tab_combos.clear();
+        self.tab_bursts.clear();
+        self.completed_commands.clear();
         self.tab_gauges.clear();
         self.tab_transfers.clear();
         self.last_tick = None;
@@ -1260,5 +1368,322 @@ mod tests {
         );
         assert!(ctrl.gauge_display_for_tab(a).is_none());
         assert_eq!(ctrl.gauge_for_tab(a), 0);
+    }
+    fn fill_for_burst(ctrl: &mut DopamineController, tab: TabId, now: Instant) -> Instant {
+        ctrl.on_text_input(tab, &"x ".repeat(100), now);
+        let full = now + COMBO_TIMEOUT;
+        ctrl.tick_with_viewport(full, 800.0, 600.0, Some(tab), None);
+        assert_eq!(ctrl.gauge_for_tab(tab), 100);
+        full
+    }
+
+    #[test]
+    fn slice4_success_gate_dedup_inflow_and_wall_clock_expiry() {
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let b = tabs.add(TabKind::Terminal);
+        let now = Instant::now();
+        ctrl.on_command_finished(a, 1, true, true, now);
+        assert!(ctrl.burst_for_tab(a).is_none());
+        let full = fill_for_burst(&mut ctrl, a, now);
+        ctrl.on_command_finished(a, 2, false, true, full);
+        ctrl.on_command_finished(a, 3, true, false, full);
+        assert!(ctrl.burst_for_tab(a).is_none());
+        ctrl.on_command_finished(a, 4, true, true, full);
+        assert!(ctrl.burst_for_tab(a).is_some());
+        assert_eq!(ctrl.gauge_for_tab(a), 0);
+        assert_eq!(ctrl.displayed_gauge_for_tab(a), 100.0);
+        assert!(ctrl.transfer_for_tab(a).is_none());
+        assert!(ctrl.burst_for_tab(b).is_none());
+        ctrl.on_text_input(a, "discard these points", full);
+        ctrl.tick_with_viewport(full + burst::DURATION / 2, 800.0, 600.0, Some(a), None);
+        assert_eq!(ctrl.displayed_gauge_for_tab(a), 50.0);
+        // Delayed frame crosses both the combo timeout and the animation end.
+        let end = full + burst::DURATION + COMBO_TIMEOUT;
+        ctrl.tick_with_viewport(end, 800.0, 600.0, Some(a), None);
+        assert!(ctrl.burst_for_tab(a).is_none());
+        assert_eq!(ctrl.gauge_for_tab(a), 0);
+        assert_eq!(ctrl.displayed_gauge_for_tab(a), 0.0);
+        let refilled = fill_for_burst(&mut ctrl, a, end);
+        ctrl.on_command_finished(a, 4, true, true, refilled);
+        ctrl.on_command_finished(a, 2, true, true, refilled);
+        assert!(ctrl.burst_for_tab(a).is_none());
+        assert_eq!(ctrl.gauge_for_tab(a), 100);
+        ctrl.on_command_finished(a, 5, true, true, refilled);
+        assert!(ctrl.burst_for_tab(a).is_some());
+    }
+
+    #[test]
+    fn slice4_every_cleanup_path_and_resume_after_cancel() {
+        for cleanup in 0..4 {
+            let mut ctrl = DopamineController::new(true);
+            let mut tabs = WorkbenchTabs::default();
+            let a = tabs.add(TabKind::Terminal);
+            let b = tabs.add(TabKind::Terminal);
+            let full = fill_for_burst(&mut ctrl, a, Instant::now());
+            ctrl.on_command_finished(a, 1, true, true, full);
+            ctrl.on_text_input(a, "x ", full);
+            match cleanup {
+                0 => ctrl.retain_active_burst(Some(b), full),
+                1 => ctrl.clear_tab(a),
+                2 => ctrl.on_shell_exited(a),
+                _ => ctrl.set_enabled(false),
+            }
+            assert!(ctrl.burst_for_tab(a).is_none());
+            assert_eq!(ctrl.gauge_for_tab(a), 0);
+            assert_eq!(ctrl.displayed_gauge_for_tab(a), 0.0);
+            ctrl.set_enabled(true);
+            ctrl.on_text_input(a, "next ", full + burst::DURATION);
+            ctrl.tick_with_viewport(
+                full + burst::DURATION + COMBO_TIMEOUT,
+                800.0,
+                600.0,
+                Some(a),
+                None,
+            );
+            assert!(ctrl.gauge_for_tab(a) > 0);
+        }
+    }
+
+    #[test]
+    fn slice4_retake_gauge_shrinks_over_four_seconds_and_state_is_released() {
+        use std::time::Duration;
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let full = fill_for_burst(&mut ctrl, a, Instant::now());
+        ctrl.on_command_finished(a, 1, true, true, full);
+        let b = ctrl.burst_for_tab(a).expect("burst started");
+        assert_eq!(b.effects, burst::ALL_EFFECTS);
+        assert!(burst::TEXT_TABLE.iter().any(|e| e.text == b.text));
+        // Canonical gauge is zero immediately; only the display shrinks.
+        assert_eq!(ctrl.gauge_for_tab(a), 0);
+        for (ms, shown) in [(0, 100.0), (1000, 75.0), (2000, 50.0), (3000, 25.0)] {
+            ctrl.tick_with_viewport(
+                full + Duration::from_millis(ms),
+                800.0,
+                600.0,
+                Some(a),
+                None,
+            );
+            assert_eq!(ctrl.displayed_gauge_for_tab(a), shown, "{ms}ms");
+            assert_eq!(ctrl.gauge_for_tab(a), 0);
+        }
+        ctrl.tick_with_viewport(full + burst::DURATION, 800.0, 600.0, Some(a), None);
+        assert!(ctrl.burst_for_tab(a).is_none());
+        assert_eq!(ctrl.displayed_gauge_for_tab(a), 0.0);
+    }
+
+    fn armed_controller() -> (DopamineController, TabId, TabId) {
+        let mut ctrl = DopamineController::new(true);
+        ctrl.arm_dev_initial_gauge(99);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let b = tabs.add(TabKind::Terminal);
+        (ctrl, a, b)
+    }
+
+    #[test]
+    fn dev_gauge_is_99_only_for_debug_builds_outside_unit_tests() {
+        assert_eq!(dev_initial_gauge(true, false), 99);
+        assert_eq!(dev_initial_gauge(false, false), 0, "release build");
+        assert_eq!(dev_initial_gauge(true, true), 0, "unit tests");
+        assert_eq!(dev_initial_gauge(false, true), 0);
+        assert_eq!(DEV_INITIAL_GAUGE, 0, "the test build never starts at 99");
+        // An unarmed controller (release behavior) starts at zero.
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        ctrl.arm_dev_initial_gauge(DEV_INITIAL_GAUGE);
+        ctrl.apply_dev_initial_gauge(a);
+        assert_eq!(ctrl.gauge_for_tab(a), 0);
+        assert!(ctrl.gauge_display_for_tab(a).is_none());
+    }
+
+    #[test]
+    fn dev_gauge_seeds_a_state_that_shell_integration_created_first() {
+        let (mut ctrl, a, _b) = armed_controller();
+        // The first prompt marker creates the combo state before the first tick.
+        ctrl.on_prompt_started(a, Instant::now());
+        ctrl.apply_dev_initial_gauge(a);
+        assert_eq!(ctrl.gauge_for_tab(a), 99);
+        assert_eq!(ctrl.displayed_gauge_for_tab(a), 99.0);
+        assert!(ctrl.drain_combo_events(a).is_empty());
+        // A state that already accumulated points is never overwritten.
+        let (mut ctrl, a, _b) = armed_controller();
+        let t = Instant::now();
+        ctrl.on_text_input(a, &typed_tokens(2), t);
+        ctrl.tick_with_viewport(t + COMBO_TIMEOUT, 800.0, 600.0, Some(a), None);
+        ctrl.apply_dev_initial_gauge(a);
+        assert_eq!(ctrl.gauge_for_tab(a), 2);
+    }
+
+    #[test]
+    fn dev_gauge_sets_canonical_and_display_without_any_event() {
+        let (mut ctrl, a, _b) = armed_controller();
+        ctrl.apply_dev_initial_gauge(a);
+        assert_eq!(ctrl.gauge_for_tab(a), 99);
+        assert_eq!(ctrl.displayed_gauge_for_tab(a), 99.0);
+        assert!(ctrl.drain_combo_events(a).is_empty());
+        let t = Instant::now();
+        ctrl.tick_with_viewport(t, 800.0, 600.0, Some(a), None);
+        ctrl.tick_with_viewport(
+            t + std::time::Duration::from_millis(16),
+            800.0,
+            600.0,
+            Some(a),
+            None,
+        );
+        assert!(ctrl.transfer_for_tab(a).is_none(), "no transfer particles");
+        assert!(ctrl.burst_for_tab(a).is_none(), "no burst at 99");
+        assert_eq!(ctrl.gauge_for_tab(a), 99);
+        assert_eq!(ctrl.displayed_gauge_for_tab(a), 99.0);
+    }
+
+    #[test]
+    fn dev_gauge_is_applied_once_and_never_returns() {
+        let (mut ctrl, a, b) = armed_controller();
+        // Mode OFF does not consume the one-shot and shows nothing.
+        ctrl.set_enabled(false);
+        ctrl.apply_dev_initial_gauge(a);
+        assert_eq!(ctrl.gauge_for_tab(a), 0);
+        assert!(ctrl.gauge_display_for_tab(a).is_none());
+        ctrl.set_enabled(true);
+        ctrl.apply_dev_initial_gauge(a);
+        assert_eq!(ctrl.gauge_for_tab(a), 99);
+        // Another tab, repeated calls, tab switching: never re-initialized.
+        ctrl.apply_dev_initial_gauge(b);
+        ctrl.apply_dev_initial_gauge(a);
+        assert_eq!(ctrl.gauge_for_tab(b), 0);
+        let t = Instant::now();
+        ctrl.tick_with_viewport(t, 800.0, 600.0, Some(b), None);
+        ctrl.tick_with_viewport(t, 800.0, 600.0, Some(a), None);
+        assert_eq!(ctrl.gauge_for_tab(a), 99);
+        // Mode OFF -> ON clears the state and does not bring 99 back.
+        ctrl.set_enabled(false);
+        ctrl.set_enabled(true);
+        ctrl.apply_dev_initial_gauge(a);
+        assert_eq!(ctrl.gauge_for_tab(a), 0);
+        assert!(ctrl.gauge_display_for_tab(a).is_none());
+    }
+
+    #[test]
+    fn dev_gauge_reaches_burst_through_the_regular_transfer_and_success_path() {
+        let (mut ctrl, a, b) = armed_controller();
+        ctrl.apply_dev_initial_gauge(a);
+        // A bare success never bursts at 99.
+        let t0 = Instant::now();
+        ctrl.on_command_finished(a, 1, true, true, t0);
+        assert!(ctrl.burst_for_tab(a).is_none());
+        // One regular combo transfer takes the canonical gauge to 100 (with its event).
+        ctrl.on_text_input(a, &typed_tokens(2), t0);
+        let t1 = t0 + COMBO_TIMEOUT;
+        ctrl.tick_with_viewport(t1, 800.0, 600.0, Some(a), None);
+        assert_eq!(ctrl.gauge_for_tab(a), 100);
+        assert!(
+            ctrl.transfer_for_tab(a).is_some(),
+            "regular transfer effect"
+        );
+        ctrl.on_command_finished(a, 2, true, true, t1);
+        assert!(ctrl.burst_for_tab(a).is_some());
+        assert_eq!(ctrl.gauge_for_tab(a), 0);
+        // After the Burst: still 0, and neither time nor tab switches revive 99.
+        let end = t1 + burst::DURATION + COMBO_TIMEOUT;
+        ctrl.tick_with_viewport(end, 800.0, 600.0, Some(a), None);
+        assert!(ctrl.burst_for_tab(a).is_none());
+        assert_eq!(ctrl.gauge_for_tab(a), 0);
+        assert_eq!(ctrl.displayed_gauge_for_tab(a), 0.0);
+        for active in [b, a, b] {
+            ctrl.apply_dev_initial_gauge(active);
+            ctrl.tick_with_viewport(end, 800.0, 600.0, Some(active), None);
+        }
+        assert_eq!(ctrl.gauge_for_tab(a), 0);
+        assert_eq!(ctrl.gauge_for_tab(b), 0);
+        // Re-accumulates from zero.
+        ctrl.on_text_input(a, &typed_tokens(3), end);
+        ctrl.tick_with_viewport(end + COMBO_TIMEOUT, 800.0, 600.0, Some(a), None);
+        assert_eq!(ctrl.gauge_for_tab(a), 3);
+    }
+
+    #[test]
+    fn dev_gauge_leaves_nothing_behind_after_close_or_shell_exit() {
+        for exit_shell in [false, true] {
+            let (mut ctrl, a, _b) = armed_controller();
+            ctrl.apply_dev_initial_gauge(a);
+            if exit_shell {
+                ctrl.on_shell_exited(a);
+            } else {
+                ctrl.clear_tab(a);
+            }
+            assert_eq!(ctrl.gauge_for_tab(a), 0);
+            assert!(ctrl.gauge_display_for_tab(a).is_none());
+            // The one-shot is spent: a re-created tab id starts clean.
+            ctrl.apply_dev_initial_gauge(a);
+            assert_eq!(ctrl.gauge_for_tab(a), 0);
+            assert!(ctrl.gauge_display_for_tab(a).is_none());
+        }
+    }
+
+    #[test]
+    fn slice4_all_four_effects_and_all_state_vanish_on_close_exit_and_mode_off() {
+        for cleanup in 0..3 {
+            let mut ctrl = DopamineController::new(true);
+            let mut tabs = WorkbenchTabs::default();
+            let a = tabs.add(TabKind::Terminal);
+            let full = fill_for_burst(&mut ctrl, a, Instant::now());
+            ctrl.on_command_finished(a, 1, true, true, full);
+            let b = ctrl.burst_for_tab(a).unwrap();
+            for e in [
+                burst::Effect::Explosion,
+                burst::Effect::Fountain,
+                burst::Effect::Party,
+                burst::Effect::Fireworks,
+            ] {
+                assert!(b.effects.contains(&e));
+            }
+            assert!(b.shake_offset(full + burst::DURATION * 27 / 100) != (0.0, 0.0));
+            match cleanup {
+                0 => ctrl.clear_tab(a),
+                1 => ctrl.on_shell_exited(a),
+                _ => ctrl.set_enabled(false),
+            }
+            assert!(ctrl.burst_for_tab(a).is_none());
+            assert_eq!(ctrl.displayed_gauge_for_tab(a), 0.0);
+            assert!(ctrl.transfer_for_tab(a).is_none());
+        }
+    }
+
+    #[test]
+    fn shake_exists_only_for_the_tab_whose_trusted_success_started_a_burst() {
+        let mut ctrl = DopamineController::new(true);
+        let mut tabs = WorkbenchTabs::default();
+        let a = tabs.add(TabKind::Terminal);
+        let b = tabs.add(TabKind::Terminal);
+        let full = fill_for_burst(&mut ctrl, a, Instant::now());
+        // Failed / unknown-status finishes never start a Burst, hence never a Shake A.
+        ctrl.on_command_finished(a, 1, false, true, full);
+        ctrl.on_command_finished(a, 2, true, false, full);
+        assert!(ctrl.burst_for_tab(a).is_none());
+        // The trusted success starts it; Shake A is live at t = 0+ and only on tab `a`.
+        ctrl.on_command_finished(a, 3, true, true, full);
+        let burst_a = ctrl.burst_for_tab(a).unwrap();
+        assert!(burst_a.shake_offset(full + std::time::Duration::from_millis(20)) != (0.0, 0.0));
+        assert!(ctrl.burst_for_tab(b).is_none());
+        // A duplicate completion event for the same command neither restarts nor doubles it.
+        let started = burst_a.started;
+        ctrl.on_command_finished(
+            a,
+            3,
+            true,
+            true,
+            full + std::time::Duration::from_millis(300),
+        );
+        assert_eq!(ctrl.burst_for_tab(a).unwrap().started, started);
+        // Shake B is live at the cut-in rest and everything stops with the shell.
+        let at = |ms| started + std::time::Duration::from_millis(ms);
+        assert!(ctrl.burst_for_tab(a).unwrap().shake_offset(at(1500)) != (0.0, 0.0));
+        ctrl.on_shell_exited(a);
+        assert!(ctrl.burst_for_tab(a).is_none());
     }
 }

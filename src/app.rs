@@ -508,6 +508,7 @@ impl Kegon {
             dopamine: {
                 let mut ctrl = DopamineController::new(settings.dopamine.enabled());
                 ctrl.set_sound_kind(settings.dopamine.sound());
+                ctrl.arm_dev_initial_gauge(crate::terminal::dopamine::DEV_INITIAL_GAUGE);
                 ctrl
             },
             settings,
@@ -1324,6 +1325,11 @@ impl Kegon {
                 let h = (self.window_size.height - TAB_STRIP_HEIGHT).max(100.0);
                 let active_tab = self.workbench.tabs().active().map(|tab| tab.id);
                 let hit_origin = self.active_tab_hit_position();
+                if let Some(tab) = self.workbench.tabs().active()
+                    && tab.kind == TabKind::Terminal
+                {
+                    self.dopamine.apply_dev_initial_gauge(tab.id);
+                }
                 self.dopamine
                     .tick_with_viewport(now, w, h, active_tab, hit_origin);
             }
@@ -1393,6 +1399,10 @@ impl Kegon {
                 // Backdrop clicks are intentionally ignored to avoid accidental dismissal.
             }
         }
+        self.dopamine.retain_active_burst(
+            self.workbench.tabs().active().map(|t| t.id),
+            std::time::Instant::now(),
+        );
     }
 
     fn handle_iced_event(&mut self, event: Event) {
@@ -2449,6 +2459,22 @@ impl Kegon {
             .into()
     }
 
+    /// Screen Shake for the active terminal body: the Burst's deterministic offset snapped to
+    /// whole physical pixels. Render-only; zero without an active Burst.
+    fn screen_shake_offset(&self, now: std::time::Instant) -> iced::Vector {
+        let Some(burst) = self
+            .workbench
+            .tabs()
+            .active()
+            .and_then(|tab| self.dopamine.burst_for_tab(tab.id))
+        else {
+            return iced::Vector::ZERO;
+        };
+        let (x, y) = burst.shake_offset(now);
+        let scale = self.scale_factor.max(1.0);
+        iced::Vector::new((x * scale).round() / scale, (y * scale).round() / scale)
+    }
+
     fn main_area(&self) -> Element<'_, Message> {
         let theme = self.active_theme;
         let tab_strip = self.tab_strip();
@@ -2462,6 +2488,7 @@ impl Kegon {
                 font_config: &self.terminal_font_config,
                 scale_factor: self.scale_factor,
                 builtin_glyphs: self.settings.appearance.builtin_glyphs(),
+                shake: self.screen_shake_offset(std::time::Instant::now()),
             };
 
             let canvas_widget = Canvas::new(canvas_program).width(Fill).height(Fill);
@@ -2494,6 +2521,11 @@ impl Kegon {
                 transfer,
                 now,
                 self.scale_factor,
+            )
+            .with_burst(
+                active_tab_id.and_then(|id| self.dopamine.burst_for_tab(id)),
+                self.terminal_font_config.metrics.font_size,
+                self.terminal_font_config.font,
             );
             let overlay_widget = Canvas::new(overlay_program).width(Fill).height(Fill);
 
@@ -7560,5 +7592,170 @@ mod tests {
         };
         assert_eq!(current_rows, initial_rows);
         assert_eq!(current_cols, initial_cols);
+    }
+    #[test]
+    fn dopamine_slice4_live_font_metrics_grid_and_tab_switch() {
+        use crate::terminal::dopamine::{COMBO_TIMEOUT, burst};
+        use alacritty_terminal::grid::Dimensions;
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+        let now = std::time::Instant::now();
+        app.dopamine.on_text_input(tab, &"x ".repeat(100), now);
+        app.update(Message::DopamineTicked(now + COMBO_TIMEOUT));
+        app.dopamine
+            .on_command_finished(tab, 1, true, true, now + COMBO_TIMEOUT);
+        assert!(app.dopamine.burst_for_tab(tab).is_some());
+        let dimensions = || {
+            let term = app.active_session().unwrap().term().lock();
+            (term.screen_lines(), term.columns())
+        };
+        let before = dimensions();
+        drop(app.main_area());
+        assert_eq!(before, dimensions());
+        for size in [12.0, 24.0, 36.0] {
+            app.metric_drafts = Some(MetricDrafts::from_settings(&app.settings.appearance));
+            app.metric_drafts
+                .as_mut()
+                .unwrap()
+                .set(TerminalMetric::FontSize, size.to_string());
+            app.apply_metric_draft(TerminalMetric::FontSize);
+            assert_eq!(
+                burst::text_size(app.terminal_font_config.metrics.font_size),
+                size * (96.0 / 72.0) * 2.0
+            );
+            drop(app.main_area());
+        }
+        app.update(Message::OpenSettingsTab);
+        assert!(app.dopamine.burst_for_tab(tab).is_none());
+        assert_eq!(app.dopamine.gauge_for_tab(tab), 0);
+    }
+    #[test]
+    fn dopamine_slice4_verified_success_only_and_duplicate_delivery() {
+        use crate::terminal::dopamine::COMBO_TIMEOUT;
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+        for (status, matched, expected) in [
+            (ShellReportedStatus::Success, true, true),
+            (ShellReportedStatus::Failure, true, false),
+            (ShellReportedStatus::Unknown, true, false),
+            (ShellReportedStatus::Success, false, false),
+        ] {
+            let mut app = new_test_app(Locale::JaJp);
+            app.update(Message::SettingsDopamineToggled(true));
+            let tab = active_tab(&app);
+            let now = std::time::Instant::now() - std::time::Duration::from_secs(2);
+            app.dopamine.on_text_input(tab, &"x ".repeat(100), now);
+            app.update(Message::DopamineTicked(now + COMBO_TIMEOUT));
+            app.terminals
+                .command_state_machine_mut(tab)
+                .unwrap()
+                .set_expected_session_id(Some("BURST_TEST".into()));
+            for marker in [
+                Osc133Marker::PromptStarted,
+                Osc133Marker::InputStarted,
+                Osc133Marker::CommandStartedWithMetadata(Osc133Metadata {
+                    version: 1,
+                    session_id: "BURST_TEST".into(),
+                    seq: 1,
+                    shell_status: ShellReportedStatus::Unknown,
+                }),
+                Osc133Marker::IndependentMetadata(Osc133Metadata {
+                    version: 1,
+                    session_id: "BURST_TEST".into(),
+                    seq: if matched { 1 } else { 99 },
+                    shell_status: status,
+                }),
+                // A zero exit code must not override missing or negative shell status.
+                Osc133Marker::CommandFinished(Some(0)),
+            ] {
+                app.update(Message::TerminalEventReceived(
+                    tab,
+                    TerminalEvent::ShellIntegration(marker),
+                ));
+            }
+            assert_eq!(app.dopamine.burst_for_tab(tab).is_some(), expected);
+            assert_eq!(
+                app.dopamine.gauge_for_tab(tab),
+                if expected { 0 } else { 100 }
+            );
+            let start = app.dopamine.burst_for_tab(tab).map(|b| b.started);
+            app.update(Message::TerminalEventReceived(
+                tab,
+                TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
+            ));
+            assert_eq!(app.dopamine.burst_for_tab(tab).map(|b| b.started), start);
+            if expected {
+                // IME still reaches the normal input/combo route while Burst is alive.
+                app.update(Message::IcedEventReceived(Event::InputMethod(
+                    ImeEvent::Commit("日本語".into()),
+                )));
+                assert!(app.dopamine.combo_for_tab(tab, std::time::Instant::now()) > 0);
+                app.update(Message::OpenSettingsTab);
+                assert!(app.dopamine.burst_for_tab(tab).is_none());
+                app.update(Message::TabSelected(tab));
+                assert!(app.dopamine.burst_for_tab(tab).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn dopamine_slice4_shake_is_render_only_and_keeps_pty_and_input_contracts() {
+        use crate::terminal::dopamine::{COMBO_TIMEOUT, burst};
+        use alacritty_terminal::grid::Dimensions;
+        use std::time::Duration;
+        let mut app = new_test_app(Locale::JaJp);
+        app.update(Message::SettingsDopamineToggled(true));
+        let tab = active_tab(&app);
+        // No Burst: no shake.
+        assert_eq!(
+            app.screen_shake_offset(std::time::Instant::now()),
+            iced::Vector::ZERO
+        );
+        let now = std::time::Instant::now();
+        app.dopamine.on_text_input(tab, &"x ".repeat(100), now);
+        app.update(Message::DopamineTicked(now + COMBO_TIMEOUT));
+        app.dopamine
+            .on_command_finished(tab, 1, true, true, now + COMBO_TIMEOUT);
+        let started = app.dopamine.burst_for_tab(tab).expect("burst").started;
+        let dimensions = || {
+            let term = app.active_session().unwrap().term().lock();
+            (term.screen_lines(), term.columns())
+        };
+        let before = dimensions();
+        let scale = app.scale_factor.max(1.0);
+
+        // Shake A 0..0.5 s, quiet 0.5..1.0 s, Shake B 1.0..3.0 s, quiet afterwards; all within 5 px.
+        assert_eq!(
+            app.screen_shake_offset(started + Duration::from_millis(900)),
+            iced::Vector::ZERO
+        );
+        let mut max_seen = 0.0_f32;
+        for ms in (0..500).chain(1000..3000) {
+            let v = app.screen_shake_offset(started + Duration::from_millis(ms));
+            // Physical-pixel snapping may add at most half a physical px per axis.
+            let slack = 0.5 / scale * std::f32::consts::SQRT_2;
+            assert!(
+                v.x.hypot(v.y) <= burst::SHAKE_MAX_PX + slack + 1e-3,
+                "{v:?}"
+            );
+            max_seen = max_seen.max(v.x.hypot(v.y));
+        }
+        assert!(max_seen > 1.0, "the shake is visible");
+        for ms in [500, 750, 3000, 3500, 3999] {
+            assert_eq!(
+                app.screen_shake_offset(started + Duration::from_millis(ms)),
+                iced::Vector::ZERO,
+                "{ms}ms"
+            );
+        }
+        // Layout (PTY rows/cols) is untouched by building the view repeatedly.
+        drop(app.main_area());
+        assert_eq!(before, dimensions());
+        // Other tabs / Settings never inherit the shake.
+        app.update(Message::OpenSettingsTab);
+        assert_eq!(
+            app.screen_shake_offset(started + Duration::from_millis(1100)),
+            iced::Vector::ZERO
+        );
     }
 }

@@ -295,6 +295,9 @@ pub struct TerminalProgram<'a> {
     /// glyphs, and place cell background rectangles on the same physically aligned edges so shapes and
     /// backgrounds share them. Off draws everything as before, with the font and unaligned backgrounds.
     pub builtin_glyphs: bool,
+    /// Render-only Screen Shake translation (logical px) applied to the cell content. Layout,
+    /// PTY size and input coordinates are unaffected; the background keeps covering the canvas.
+    pub shake: iced::Vector,
 }
 
 impl<'a, Message> Program<Message> for TerminalProgram<'a> {
@@ -323,6 +326,9 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
         // Fill background
         frame.fill_rectangle(Point::ORIGIN, bounds.size(), colors.background);
+        if self.shake != iced::Vector::ZERO {
+            frame.translate(self.shake);
+        }
 
         let term = self.session.term().lock();
         let content = term.renderable_content();
