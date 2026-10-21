@@ -119,10 +119,17 @@ fn write_user_files(kind: ShellKind, home: &Path) {
                 "PROMPT_COMMAND='echo USER_HOOK_RAN'\nPS1='$ '\n",
             )
         }
-        ShellKind::Zsh => fs::write(
-            home.join(".zshrc"),
-            "precmd() { echo USER_HOOK_RAN }\nPS1='%# '\n",
-        ),
+        ShellKind::Zsh => {
+            // Ubuntu's `/etc/zsh/zshrc` runs `compinit` before the user's `.zshrc`, and stops at a
+            // prompt when a directory on `fpath` is insecure (as on some CI images). It reads
+            // `skip_global_compinit` from `.zshenv`, so set it there to keep the test shell
+            // independent of the host's global completion setup.
+            fs::write(home.join(".zshenv"), "skip_global_compinit=1\n").unwrap();
+            fs::write(
+                home.join(".zshrc"),
+                "precmd() { echo USER_HOOK_RAN }\nPS1='%# '\n",
+            )
+        }
         ShellKind::Fish => {
             let config = home.join(".config").join("fish");
             fs::create_dir_all(&config).unwrap();
