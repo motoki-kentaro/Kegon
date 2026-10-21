@@ -419,6 +419,12 @@ impl ShellSpec {
         &self.config.args
     }
 
+    /// Sets or replaces the initial working directory for this [`ShellSpec`].
+    pub fn with_working_directory(mut self, working_directory: Option<PathBuf>) -> Self {
+        self.working_directory = working_directory;
+        self
+    }
+
     /// Returns the session ID generated for this launch, if Shell Integration is active.
     #[allow(dead_code)]
     pub fn session_id(&self) -> Option<&str> {
@@ -1474,6 +1480,38 @@ mod tests {
         assert_eq!(spec.integration_launch, ShellIntegrationLaunch::Unsupported);
         assert!(!spec.integrated);
         assert_eq!(spec.session_id, None);
+    }
+
+    #[test]
+    fn linux_plain_pwsh_has_unsupported_integration_on_unix() {
+        let env = MockEnvironment::new()
+            .with_var("SHELL", "/usr/bin/pwsh")
+            .with_executable("/usr/bin/pwsh");
+        let resolver = ShellResolver::with_env(env);
+        let resolved = resolver
+            .resolve_unix(false) // linux -> login = false, args = []
+            .expect("resolve linux pwsh");
+        assert_eq!(resolved.program, "/usr/bin/pwsh");
+        assert_eq!(resolved.kind, ShellKind::PowerShell);
+        assert!(resolved.args.is_empty());
+
+        let spec = resolved
+            .build_spec(ShellIntegrationMode::Auto, "HOST", None, None)
+            .expect("build spec");
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(spec.integration_launch, ShellIntegrationLaunch::Unsupported);
+            assert!(!spec.integrated);
+            assert_eq!(spec.session_id, None);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // On Windows host, Windows PowerShell injection activates for empty args
+            assert_eq!(spec.integration_launch, ShellIntegrationLaunch::Injected);
+            assert!(spec.integrated);
+            assert!(spec.session_id.is_some());
+        }
     }
 
     #[test]

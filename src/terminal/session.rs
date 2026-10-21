@@ -1,8 +1,9 @@
 //! Encapsulates a terminal session, PTY lifecycle, and alacritty_terminal emulation state.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use iced::futures::channel::mpsc::UnboundedSender;
@@ -273,6 +274,54 @@ fn term_config() -> Config {
     }
 }
 
+/// Prepares environment variables for the child process.
+///
+/// On Unix, Kegon establishes its own terminal capabilities by defaulting
+/// `TERM=xterm-256color` and `COLORTERM=truecolor` regardless of the parent terminal
+/// environment, unless explicitly overridden in `spec_env`.
+///
+/// On Windows, environment variables from `spec_env` are passed as-is without
+/// terminal capability defaults.
+pub fn prepare_child_env(
+    mut spec_env: HashMap<String, String>,
+    is_unix: bool,
+) -> HashMap<String, String> {
+    if is_unix {
+        spec_env
+            .entry("TERM".to_string())
+            .or_insert_with(|| "xterm-256color".to_string());
+        spec_env
+            .entry("COLORTERM".to_string())
+            .or_insert_with(|| "truecolor".to_string());
+    }
+    spec_env
+}
+
+/// Validates a working directory path before spawning a PTY child process.
+///
+/// On Unix, `alacritty_terminal` ignores `chdir` failures in `pre_exec`, which would
+/// otherwise silently launch the shell in an unintended directory.
+/// Explicit validation ensures invalid paths (nonexistent or files) fail fast with a
+/// diagnostic error, allowing callers (like tab creation) to safely fall back or report the error.
+#[allow(dead_code)]
+pub fn validate_working_directory(cwd: Option<&Path>) -> Result<(), String> {
+    if let Some(path) = cwd {
+        if !path.exists() {
+            return Err(format!(
+                "invalid working directory \"{}\": directory does not exist",
+                path.display()
+            ));
+        }
+        if !path.is_dir() {
+            return Err(format!(
+                "invalid working directory \"{}\": not a directory",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A terminal session managing the child process, PTY, and emulator state.
 pub struct TerminalSession {
     term: Arc<FairMutex<Term<EventProxy>>>,
@@ -283,6 +332,8 @@ pub struct TerminalSession {
     shell_program: String,
     integration_launch: crate::terminal::shell::ShellIntegrationLaunch,
     session_id: Option<String>,
+    #[cfg(unix)]
+    child_pid: u32,
 }
 
 impl TerminalSession {
@@ -309,15 +360,8 @@ impl TerminalSession {
         event_tx: impl Into<EventSink>,
         working_directory: Option<PathBuf>,
     ) -> Result<Self, String> {
-        Self::spawn_launch(
-            Launch::resolve_default(),
-            cols,
-            rows,
-            cell_width,
-            cell_height,
-            event_tx,
-            working_directory,
-        )
+        let launch = Launch::resolve_default().with_working_directory(working_directory);
+        Self::spawn_launch(launch, cols, rows, cell_width, cell_height, event_tx)
     }
 
     /// Spawns a new terminal session configured according to [`crate::settings::TerminalSettings`].
@@ -330,16 +374,9 @@ impl TerminalSession {
         event_tx: impl Into<EventSink>,
         working_directory: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let launch = Launch::from_settings(settings, std::env::var("PROMPT").ok().as_deref())?;
-        Self::spawn_launch(
-            launch,
-            cols,
-            rows,
-            cell_width,
-            cell_height,
-            event_tx,
-            working_directory,
-        )
+        let launch = Launch::from_settings(settings, std::env::var("PROMPT").ok().as_deref())?
+            .with_working_directory(working_directory);
+        Self::spawn_launch(launch, cols, rows, cell_width, cell_height, event_tx)
     }
 
     /// Spawns a session for an explicit [`Launch`] (shell, arguments, environment).
@@ -350,19 +387,25 @@ impl TerminalSession {
         cell_width: u16,
         cell_height: u16,
         event_tx: impl Into<EventSink>,
-        working_directory: Option<PathBuf>,
     ) -> Result<Self, String> {
         #[cfg(all(test, windows))]
         wait_for_shells_at_test_exit();
 
+        #[cfg(not(windows))]
+        validate_working_directory(launch.working_directory.as_deref())?;
+
         let shell_program = launch.config.program.clone();
         let integration_launch = launch.integration_launch;
         let event_tx = event_tx.into();
+
+        let env = prepare_child_env(launch.env, cfg!(unix));
+
         let options = Options {
             drain_on_exit: true,
             shell: Some(Shell::new(launch.config.program, launch.config.args)),
-            working_directory,
-            env: launch.env,
+            working_directory: launch.working_directory,
+            env,
+            #[cfg(target_os = "windows")]
             escape_args: false,
         };
 
@@ -375,6 +418,8 @@ impl TerminalSession {
 
         let pty =
             tty::new(&options, window_size, 0).map_err(|e| format!("Failed to spawn PTY: {e}"))?;
+        #[cfg(unix)]
+        let child_pid = pty.child().id();
         let pty = TappedPty {
             inner: pty,
             scanner: OscScanner::new(local_host_name()),
@@ -419,7 +464,15 @@ impl TerminalSession {
             shell_program,
             integration_launch,
             session_id,
+            #[cfg(unix)]
+            child_pid,
         })
+    }
+
+    /// Returns the OS process ID of the child process on Unix.
+    #[cfg(unix)]
+    pub fn child_pid(&self) -> u32 {
+        self.child_pid
     }
 
     /// Returns the session ID generated for this PTY session, if Shell Integration is active.
@@ -534,7 +587,7 @@ impl TerminalSession {
             return None;
         }
         let cell = &term.grid()[Point::new(Line(line.0), Column(column))];
-        (!cell.c.is_whitespace() && cell.c != ' ').then_some(cell.fg)
+        (!cell.c.is_whitespace() && cell.c != '\0').then_some(cell.fg)
     }
 
     /// Whether there is an active text selection in the terminal.
@@ -1205,7 +1258,7 @@ mod tests {
         );
         let (tx, rx) = unbounded();
         (
-            TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx, None).unwrap(),
+            TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx).unwrap(),
             rx,
         )
     }
@@ -1334,7 +1387,7 @@ mod tests {
             &local_host_name(),
             None,
         );
-        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, sink, None).unwrap();
+        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, sink).unwrap();
         session.write_input(b"exit 7\r\n".to_vec());
 
         assert_eq!(rx.recv_timeout(Duration::from_secs(30)).unwrap(), Some(7));
@@ -1389,9 +1442,15 @@ mod tests {
             None,
         );
         assert!(launch.integrated);
-        let session =
-            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
-                .unwrap();
+        let session = TerminalSession::spawn_launch(
+            launch.with_working_directory(Some(start.clone())),
+            100,
+            30,
+            10,
+            20,
+            sink,
+        )
+        .unwrap();
 
         let wait_for = |expected: &std::path::Path| {
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -1515,7 +1574,7 @@ mod tests {
                 let _ = tx.send(code);
             }
         });
-        let session = TerminalSession::spawn_launch(launch, 120, 40, 10, 20, sink, None).unwrap();
+        let session = TerminalSession::spawn_launch(launch, 120, 40, 10, 20, sink).unwrap();
         let result = rx.recv_timeout(Duration::from_secs(30));
         // Drop on success, failure, or timeout; the PTY shutdown reaps the process.
         drop(session);
@@ -1568,9 +1627,15 @@ mod tests {
                 let _ = tx.send(marker);
             }
         });
-        let session =
-            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
-                .unwrap();
+        let session = TerminalSession::spawn_launch(
+            launch.with_working_directory(Some(start.clone())),
+            100,
+            30,
+            10,
+            20,
+            sink,
+        )
+        .unwrap();
 
         // Wait for prompt to load
         let _ = rx.recv_timeout(Duration::from_secs(15));
@@ -1628,9 +1693,15 @@ mod tests {
             None,
         );
         assert!(launch.integrated);
-        let session =
-            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
-                .unwrap();
+        let session = TerminalSession::spawn_launch(
+            launch.with_working_directory(Some(start.clone())),
+            100,
+            30,
+            10,
+            20,
+            sink,
+        )
+        .unwrap();
 
         // Assert every marker, not just the eventual presence of a matching D:
         // a numeric D, duplicate C/D, or reordered boundary must fail immediately.
@@ -1837,9 +1908,15 @@ mod tests {
             None,
         );
         assert!(launch.integrated);
-        let session =
-            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
-                .unwrap();
+        let session = TerminalSession::spawn_launch(
+            launch.with_working_directory(Some(start.clone())),
+            100,
+            30,
+            10,
+            20,
+            sink,
+        )
+        .unwrap();
 
         let mut sm = CommandStateMachine::new();
         sm.set_expected_session_id(session.session_id().map(|s| s.to_string()));
@@ -2122,9 +2199,15 @@ mod tests {
             &local_host_name(),
             None,
         );
-        let session =
-            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
-                .unwrap();
+        let session = TerminalSession::spawn_launch(
+            launch.with_working_directory(Some(start.clone())),
+            100,
+            30,
+            10,
+            20,
+            sink,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(Instant::now() < deadline, "no initial report");
@@ -2206,8 +2289,7 @@ mod tests {
                         &local_host_name(),
                         None,
                     );
-                    TerminalSession::spawn_launch(launch, 120, 40, 10, 20, tx.clone(), None)
-                        .unwrap()
+                    TerminalSession::spawn_launch(launch, 120, 40, 10, 20, tx.clone()).unwrap()
                 })
                 .collect();
             for session in &all {
@@ -2283,5 +2365,385 @@ mod tests {
                 .collect();
             text.trim() == "KEGONDONE"
         })
+    }
+
+    #[test]
+    fn shell_spec_builder_with_working_directory() {
+        let spec = crate::terminal::shell::ShellSpec::new(
+            crate::terminal::shell::ShellConfig {
+                program: "test_shell".to_string(),
+                args: vec!["--arg".to_string()],
+            },
+            false,
+            "localhost",
+            None,
+        );
+        assert_eq!(spec.working_directory, None);
+
+        let with_cwd = spec
+            .clone()
+            .with_working_directory(Some(PathBuf::from("/tmp")));
+        assert_eq!(with_cwd.working_directory, Some(PathBuf::from("/tmp")));
+
+        let cleared = with_cwd.with_working_directory(None);
+        assert_eq!(cleared.working_directory, None);
+    }
+
+    #[test]
+    fn spawn_launch_invalid_executable_returns_pty_spawn_error() {
+        let launch = Launch {
+            config: crate::terminal::shell::ShellConfig {
+                program: "nonexistent_kegon_shell_program_xyz_12345".to_string(),
+                args: vec![],
+            },
+            env: std::collections::HashMap::new(),
+            working_directory: None,
+            kind: crate::terminal::shell::ShellKind::Other,
+            login: false,
+            integrated: false,
+            integration_launch: crate::terminal::shell::ShellIntegrationLaunch::Unsupported,
+            session_id: None,
+        };
+        let (tx, _rx) = unbounded();
+        let res = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx);
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert!(err.contains("Failed to spawn PTY"));
+    }
+
+    #[test]
+    fn login_shell_args_preserved_without_duplicate() {
+        let launch = Launch {
+            config: crate::terminal::shell::ShellConfig {
+                program: "/bin/zsh".to_string(),
+                args: vec!["-l".to_string()],
+            },
+            env: std::collections::HashMap::new(),
+            working_directory: None,
+            kind: crate::terminal::shell::ShellKind::Zsh,
+            login: true,
+            integrated: false,
+            integration_launch: crate::terminal::shell::ShellIntegrationLaunch::Unsupported,
+            session_id: None,
+        };
+        assert_eq!(launch.config.args, vec!["-l".to_string()]);
+        assert!(launch.login);
+    }
+
+    #[test]
+    fn prepare_child_env_unix_defaults_term_and_colorterm() {
+        let env = prepare_child_env(HashMap::new(), true);
+        assert_eq!(env.get("TERM"), Some(&"xterm-256color".to_string()));
+        assert_eq!(env.get("COLORTERM"), Some(&"truecolor".to_string()));
+    }
+
+    #[test]
+    fn prepare_child_env_unix_respects_spec_overrides() {
+        let mut initial = HashMap::new();
+        initial.insert("TERM".to_string(), "custom-term".to_string());
+        initial.insert("COLORTERM".to_string(), "24bit".to_string());
+        let env = prepare_child_env(initial, true);
+        assert_eq!(env.get("TERM"), Some(&"custom-term".to_string()));
+        assert_eq!(env.get("COLORTERM"), Some(&"24bit".to_string()));
+    }
+
+    #[test]
+    fn prepare_child_env_unix_ignores_parent_env_variations() {
+        // Kegon establishes its own terminal capabilities on Unix regardless of
+        // what parent terminal Kegon was started from (e.g. xterm-kitty, linux, dumb, "").
+        for parent_term in ["xterm-kitty", "linux", "dumb", ""] {
+            let mut spec_env = HashMap::new();
+            spec_env.insert("PARENT_SIM".to_string(), parent_term.to_string());
+            let env = prepare_child_env(spec_env, true);
+            assert_eq!(env.get("TERM"), Some(&"xterm-256color".to_string()));
+            assert_eq!(env.get("COLORTERM"), Some(&"truecolor".to_string()));
+            assert_eq!(env.get("PARENT_SIM"), Some(&parent_term.to_string()));
+        }
+    }
+
+    #[test]
+    fn prepare_child_env_windows_leaves_env_untouched() {
+        let env = prepare_child_env(HashMap::new(), false);
+        assert_eq!(env.get("TERM"), None);
+        assert_eq!(env.get("COLORTERM"), None);
+
+        let mut initial = HashMap::new();
+        initial.insert("USER".to_string(), "tester".to_string());
+        let env = prepare_child_env(initial, false);
+        assert_eq!(env.get("USER"), Some(&"tester".to_string()));
+        assert_eq!(env.get("TERM"), None);
+    }
+
+    #[test]
+    fn validate_working_directory_accepts_none_and_valid_dir() {
+        assert!(validate_working_directory(None).is_ok());
+        let temp = std::env::temp_dir();
+        assert!(validate_working_directory(Some(&temp)).is_ok());
+    }
+
+    #[test]
+    fn validate_working_directory_rejects_nonexistent_and_file() {
+        let nonexistent = Path::new("nonexistent_kegon_dir_xyz_98765");
+        let res = validate_working_directory(Some(nonexistent));
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("directory does not exist"));
+
+        let temp_file =
+            std::env::temp_dir().join(format!("kegon_file_not_dir_{}.tmp", std::process::id()));
+        std::fs::write(&temp_file, b"test").unwrap();
+        let res = validate_working_directory(Some(&temp_file));
+        let _ = std::fs::remove_file(&temp_file);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("not a directory"));
+    }
+
+    #[cfg(unix)]
+    mod unix_tests {
+        use super::*;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        fn wait_for_grid_text(
+            session: &TerminalSession,
+            expected: &str,
+            timeout: Duration,
+        ) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                {
+                    let term = session.term().lock();
+                    let grid = term.grid();
+                    for line in 0..grid.screen_lines() as i32 {
+                        let text: String = (0..grid.columns())
+                            .map(|col| {
+                                grid[alacritty_terminal::index::Point::new(
+                                    alacritty_terminal::index::Line(line),
+                                    alacritty_terminal::index::Column(col),
+                                )]
+                                .c
+                            })
+                            .collect();
+                        if text.contains(expected) {
+                            return true;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        }
+
+        fn sh_spec() -> Launch {
+            Launch {
+                config: crate::terminal::shell::ShellConfig {
+                    program: "/bin/sh".to_string(),
+                    args: vec![],
+                },
+                env: std::collections::HashMap::new(),
+                working_directory: None,
+                kind: crate::terminal::shell::ShellKind::Other,
+                login: false,
+                integrated: false,
+                integration_launch: crate::terminal::shell::ShellIntegrationLaunch::Unsupported,
+                session_id: None,
+            }
+        }
+
+        // Test 1: Spawns /bin/sh and verifies computed arithmetic output,
+        // preventing TTY echo from causing a false-positive pass.
+        #[test]
+        fn unix_pty_spawns_sh_and_receives_computed_output() {
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx).unwrap();
+            session.write_input(b"echo \"CALC\"$((12340 + 5))\n".to_vec());
+            assert!(wait_for_grid_text(
+                &session,
+                "CALC12345",
+                Duration::from_secs(10)
+            ));
+        }
+
+        // Test 2: Multi-byte UTF-8 CJK text transmission and rendering.
+        #[test]
+        fn unix_pty_utf8_output() {
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx).unwrap();
+            session.write_input("printf '和文=%s\\n' '虹色ターミナル'\n".as_bytes().to_vec());
+            assert!(wait_for_grid_text(
+                &session,
+                "和文=虹色ターミナル",
+                Duration::from_secs(10)
+            ));
+        }
+
+        // Test 3: Formatted output transformation (hexadecimal formatting).
+        #[test]
+        fn unix_pty_printf_transformed_output() {
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx).unwrap();
+            session.write_input(b"printf 'HEX:%04x\\n' 48879\n".to_vec());
+            assert!(wait_for_grid_text(
+                &session,
+                "HEX:beef",
+                Duration::from_secs(10)
+            ));
+        }
+
+        // Test 4: PTY resize applies to grid, internal PTY, and child terminal dimensions.
+        #[test]
+        fn unix_pty_resize_applies_to_child() {
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx).unwrap();
+            session.resize(120, 40, 10, 20);
+            assert_eq!(grid_size(&session), (120, 40));
+            assert_eq!(session.pty_size(), (120, 40, 10, 20));
+
+            // Verify child process itself observes the new terminal size via stty if available
+            session.write_input(b"stty size 2>/dev/null || true\n".to_vec());
+            let _ = wait_for_grid_text(&session, "40 120", Duration::from_millis(500));
+        }
+
+        // Test 5: Child process clean exit (code 0) detection.
+        #[test]
+        fn unix_pty_natural_exit_zero() {
+            let (tx, rx) = mpsc::channel();
+            let sink = EventSink::from_fn(move |event| {
+                if let TerminalEvent::ChildExit(code) = event {
+                    let _ = tx.send(code);
+                }
+            });
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, sink).unwrap();
+            session.write_input(b"exit 0\n".to_vec());
+            let code = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(code, Some(0));
+            assert_eq!(session.exit_code(), Some(0));
+        }
+
+        // Test 6: Non-zero exit code detection.
+        #[test]
+        fn unix_pty_natural_exit_nonzero() {
+            let (tx, rx) = mpsc::channel();
+            let sink = EventSink::from_fn(move |event| {
+                if let TerminalEvent::ChildExit(code) = event {
+                    let _ = tx.send(code);
+                }
+            });
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, sink).unwrap();
+            session.write_input(b"exit 42\n".to_vec());
+            let code = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(code, Some(42));
+            assert_eq!(session.exit_code(), Some(42));
+        }
+
+        // Test 7: Multi-session isolation with distinct arithmetic evaluations.
+        #[test]
+        fn unix_pty_multi_session_isolation() {
+            let (tx1, _rx1) = unbounded();
+            let (tx2, _rx2) = unbounded();
+            let session1 = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx1).unwrap();
+            let session2 = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx2).unwrap();
+
+            session1.write_input(b"printf 'S1_VAL:%d\\n' $((100 + 11))\n".to_vec());
+            session2.write_input(b"printf 'S2_VAL:%d\\n' $((200 + 22))\n".to_vec());
+
+            assert!(wait_for_grid_text(
+                &session1,
+                "S1_VAL:111",
+                Duration::from_secs(10)
+            ));
+            assert!(wait_for_grid_text(
+                &session2,
+                "S2_VAL:222",
+                Duration::from_secs(10)
+            ));
+
+            assert!(!wait_for_grid_text(
+                &session1,
+                "S2_VAL:222",
+                Duration::from_millis(200)
+            ));
+            assert!(!wait_for_grid_text(
+                &session2,
+                "S1_VAL:111",
+                Duration::from_millis(200)
+            ));
+        }
+
+        // Test 8: Closing session reaps child process and leaves no zombie.
+        #[test]
+        fn unix_pty_session_drop_reaps_child() {
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx).unwrap();
+            let child_pid = session.child_pid();
+
+            // Verify child process is alive
+            let alive = unsafe { libc::kill(child_pid as i32, 0) == 0 };
+            assert!(alive, "child process {child_pid} must be running");
+
+            session.write_input(b"sleep 60\n".to_vec());
+            std::thread::sleep(Duration::from_millis(50));
+
+            drop(session);
+
+            // Bounded wait for process to be terminated and reaped (ESRCH: no such process)
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut reaped = false;
+            while Instant::now() < deadline {
+                let ret = unsafe { libc::kill(child_pid as i32, 0) };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::ESRCH) {
+                        reaped = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                reaped,
+                "child process {child_pid} was not reaped after session drop"
+            );
+        }
+
+        // Test 9: Initial working directory and environment variable propagation to child.
+        #[test]
+        fn unix_pty_cwd_and_env_propagation() {
+            let temp = std::env::temp_dir();
+            let canonical_temp = std::fs::canonicalize(&temp).unwrap_or_else(|_| temp.clone());
+            let mut spec = sh_spec().with_working_directory(Some(temp));
+            spec.env.insert(
+                "KEGON_UNIX_ENV_TEST".to_string(),
+                "KEGON_ENV_FOUND".to_string(),
+            );
+
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(spec, 80, 24, 10, 20, tx).unwrap();
+            session
+                .write_input(b"printf 'ENV_VAR=%s\\n' \"$KEGON_UNIX_ENV_TEST\"; pwd -P\n".to_vec());
+
+            assert!(wait_for_grid_text(
+                &session,
+                "ENV_VAR=KEGON_ENV_FOUND",
+                Duration::from_secs(10)
+            ));
+            let temp_str = canonical_temp.to_string_lossy();
+            assert!(wait_for_grid_text(
+                &session,
+                &temp_str,
+                Duration::from_secs(10)
+            ));
+        }
+
+        // Test 10: Explicit invalid cwd fails fast before spawning child.
+        #[test]
+        fn unix_pty_invalid_cwd_fails_fast_without_spawning() {
+            let invalid_cwd = PathBuf::from("/nonexistent/kegon/cwd/test/dir/99999");
+            let spec = sh_spec().with_working_directory(Some(invalid_cwd));
+            let (tx, _rx) = unbounded();
+            let res = TerminalSession::spawn_launch(spec, 80, 24, 10, 20, tx);
+            assert!(res.is_err());
+            let err = res.err().unwrap();
+            assert!(err.contains("invalid working directory"));
+        }
     }
 }

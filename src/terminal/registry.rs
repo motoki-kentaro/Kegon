@@ -685,7 +685,7 @@ mod tests {
             None,
         );
         let (tx, _rx) = unbounded();
-        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx, None).unwrap();
+        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx).unwrap();
         registry.insert(ids[0], session).ok().unwrap();
         assert_eq!(
             registry.shell_integration_status(ids[0]),
@@ -769,7 +769,7 @@ mod tests {
             .expect("launch0 must have session_id")
             .to_string();
         let (tx0, _rx0) = unbounded();
-        let session0 = TerminalSession::spawn_launch(launch0, 80, 24, 10, 20, tx0, None).unwrap();
+        let session0 = TerminalSession::spawn_launch(launch0, 80, 24, 10, 20, tx0).unwrap();
         registry.insert(tabs[0], session0).ok().unwrap();
 
         // Spawn Tab 1 with PowerShell launch
@@ -787,7 +787,7 @@ mod tests {
             .expect("launch1 must have session_id")
             .to_string();
         let (tx1, _rx1) = unbounded();
-        let session1 = TerminalSession::spawn_launch(launch1, 80, 24, 10, 20, tx1, None).unwrap();
+        let session1 = TerminalSession::spawn_launch(launch1, 80, 24, 10, 20, tx1).unwrap();
         registry.insert(tabs[1], session1).ok().unwrap();
 
         // 1. Verify SIDs are distinct and non-empty
@@ -891,7 +891,7 @@ mod tests {
         assert!(!launch.env.contains_key(SESSION_ID_ENV));
 
         let (tx, _rx) = unbounded();
-        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx, None).unwrap();
+        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx).unwrap();
         registry.insert(tabs[0], session).ok().unwrap();
 
         assert_eq!(registry.session_id(tabs[0]), None);
