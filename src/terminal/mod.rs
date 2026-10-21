@@ -23,6 +23,9 @@ pub mod shell;
 pub mod surface;
 pub mod tile_cache;
 pub mod title;
+pub mod unix_integration;
+#[cfg(all(test, unix))]
+mod unix_shell_e2e;
 
 pub use arbitration::{InputArbiter, InputRoute};
 pub use clipboard::SystemClipboard;

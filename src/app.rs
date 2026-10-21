@@ -3637,8 +3637,9 @@ mod tests {
 
     /// Gives `tab` a session whose Shell Integration was injected, the precondition for the
     /// synthetic OSC 133 markers these tests send to count. The default Windows shell
-    /// (PowerShell) is injected for real; Unix shells stay `Unsupported` until Slice 3, so there
-    /// the session is replaced with one from [`injected_launch`].
+    /// (PowerShell) is injected for real. On Unix the default shell is the user's own, which may
+    /// be one that is not integrated (or not installed), so there the session is replaced with
+    /// one from [`injected_launch`].
     ///
     /// [`injected_launch`]: crate::terminal::shell::mock::injected_launch
     fn integrate_terminal(app: &mut Kegon, tab: TabId) {
@@ -3664,6 +3665,42 @@ mod tests {
             );
             assert!(app.terminals.insert(tab, session).is_ok());
         }
+    }
+
+    /// Gives `tab` a plain `/bin/sh` session, a shell Kegon does not integrate, whatever the user's
+    /// own shell is.
+    #[cfg(unix)]
+    fn plain_sh_terminal(app: &mut Kegon, tab: TabId) {
+        use crate::terminal::shell::{ResolvedShell, ShellKind};
+        let spec = ResolvedShell {
+            program: "/bin/sh".to_string(),
+            args: vec![],
+            kind: ShellKind::Other,
+            login: false,
+        }
+        .build_spec(
+            crate::settings::ShellIntegrationMode::Auto,
+            &crate::terminal::cwd::local_host_name(),
+            None,
+            None,
+        )
+        .expect("plain sh spec");
+        let (cols, rows) = app.terminal_grid_size();
+        let metrics = app.terminal_font_config.metrics;
+        let session = TerminalSession::spawn_launch(
+            spec,
+            cols,
+            rows,
+            metrics.cell_width as u16,
+            metrics.cell_height as u16,
+            tagged_sink(&app.terminal_event_tx, tab),
+        )
+        .expect("plain sh session");
+        assert!(
+            app.terminals.remove(tab).is_some(),
+            "no terminal to replace"
+        );
+        assert!(app.terminals.insert(tab, session).is_ok());
     }
 
     /// Adds a second terminal tab with its own session, tagging events the way production does.
@@ -6161,7 +6198,7 @@ mod tests {
         assert!(result.correlation.is_matched());
     }
 
-    /// Unix shells have no Shell Integration until Slice 3: the tooltip says so in both locales,
+    /// A shell without Shell Integration (here `/bin/sh`): the tooltip says so in both locales,
     /// and markers that would be trusted on an injected session neither promote the status nor
     /// reach Dopamine Mode.
     #[cfg(unix)]
@@ -6176,6 +6213,7 @@ mod tests {
             let mut app = new_test_app(locale);
             app.update(Message::SettingsDopamineToggled(true));
             let tab = active_tab(&app);
+            plain_sh_terminal(&mut app, tab);
             assert_eq!(
                 app.terminals.shell_integration_status(tab),
                 Some(ShellIntegrationStatus::Unsupported)

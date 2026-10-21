@@ -1,0 +1,114 @@
+# Kegon Shell Integration for zsh: stands in for ~/.zshrc and installs the hooks after it.
+#
+# Speaks the same OSC 133 dialect as the PowerShell integration: `C` and `D` carry kegon.v /
+# kegon.sid / kegon.seq, and `D` also carries the exit code and kegon.ps. Needs zsh 5.1 or later
+# (`printf -v`).
+
+__kegon_zdotdir=$ZDOTDIR
+ZDOTDIR=${KEGON_USER_ZDOTDIR:-$HOME}
+[[ -r "$ZDOTDIR/.zshrc" ]] && builtin source "$ZDOTDIR/.zshrc"
+KEGON_USER_ZDOTDIR=$ZDOTDIR
+unset __kegon_zdotdir
+
+# Give ZDOTDIR back to the user so ~/.zlogin and every later zsh read their own files.
+if [[ $KEGON_USER_ZDOTDIR == "$HOME" ]]; then
+    unset ZDOTDIR
+else
+    ZDOTDIR=$KEGON_USER_ZDOTDIR
+fi
+unset KEGON_USER_ZDOTDIR
+
+if [[ -n ${__kegon_sid-} && -o interactive && -z ${__kegon_installed-} ]]; then
+    typeset -g __kegon_installed=1
+    typeset -g __kegon_host='@HOST@'
+    typeset -gi __kegon_seq=0
+    typeset -g __kegon_running=
+
+    # Percent-encodes $1 into REPLY (byte-wise, so the result is a valid file URI path).
+    __kegon_encode_path() {
+        emulate -L zsh
+        local LC_ALL=C
+        local s=$1 out= c i
+        for ((i = 1; i <= ${#s}; i++)); do
+            c=${s[i]}
+            case $c in
+                [a-zA-Z0-9/._~:-]) out+=$c ;;
+                *)
+                    printf -v c '%%%02X' "'$c"
+                    out+=$c
+                    ;;
+            esac
+        done
+        REPLY=$out
+    }
+
+    # Runs before a command line executes; once per line, however many commands it holds.
+    __kegon_preexec() {
+        __kegon_running=1
+        __kegon_seq=$((__kegon_seq + 1))
+        printf '\e]133;C;kegon.v=1;kegon.sid=%s;kegon.seq=%d\a' "$__kegon_sid" "$__kegon_seq"
+    }
+
+    # zsh runs a function named `precmd` before every function in `precmd_functions`, and what it
+    # runs replaces `$?`. If the user defined one, move it into the array right behind our hook:
+    # the same order and the same single call, but our hook now reads the command's status first.
+    # (`functions -c` copies the definition.)
+    __kegon_absorb_precmd() {
+        (( ${+functions[precmd]} )) || return 1
+        (( ${+functions[__kegon_user_precmd]} )) && unfunction __kegon_user_precmd
+        functions -c precmd __kegon_user_precmd || return 1
+        unfunction precmd
+        __kegon_arrange_hooks
+    }
+
+    # Our hook first, the absorbed `precmd` next, then everyone else's, and the input-start marker
+    # last. Idempotent: our names are removed before they are put back.
+    __kegon_arrange_hooks() {
+        local -a rest
+        rest=(${${${precmd_functions:#__kegon_precmd}:#__kegon_user_precmd}:#__kegon_mark_input})
+        if (( ${+functions[__kegon_user_precmd]} )); then
+            precmd_functions=(__kegon_precmd __kegon_user_precmd $rest __kegon_mark_input)
+        else
+            precmd_functions=(__kegon_precmd $rest __kegon_mark_input)
+        fi
+    }
+
+    # First precmd: `$?` is still the exit status of the command line.
+    __kegon_precmd() {
+        local ret=$?
+        local unknown=
+        if (( ${+functions[precmd]} )); then
+            # A `precmd` defined after startup has already run and replaced `$?`: the status of
+            # this command is lost, so it is reported as unknown (never as a success).
+            unknown=1
+            __kegon_absorb_precmd
+        fi
+        if [[ -n $__kegon_running ]]; then
+            __kegon_running=
+            if [[ -n $unknown ]]; then
+                printf '\e]133;D;;kegon.v=1;kegon.sid=%s;kegon.seq=%d\a' \
+                    "$__kegon_sid" "$__kegon_seq"
+            else
+                local ps=success
+                ((ret == 0)) || ps=failure
+                printf '\e]133;D;%d;kegon.v=1;kegon.sid=%s;kegon.seq=%d;kegon.ps=%s\a' \
+                    "$ret" "$__kegon_sid" "$__kegon_seq" "$ps"
+            fi
+        fi
+        __kegon_encode_path "$PWD"
+        printf '\e]7;file://%s%s\a' "$__kegon_host" "$REPLY"
+        printf '\e]133;A\a'
+        return $ret
+    }
+
+    # Last precmd: end the prompt with the input-start marker, again if the prompt was replaced.
+    __kegon_mark_input() {
+        local ret=$?
+        [[ $PS1 == *'133;B'* ]] || PS1+=$'%{\e]133;B\a%}'
+        return $ret
+    }
+
+    preexec_functions=(${preexec_functions:#__kegon_preexec} __kegon_preexec)
+    __kegon_absorb_precmd
+    __kegon_arrange_hooks
+fi

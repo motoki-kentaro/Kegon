@@ -332,6 +332,8 @@ pub struct TerminalSession {
     shell_program: String,
     integration_launch: crate::terminal::shell::ShellIntegrationLaunch,
     session_id: Option<String>,
+    /// The shell reads its Shell Integration scripts from here; they are deleted with the session.
+    _integration_files: Option<crate::terminal::unix_integration::IntegrationFiles>,
     /// Only the Unix PTY tests read it, to check that the child is reaped after drop.
     #[cfg(all(unix, test))]
     child_pid: u32,
@@ -455,6 +457,7 @@ impl TerminalSession {
         let _ = pty_sink.set(PtySink::EventLoop(event_loop_sender.clone()));
         let _join_handle = event_loop.spawn();
         let session_id = launch.session_id;
+        let integration_files = launch.integration_files;
 
         Ok(Self {
             term,
@@ -465,6 +468,7 @@ impl TerminalSession {
             shell_program,
             integration_launch,
             session_id,
+            _integration_files: integration_files,
             #[cfg(all(unix, test))]
             child_pid,
         })
@@ -2413,6 +2417,7 @@ mod tests {
             integrated: false,
             integration_launch: crate::terminal::shell::ShellIntegrationLaunch::Unsupported,
             session_id: None,
+            integration_files: None,
         };
         let (tx, _rx) = unbounded();
         let res = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx);
@@ -2435,6 +2440,7 @@ mod tests {
             integrated: false,
             integration_launch: crate::terminal::shell::ShellIntegrationLaunch::Unsupported,
             session_id: None,
+            integration_files: None,
         };
         assert_eq!(launch.config.args, vec!["-l".to_string()]);
         assert!(launch.login);
@@ -2558,6 +2564,7 @@ mod tests {
                 integrated: false,
                 integration_launch: crate::terminal::shell::ShellIntegrationLaunch::Unsupported,
                 session_id: None,
+                integration_files: None,
             }
         }
 

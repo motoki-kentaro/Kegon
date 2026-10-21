@@ -1,0 +1,13 @@
+# Kegon Shell Integration for zsh: stands in for ~/.zshenv (ZDOTDIR points at this directory).
+# The user's own file runs first, with ZDOTDIR set back to the user's value while it does.
+
+if [[ -n ${KEGON_SESSION_ID-} ]]; then
+    typeset -g __kegon_sid=$KEGON_SESSION_ID
+    unset KEGON_SESSION_ID
+fi
+__kegon_zdotdir=$ZDOTDIR
+ZDOTDIR=${KEGON_USER_ZDOTDIR:-$HOME}
+[[ -r "$ZDOTDIR/.zshenv" ]] && builtin source "$ZDOTDIR/.zshenv"
+KEGON_USER_ZDOTDIR=$ZDOTDIR
+ZDOTDIR=$__kegon_zdotdir
+unset __kegon_zdotdir

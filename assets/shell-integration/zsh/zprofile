@@ -1,0 +1,8 @@
+# Kegon Shell Integration for zsh: stands in for ~/.zprofile (login shells).
+
+__kegon_zdotdir=$ZDOTDIR
+ZDOTDIR=${KEGON_USER_ZDOTDIR:-$HOME}
+[[ -r "$ZDOTDIR/.zprofile" ]] && builtin source "$ZDOTDIR/.zprofile"
+KEGON_USER_ZDOTDIR=$ZDOTDIR
+ZDOTDIR=$__kegon_zdotdir
+unset __kegon_zdotdir

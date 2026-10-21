@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::settings::{ShellIntegrationMode, ShellMode, TerminalSettings, validate_shell_path};
+use crate::terminal::unix_integration::{self, IntegrationFiles, UserEnv};
 
 /// Environment variable that turns Shell Integration off when set to `0`.
 pub const SHELL_INTEGRATION_ENV: &str = "KEGON_SHELL_INTEGRATION";
@@ -202,6 +203,28 @@ impl ResolvedShell {
         existing_prompt: Option<&str>,
         working_directory: Option<PathBuf>,
     ) -> Result<ShellSpec, String> {
+        // bash, zsh and fish are integrated on Unix only: on Windows the same names are MSYS or
+        // Git builds whose paths and startup files the scripts do not account for.
+        let unix = cfg!(unix).then(|| (UserEnv::from_process(), unix_integration::default_base()));
+        self.build_spec_for(
+            integration_mode,
+            local_host,
+            existing_prompt,
+            working_directory,
+            unix.as_ref().map(|(user, base)| (user, base.as_path())),
+        )
+    }
+
+    /// [`Self::build_spec`] with the Unix integration's inputs given: the user's environment and
+    /// the directory for the hook scripts, or `None` to leave bash, zsh and fish unintegrated.
+    pub(crate) fn build_spec_for(
+        self,
+        integration_mode: ShellIntegrationMode,
+        local_host: &str,
+        existing_prompt: Option<&str>,
+        working_directory: Option<PathBuf>,
+        unix: Option<(&UserEnv, &Path)>,
+    ) -> Result<ShellSpec, String> {
         let enabled = match integration_mode {
             ShellIntegrationMode::Auto => {
                 !env::var(SHELL_INTEGRATION_ENV).is_ok_and(|v| v.trim() == "0")
@@ -225,6 +248,7 @@ impl ResolvedShell {
                 integrated: false,
                 integration_launch: ShellIntegrationLaunch::Disabled,
                 session_id: None,
+                integration_files: None,
             });
         }
 
@@ -237,6 +261,16 @@ impl ResolvedShell {
         let can_inject_powershell = false;
 
         let can_inject_cmd = self.args.is_empty() && self.kind.supports_cmd_integration();
+
+        // `None` (an unknown argument, or scripts that could not be written) leaves the plain
+        // shell, reported as `Unsupported`.
+        let unix_plan = unix.and_then(|(user, base)| {
+            let sid = generate_session_id();
+            unix_integration::prepare(
+                self.kind, &self.args, self.login, local_host, &sid, user, base,
+            )
+            .map(|plan| (sid, plan))
+        });
 
         if can_inject_powershell {
             let script = powershell_script(local_host);
@@ -258,6 +292,7 @@ impl ResolvedShell {
                 integrated: true,
                 integration_launch: ShellIntegrationLaunch::Injected,
                 session_id: Some(sid),
+                integration_files: None,
             })
         } else if can_inject_cmd {
             let prompt = format!("$E]9;9;$P$E\\{}", existing_prompt.unwrap_or("$P$G"));
@@ -273,6 +308,22 @@ impl ResolvedShell {
                 integrated: true,
                 integration_launch: ShellIntegrationLaunch::Unsupported, // cmd has no OSC 133 hooks
                 session_id: None,
+                integration_files: None,
+            })
+        } else if let Some((sid, plan)) = unix_plan {
+            Ok(ShellSpec {
+                config: ShellConfig {
+                    program: self.program,
+                    args: plan.args,
+                },
+                env: plan.env,
+                working_directory,
+                kind: self.kind,
+                login: self.login,
+                integrated: true,
+                integration_launch: ShellIntegrationLaunch::Injected,
+                session_id: Some(sid),
+                integration_files: Some(plan.files),
             })
         } else {
             // Integration is supported neither by shell nor by argument context.
@@ -289,6 +340,7 @@ impl ResolvedShell {
                 integrated: false,
                 integration_launch: ShellIntegrationLaunch::Unsupported,
                 session_id: None,
+                integration_files: None,
             })
         }
     }
@@ -320,6 +372,9 @@ pub struct ShellSpec {
     pub integration_launch: ShellIntegrationLaunch,
     /// The session identifier generated for this session, if integration is active.
     pub session_id: Option<String>,
+    /// Hook scripts of a Unix shell's integration; deleted when the last copy of this spec (and so
+    /// the session) is dropped.
+    pub integration_files: Option<IntegrationFiles>,
 }
 
 /// Backwards compatibility alias for [`ShellSpec`].
@@ -929,9 +984,10 @@ pub(crate) mod mock {
     /// A launch whose Shell Integration was injected, with its own session id, for tests of what
     /// happens downstream of injection (SID wiring, status, Dopamine) with synthetic markers.
     ///
-    /// Windows injects into PowerShell for real. Unix shells stay `Unsupported` until Slice 3, so
-    /// there an inert child (`/bin/cat`: it runs nothing typed into it and prints no markers) is
-    /// declared injected. Production code never builds such a spec.
+    /// Windows injects into PowerShell for real. On Unix the tests must not depend on which shell
+    /// is installed or how the user configured it, so there an inert child (`/bin/cat`: it runs
+    /// nothing typed into it and prints no markers) is declared injected. Production code never
+    /// builds such a spec.
     pub fn injected_launch(local_host: &str) -> ShellSpec {
         #[cfg(windows)]
         {
@@ -957,6 +1013,7 @@ pub(crate) mod mock {
                 integrated: true,
                 integration_launch: ShellIntegrationLaunch::Injected,
                 session_id: Some(sid),
+                integration_files: None,
             }
         }
     }
@@ -1053,8 +1110,9 @@ mod tests {
             assert_eq!(&launch.config, original);
             assert!(launch.env.is_empty());
         };
-        let bash = config("/bin/bash");
-        untouched(&Launch::new(bash.clone(), true, "PC", None), &bash);
+        // `sh` is integrated nowhere (bash, zsh and fish are, on Unix).
+        let sh = config("/bin/sh");
+        untouched(&Launch::new(sh.clone(), true, "PC", None), &sh);
         let pwsh = config("pwsh.exe");
         untouched(&Launch::new(pwsh.clone(), false, "PC", None), &pwsh);
         let with_args = ShellConfig {
@@ -1103,15 +1161,24 @@ mod tests {
         // Windows resolves PowerShell or cmd.exe, both set up to report their directory.
         #[cfg(windows)]
         assert!(launch.integrated);
-        // Unix shells have no Shell Integration until Slice 3.
+        // On Unix, bash, zsh and fish are integrated and any other shell is left plain; either
+        // way the invariant between the three fields holds.
         #[cfg(not(windows))]
         {
-            assert!(!launch.integrated);
-            assert_eq!(
-                launch.integration_launch,
-                ShellIntegrationLaunch::Unsupported
+            let integrated_kind = matches!(
+                launch.kind,
+                ShellKind::Bash | ShellKind::Zsh | ShellKind::Fish
             );
-            assert_eq!(launch.session_id(), None);
+            assert_eq!(launch.session_id().is_some(), launch.integrated);
+            if launch.integrated {
+                assert!(integrated_kind);
+                assert_eq!(launch.integration_launch, ShellIntegrationLaunch::Injected);
+            } else {
+                assert_eq!(
+                    launch.integration_launch,
+                    ShellIntegrationLaunch::Unsupported
+                );
+            }
         }
     }
 
@@ -1668,8 +1735,9 @@ mod tests {
             login: true,
         };
 
+        // Without the Unix inputs (as on Windows) a Unix shell is left exactly as resolved.
         let spec = resolved
-            .build_spec(ShellIntegrationMode::Auto, "HOST", None, None)
+            .build_spec_for(ShellIntegrationMode::Auto, "HOST", None, None, None)
             .expect("build spec");
 
         assert_eq!(spec.program(), "/bin/zsh");
@@ -1678,6 +1746,170 @@ mod tests {
         assert_eq!(spec.integration_launch, ShellIntegrationLaunch::Unsupported);
         assert!(!spec.integrated);
         assert_eq!(spec.session_id, None);
+        assert_eq!(spec.integration_files, None);
+    }
+
+    // --- Slice 3: Unix Shell Integration contract ---
+
+    fn unix_spec(
+        program: &str,
+        args: &[&str],
+        login: bool,
+        mode: ShellIntegrationMode,
+    ) -> ShellSpec {
+        let base = std::env::temp_dir();
+        ResolvedShell {
+            program: program.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            kind: ShellKind::from_program(program),
+            login,
+        }
+        .build_spec_for(
+            mode,
+            "HOST",
+            None,
+            None,
+            Some((&UserEnv::default(), base.as_path())),
+        )
+        .expect("build spec")
+    }
+
+    /// The invariant the rest of Kegon relies on to trust OSC 133 events.
+    fn assert_injection_invariant(spec: &ShellSpec) {
+        if spec.integration_launch == ShellIntegrationLaunch::Injected {
+            assert!(spec.integrated);
+            let sid = spec
+                .session_id
+                .as_deref()
+                .expect("injected has a session id");
+            assert_eq!(spec.env.get(SESSION_ID_ENV).map(String::as_str), Some(sid));
+            assert!(spec.integration_files.is_some());
+        } else {
+            assert!(!spec.integrated || spec.kind == ShellKind::Cmd);
+            assert_eq!(spec.session_id, None);
+            assert_eq!(spec.integration_files, None);
+        }
+    }
+
+    #[test]
+    fn auto_integrates_bash_zsh_and_fish_and_nothing_else() {
+        if env::var(SHELL_INTEGRATION_ENV).is_ok_and(|v| v.trim() == "0") {
+            return;
+        }
+        for program in ["/bin/bash", "/usr/bin/zsh", "/usr/local/bin/fish"] {
+            let spec = unix_spec(program, &[], false, ShellIntegrationMode::Auto);
+            assert_eq!(
+                spec.integration_launch,
+                ShellIntegrationLaunch::Injected,
+                "{program}"
+            );
+            assert_injection_invariant(&spec);
+            assert_eq!(spec.program(), program);
+        }
+        for program in ["/bin/sh", "/usr/bin/dash", "/usr/bin/nu", "/opt/odd/shell"] {
+            let spec = unix_spec(program, &[], false, ShellIntegrationMode::Auto);
+            assert_eq!(
+                spec.integration_launch,
+                ShellIntegrationLaunch::Unsupported,
+                "{program}"
+            );
+            assert_injection_invariant(&spec);
+            assert!(spec.args().is_empty() && spec.env.is_empty());
+        }
+    }
+
+    #[test]
+    fn disabled_stays_disabled_for_every_shell() {
+        for program in ["/bin/bash", "/bin/zsh", "/usr/bin/fish", "/bin/sh"] {
+            let spec = unix_spec(program, &["-l"], true, ShellIntegrationMode::Disabled);
+            assert_eq!(spec.integration_launch, ShellIntegrationLaunch::Disabled);
+            assert_injection_invariant(&spec);
+            // Exactly what the resolver chose, with no environment added.
+            assert_eq!(spec.args(), &["-l"]);
+            assert!(spec.env.is_empty());
+        }
+    }
+
+    #[test]
+    fn login_is_applied_once_and_only_through_args() {
+        if env::var(SHELL_INTEGRATION_ENV).is_ok_and(|v| v.trim() == "0") {
+            return;
+        }
+        let count = |spec: &ShellSpec| spec.args().iter().filter(|a| *a == "-l").count();
+        // zsh and fish keep the resolver's `-l`, once.
+        let zsh = unix_spec("/bin/zsh", &["-l"], true, ShellIntegrationMode::Auto);
+        assert_eq!(count(&zsh), 1);
+        assert!(zsh.login);
+        let fish = unix_spec("/usr/bin/fish", &["-l"], true, ShellIntegrationMode::Auto);
+        assert_eq!(count(&fish), 1);
+        // A login bash is a real login shell or nothing: untouched, `Unsupported`.
+        let bash = unix_spec("/bin/bash", &["-l"], true, ShellIntegrationMode::Auto);
+        assert_eq!(bash.args(), &["-l"]);
+        assert!(bash.login && bash.env.is_empty());
+        assert_eq!(bash.integration_launch, ShellIntegrationLaunch::Unsupported);
+        assert_injection_invariant(&bash);
+        // Plain Linux start: no login anywhere.
+        let linux = unix_spec("/bin/bash", &[], false, ShellIntegrationMode::Auto);
+        assert_eq!(linux.integration_launch, ShellIntegrationLaunch::Injected);
+        assert!(!linux.args().iter().any(|a| a == "-l"));
+    }
+
+    #[test]
+    fn user_arguments_make_the_shell_unsupported_not_half_integrated() {
+        for (program, args) in [
+            ("/bin/bash", vec!["--norc"]),
+            ("/bin/zsh", vec!["-f"]),
+            ("/usr/bin/fish", vec!["--private"]),
+        ] {
+            let spec = unix_spec(program, &args, false, ShellIntegrationMode::Auto);
+            assert_eq!(spec.integration_launch, ShellIntegrationLaunch::Unsupported);
+            assert_injection_invariant(&spec);
+            assert_eq!(spec.args(), args.as_slice());
+        }
+    }
+
+    #[test]
+    fn every_session_gets_its_own_identity_and_scripts() {
+        if env::var(SHELL_INTEGRATION_ENV).is_ok_and(|v| v.trim() == "0") {
+            return;
+        }
+        let first = unix_spec("/bin/bash", &[], false, ShellIntegrationMode::Auto);
+        let second = unix_spec("/bin/bash", &[], false, ShellIntegrationMode::Auto);
+        assert_ne!(first.session_id, second.session_id);
+        assert_ne!(
+            first.integration_files.as_ref().unwrap().path(),
+            second.integration_files.as_ref().unwrap().path()
+        );
+        assert_ne!(first.args(), second.args());
+        let dir = first
+            .integration_files
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+        // Cloning the spec shares the scripts; the last owner removes them.
+        let copy = first.clone();
+        drop(first);
+        assert!(dir.exists());
+        drop(copy);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn the_unix_scripts_are_never_used_on_windows() {
+        let resolved = ResolvedShell {
+            program: r"C:\Program Files\Gitinash.exe".to_string(),
+            args: vec![],
+            kind: ShellKind::Bash,
+            login: false,
+        };
+        let spec = resolved
+            .build_spec(ShellIntegrationMode::Auto, "HOST", None, None)
+            .expect("build spec");
+        if cfg!(windows) {
+            assert_eq!(spec.integration_launch, ShellIntegrationLaunch::Unsupported);
+            assert_injection_invariant(&spec);
+        }
     }
 
     // --- F-3: Error display format preservation test ---
