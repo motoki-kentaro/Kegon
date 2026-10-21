@@ -690,7 +690,11 @@ mod tests {
             events,
             vec![
                 OscEvent::ShellIntegration(Osc133Marker::PromptStarted),
-                OscEvent::WorkingDirectory(PathBuf::from(r"C:\works\kegon")),
+                OscEvent::WorkingDirectory(PathBuf::from(if cfg!(windows) {
+                    r"C:\works\kegon"
+                } else {
+                    "/C:/works/kegon"
+                })),
                 OscEvent::ShellIntegration(Osc133Marker::InputStarted),
                 OscEvent::ShellIntegration(Osc133Marker::CommandStarted),
                 OscEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),

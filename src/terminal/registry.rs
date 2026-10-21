@@ -749,21 +749,13 @@ mod tests {
     #[test]
     fn multi_tab_sid_wiring_isolation_and_lifecycle() {
         use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
-        use crate::terminal::shell::{Launch, ShellConfig};
+        use crate::terminal::shell::mock::injected_launch;
 
         let mut registry = TerminalRegistry::new();
         let tabs = tab_ids(2);
 
-        // Spawn Tab 0 with PowerShell launch
-        let launch0 = Launch::new(
-            ShellConfig {
-                program: "powershell.exe".to_string(),
-                args: vec![],
-            },
-            true,
-            "PC",
-            None,
-        );
+        // Spawn Tab 0 with an injected launch (PowerShell on Windows)
+        let launch0 = injected_launch("PC");
         let sid0 = launch0
             .session_id()
             .expect("launch0 must have session_id")
@@ -772,16 +764,8 @@ mod tests {
         let session0 = TerminalSession::spawn_launch(launch0, 80, 24, 10, 20, tx0).unwrap();
         registry.insert(tabs[0], session0).ok().unwrap();
 
-        // Spawn Tab 1 with PowerShell launch
-        let launch1 = Launch::new(
-            ShellConfig {
-                program: "powershell.exe".to_string(),
-                args: vec![],
-            },
-            true,
-            "PC",
-            None,
-        );
+        // Spawn Tab 1 with an injected launch (PowerShell on Windows)
+        let launch1 = injected_launch("PC");
         let sid1 = launch1
             .session_id()
             .expect("launch1 must have session_id")
@@ -878,9 +862,15 @@ mod tests {
         let mut registry = TerminalRegistry::new();
         let tabs = tab_ids(1);
 
+        // PowerShell would be injected on Windows if enabled; Unix spawns its POSIX shell.
+        let program = if cfg!(windows) {
+            "powershell.exe"
+        } else {
+            "/bin/sh"
+        };
         let launch = Launch::new(
             ShellConfig {
-                program: "powershell.exe".to_string(),
+                program: program.to_string(),
                 args: vec![],
             },
             false, // Disabled!

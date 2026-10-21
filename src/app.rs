@@ -3635,6 +3635,37 @@ mod tests {
         app.workbench.tabs().active().unwrap().id
     }
 
+    /// Gives `tab` a session whose Shell Integration was injected, the precondition for the
+    /// synthetic OSC 133 markers these tests send to count. The default Windows shell
+    /// (PowerShell) is injected for real; Unix shells stay `Unsupported` until Slice 3, so there
+    /// the session is replaced with one from [`injected_launch`].
+    ///
+    /// [`injected_launch`]: crate::terminal::shell::mock::injected_launch
+    fn integrate_terminal(app: &mut Kegon, tab: TabId) {
+        #[cfg(windows)]
+        let _ = (app, tab);
+        #[cfg(not(windows))]
+        {
+            use crate::terminal::shell::mock::injected_launch;
+            let (cols, rows) = app.terminal_grid_size();
+            let metrics = app.terminal_font_config.metrics;
+            let session = TerminalSession::spawn_launch(
+                injected_launch(&crate::terminal::cwd::local_host_name()),
+                cols,
+                rows,
+                metrics.cell_width as u16,
+                metrics.cell_height as u16,
+                tagged_sink(&app.terminal_event_tx, tab),
+            )
+            .expect("injected test session");
+            assert!(
+                app.terminals.remove(tab).is_some(),
+                "no terminal to integrate"
+            );
+            assert!(app.terminals.insert(tab, session).is_ok());
+        }
+    }
+
     /// Adds a second terminal tab with its own session, tagging events the way production does.
     fn add_terminal_tab(app: &mut Kegon) -> TabId {
         let previous = active_tab(app);
@@ -5729,9 +5760,12 @@ mod tests {
     fn terminal_tab_spawning_with_custom_shell() {
         let mut app = new_test_app(Locale::EnUs);
         app.update(Message::SettingsShellModeChanged(ShellMode::Custom));
-        app.update(Message::SettingsShellPathChanged(
-            r"C:\Windows\System32\cmd.exe".to_string(),
-        ));
+        let shell = if cfg!(windows) {
+            r"C:\Windows\System32\cmd.exe"
+        } else {
+            "/bin/sh"
+        };
+        app.update(Message::SettingsShellPathChanged(shell.to_string()));
 
         let initial_tabs = app.workbench.tabs().len();
         let new_tab = app.open_terminal_tab();
@@ -5819,6 +5853,8 @@ mod tests {
 
         // Open second tab
         let tab1 = app.open_terminal_tab().unwrap();
+        integrate_terminal(&mut app, tab0);
+        integrate_terminal(&mut app, tab1);
 
         // Initial tooltip exists for both tabs
         assert!(app.terminal_tab_tooltip(tab0).is_some());
@@ -5886,6 +5922,7 @@ mod tests {
 
         let mut app = new_test_app(Locale::JaJp);
         let tab = app.workbench.tabs().active().unwrap().id;
+        integrate_terminal(&mut app, tab);
 
         app.update(Message::TerminalEventReceived(
             tab,
@@ -5927,6 +5964,7 @@ mod tests {
 
         let mut app = new_test_app(Locale::JaJp);
         let tab = app.workbench.tabs().active().unwrap().id;
+        integrate_terminal(&mut app, tab);
 
         // Fresh tab: status waiting, no command executed
         let init_lines = app.terminal_tab_tooltip_lines(tab).unwrap();
@@ -6070,6 +6108,7 @@ mod tests {
 
         let mut app = new_test_app(Locale::EnUs);
         let tab = app.workbench.tabs().active().unwrap().id;
+        integrate_terminal(&mut app, tab);
 
         app.terminals
             .command_state_machine_mut(tab)
@@ -6122,6 +6161,63 @@ mod tests {
         assert!(result.correlation.is_matched());
     }
 
+    /// Unix shells have no Shell Integration until Slice 3: the tooltip says so in both locales,
+    /// and markers that would be trusted on an injected session neither promote the status nor
+    /// reach Dopamine Mode.
+    #[cfg(unix)]
+    #[test]
+    fn terminal_tab_tooltip_and_dopamine_on_an_unsupported_unix_shell() {
+        use crate::terminal::integration::{Osc133Marker, Osc133Metadata, ShellReportedStatus};
+
+        for (locale, expected) in [
+            (Locale::EnUs, "Shell Integration: Unsupported"),
+            (Locale::JaJp, "Shell Integration: 非対応"),
+        ] {
+            let mut app = new_test_app(locale);
+            app.update(Message::SettingsDopamineToggled(true));
+            let tab = active_tab(&app);
+            assert_eq!(
+                app.terminals.shell_integration_status(tab),
+                Some(ShellIntegrationStatus::Unsupported)
+            );
+            assert_eq!(app.terminal_tab_tooltip_lines(tab).unwrap()[1], expected);
+
+            app.terminals
+                .command_state_machine_mut(tab)
+                .unwrap()
+                .set_expected_session_id(Some("UNIX_SID".into()));
+            let meta = |shell_status| Osc133Metadata {
+                version: 1,
+                session_id: "UNIX_SID".into(),
+                seq: 1,
+                shell_status,
+            };
+            for marker in [
+                Osc133Marker::PromptStarted,
+                Osc133Marker::InputStarted,
+                Osc133Marker::CommandStartedWithMetadata(meta(ShellReportedStatus::Unknown)),
+                Osc133Marker::IndependentMetadata(meta(ShellReportedStatus::Success)),
+                Osc133Marker::CommandFinished(Some(0)),
+            ] {
+                app.update(Message::TerminalEventReceived(
+                    tab,
+                    TerminalEvent::ShellIntegration(marker),
+                ));
+            }
+
+            assert_eq!(
+                app.terminals.shell_integration_status(tab),
+                Some(ShellIntegrationStatus::Unsupported)
+            );
+            assert_eq!(app.terminal_tab_tooltip_lines(tab).unwrap()[1], expected);
+            assert!(
+                app.dopamine
+                    .border_for_tab(tab, std::time::Instant::now())
+                    .is_none()
+            );
+        }
+    }
+
     #[test]
     fn dopamine_command_completion_border_success_rainbow_and_failure_red() {
         use crate::terminal::BorderKind;
@@ -6130,6 +6226,7 @@ mod tests {
         let mut app = new_test_app(Locale::JaJp);
         app.update(Message::SettingsDopamineToggled(true));
         let tab = active_tab(&app);
+        integrate_terminal(&mut app, tab);
 
         // Ensure session has expected session ID
         app.terminals
@@ -6166,16 +6263,15 @@ mod tests {
                 shell_status: ShellReportedStatus::Success,
             })),
         ));
+        // The border starts while this message is handled, so at this instant it has not faded.
+        let finished = std::time::Instant::now();
         app.update(Message::TerminalEventReceived(
             tab,
             TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
         ));
 
         // Border effect must be Rainbow with 100% initial opacity
-        let border = app
-            .dopamine
-            .border_for_tab(tab, std::time::Instant::now())
-            .unwrap();
+        let border = app.dopamine.border_for_tab(tab, finished).unwrap();
         assert_eq!(border.kind, BorderKind::Rainbow);
         assert!((border.alpha - 1.0).abs() < 1e-4);
         assert!(app.dopamine.has_active_animations());
@@ -6211,16 +6307,15 @@ mod tests {
                 shell_status: ShellReportedStatus::Failure,
             })),
         ));
+        // The border starts while this message is handled, so at this instant it has not faded.
+        let finished = std::time::Instant::now();
         app.update(Message::TerminalEventReceived(
             tab,
             TerminalEvent::ShellIntegration(Osc133Marker::CommandFinished(None)),
         ));
 
         // Border effect must be replaced with Red at 100% opacity
-        let border2 = app
-            .dopamine
-            .border_for_tab(tab, std::time::Instant::now())
-            .unwrap();
+        let border2 = app.dopamine.border_for_tab(tab, finished).unwrap();
         assert_eq!(border2.kind, BorderKind::Red);
         assert!((border2.alpha - 1.0).abs() < 1e-4);
         // The trusted failure played the failure sound exactly once.
@@ -6234,6 +6329,7 @@ mod tests {
         let mut app = new_test_app(Locale::JaJp);
         app.update(Message::SettingsDopamineToggled(true));
         let tab = active_tab(&app);
+        integrate_terminal(&mut app, tab);
         app.terminals
             .command_state_machine_mut(tab)
             .unwrap()
@@ -6384,6 +6480,8 @@ mod tests {
         app.update(Message::NewTerminalTab);
         let tab2 = active_tab(&app);
         assert_ne!(tab1, tab2);
+        integrate_terminal(&mut app, tab1);
+        integrate_terminal(&mut app, tab2);
 
         app.terminals
             .command_state_machine_mut(tab1)
@@ -6452,6 +6550,7 @@ mod tests {
         app.terminal_focused = true;
         app.update(Message::SettingsDopamineToggled(true));
         let tab = active_tab(&app);
+        integrate_terminal(&mut app, tab);
 
         let type_char = |app: &mut Kegon, s: &str| {
             app.handle_iced_event(Event::Keyboard(keyboard::Event::KeyPressed {
@@ -6579,6 +6678,7 @@ mod tests {
         app.terminal_focused = true;
         app.update(Message::SettingsDopamineToggled(true));
         let tab1 = active_tab(&app);
+        integrate_terminal(&mut app, tab1);
 
         // Type on tab1: 2 tokens
         app.dopamine
@@ -6631,6 +6731,7 @@ mod tests {
         app.update(Message::NewTerminalTab);
         let tab2 = active_tab(&app);
         assert_ne!(tab1, tab2);
+        integrate_terminal(&mut app, tab2);
         assert_eq!(app.dopamine.combo_for_tab(tab2, Instant::now()), 0);
         assert_eq!(app.dopamine.gauge_for_tab(tab2), 0);
 
@@ -7328,6 +7429,7 @@ mod tests {
             let mut app = new_test_app(Locale::JaJp);
             app.update(Message::SettingsDopamineToggled(true));
             let tab = active_tab(&app);
+            integrate_terminal(&mut app, tab);
             let now = std::time::Instant::now() - std::time::Duration::from_secs(2);
             app.dopamine.on_text_input(tab, &"x ".repeat(100), now);
             app.update(Message::DopamineTicked(now + COMBO_TIMEOUT));
@@ -7483,6 +7585,8 @@ mod tests {
         app.dopamine.audio().install_burst_pcm_for_test();
         let a = active_tab(&app);
         let b = add_terminal_tab(&mut app);
+        integrate_terminal(&mut app, a);
+        integrate_terminal(&mut app, b);
         for tab in [a, b] {
             app.terminals
                 .command_state_machine_mut(tab)

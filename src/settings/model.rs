@@ -445,10 +445,10 @@ pub fn validate_shell_path(raw: &str) -> Result<PathBuf, ShellPathError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = path.metadata() {
-            if meta.permissions().mode() & 0o111 == 0 {
-                return Err(ShellPathError::NotExecutable);
-            }
+        if let Ok(meta) = path.metadata()
+            && meta.permissions().mode() & 0o111 == 0
+        {
+            return Err(ShellPathError::NotExecutable);
         }
     }
 

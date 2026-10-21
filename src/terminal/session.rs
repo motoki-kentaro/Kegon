@@ -332,7 +332,8 @@ pub struct TerminalSession {
     shell_program: String,
     integration_launch: crate::terminal::shell::ShellIntegrationLaunch,
     session_id: Option<String>,
-    #[cfg(unix)]
+    /// Only the Unix PTY tests read it, to check that the child is reaped after drop.
+    #[cfg(all(unix, test))]
     child_pid: u32,
 }
 
@@ -418,7 +419,7 @@ impl TerminalSession {
 
         let pty =
             tty::new(&options, window_size, 0).map_err(|e| format!("Failed to spawn PTY: {e}"))?;
-        #[cfg(unix)]
+        #[cfg(all(unix, test))]
         let child_pid = pty.child().id();
         let pty = TappedPty {
             inner: pty,
@@ -464,13 +465,13 @@ impl TerminalSession {
             shell_program,
             integration_launch,
             session_id,
-            #[cfg(unix)]
+            #[cfg(all(unix, test))]
             child_pid,
         })
     }
 
     /// Returns the OS process ID of the child process on Unix.
-    #[cfg(unix)]
+    #[cfg(all(unix, test))]
     pub fn child_pid(&self) -> u32 {
         self.child_pid
     }
@@ -721,14 +722,19 @@ fn wait_for_shells_at_test_exit() {
 pub const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How waiting for the shells of closed sessions ended.
+///
+/// Only the Windows fork reports anything but [`ShellCleanup::Complete`]; Unix sessions reap their
+/// child on drop, so the other outcomes exist there only for the tests of their warnings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellCleanup {
     /// Every shell is gone.
     Complete,
     /// The wait ran out while `pending` shells were still being closed or reaped (`unresolved`
     /// others could not be confirmed gone before).
+    #[cfg(any(windows, test))]
     TimedOut { pending: usize, unresolved: usize },
     /// Nothing is pending, but `unresolved` shells could not be confirmed gone.
+    #[cfg(any(windows, test))]
     Unconfirmed { unresolved: usize },
 }
 
@@ -742,14 +748,18 @@ impl ShellCleanup {
     /// being closed when the process exits) and a shell that could not be confirmed gone are
     /// worded differently.
     pub fn exit_warning(self, timeout: std::time::Duration) -> Option<String> {
+        #[cfg(not(any(windows, test)))]
+        let _ = timeout;
         match self {
             ShellCleanup::Complete => None,
+            #[cfg(any(windows, test))]
             ShellCleanup::TimedOut {
                 pending,
                 unresolved,
             } => Some(format!(
                 "{pending} shell(s) were still being closed after {timeout:?} and may be left                  running ({unresolved} more could not be confirmed gone)"
             )),
+            #[cfg(any(windows, test))]
             ShellCleanup::Unconfirmed { unresolved } => Some(format!(
                 "{unresolved} shell(s) could not be confirmed gone and may be left running"
             )),
@@ -2500,6 +2510,7 @@ mod tests {
     #[cfg(unix)]
     mod unix_tests {
         use super::*;
+        use alacritty_terminal::term::cell::Flags;
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
@@ -2515,12 +2526,13 @@ mod tests {
                     let grid = term.grid();
                     for line in 0..grid.screen_lines() as i32 {
                         let text: String = (0..grid.columns())
-                            .map(|col| {
-                                grid[alacritty_terminal::index::Point::new(
+                            .filter_map(|col| {
+                                let cell = &grid[alacritty_terminal::index::Point::new(
                                     alacritty_terminal::index::Line(line),
                                     alacritty_terminal::index::Column(col),
-                                )]
-                                .c
+                                )];
+                                // Wide glyphs occupy two cells; the second is not text.
+                                (!cell.flags.contains(Flags::WIDE_CHAR_SPACER)).then_some(cell.c)
                             })
                             .collect();
                         if text.contains(expected) {

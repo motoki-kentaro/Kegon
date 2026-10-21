@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::env;
+#[cfg(any(windows, test))]
 use std::ffi::OsString;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
@@ -76,6 +77,7 @@ impl ShellKind {
     }
 
     /// Whether this shell supports PowerShell-style OSC 133 encoded script injection.
+    #[cfg(windows)]
     pub fn supports_powershell_integration(&self) -> bool {
         matches!(self, Self::PowerShell | Self::WindowsPowerShell)
     }
@@ -445,9 +447,11 @@ impl ShellSpec {
 pub trait ShellEnvironment {
     /// Returns the value of an environment variable.
     fn var(&self, key: &str) -> Option<String>;
-    /// Returns the raw OsString value of an environment variable.
+    /// Returns the raw OsString value of an environment variable (Windows resolver: `PATH`).
+    #[cfg(any(windows, test))]
     fn var_os(&self, key: &str) -> Option<OsString>;
-    /// Checks whether `path` exists and is a regular file.
+    /// Checks whether `path` exists and is a regular file (Windows resolver).
+    #[cfg(any(windows, test))]
     fn is_file(&self, path: &Path) -> bool;
     /// Checks whether `path` exists, is a regular file, and is executable.
     fn is_executable(&self, path: &Path) -> bool;
@@ -465,10 +469,12 @@ impl ShellEnvironment for OsEnvironment {
         env::var(key).ok()
     }
 
+    #[cfg(any(windows, test))]
     fn var_os(&self, key: &str) -> Option<OsString> {
         env::var_os(key)
     }
 
+    #[cfg(any(windows, test))]
     fn is_file(&self, path: &Path) -> bool {
         path.is_file()
     }
@@ -643,6 +649,10 @@ impl<E: ShellEnvironment> ShellResolver<E> {
     /// 1. `pwsh.exe` in PATH or Program Files
     /// 2. `powershell.exe` in PATH or System32
     /// 3. `%ComSpec%` or `cmd.exe`
+    ///
+    /// Only `resolve_default` on Windows calls this. Unix test builds keep it so the precedence
+    /// tests that do not depend on Windows path syntax run there too.
+    #[cfg(any(windows, test))]
     pub fn resolve_windows(&self) -> Result<ResolvedShell, ShellResolveError> {
         let mut searched = Vec::new();
 
@@ -779,6 +789,7 @@ impl<E: ShellEnvironment> ShellResolver<E> {
         Err(ShellResolveError::NoShellFound { searched })
     }
 
+    #[cfg(any(windows, test))]
     fn find_in_path(&self, executable: &str) -> Option<String> {
         let path_var = self.env.var_os("PATH")?;
         for dir in env::split_paths(&path_var) {
@@ -790,6 +801,7 @@ impl<E: ShellEnvironment> ShellResolver<E> {
         None
     }
 
+    #[cfg(any(windows, test))]
     fn find_pwsh_standard(&self) -> Option<String> {
         if let Some(pf) = self.env.var("ProgramFiles") {
             let p = Path::new(&pf).join("PowerShell").join("7").join("pwsh.exe");
@@ -800,6 +812,7 @@ impl<E: ShellEnvironment> ShellResolver<E> {
         None
     }
 
+    #[cfg(any(windows, test))]
     fn find_system_powershell(&self) -> Option<String> {
         if let Some(windir) = self.env.var("SystemRoot") {
             let p = Path::new(&windir)
@@ -912,6 +925,41 @@ pub(crate) mod mock {
             self.login_shell.clone()
         }
     }
+
+    /// A launch whose Shell Integration was injected, with its own session id, for tests of what
+    /// happens downstream of injection (SID wiring, status, Dopamine) with synthetic markers.
+    ///
+    /// Windows injects into PowerShell for real. Unix shells stay `Unsupported` until Slice 3, so
+    /// there an inert child (`/bin/cat`: it runs nothing typed into it and prints no markers) is
+    /// declared injected. Production code never builds such a spec.
+    pub fn injected_launch(local_host: &str) -> ShellSpec {
+        #[cfg(windows)]
+        {
+            let config = ShellConfig {
+                program: "powershell.exe".to_string(),
+                args: vec![],
+            };
+            ShellSpec::new(config, true, local_host, None)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = local_host;
+            let sid = generate_session_id();
+            ShellSpec {
+                config: ShellConfig {
+                    program: "/bin/cat".to_string(),
+                    args: vec![],
+                },
+                env: HashMap::from([(SESSION_ID_ENV.to_string(), sid.clone())]),
+                working_directory: None,
+                kind: ShellKind::Other,
+                login: false,
+                integrated: true,
+                integration_launch: ShellIntegrationLaunch::Injected,
+                session_id: Some(sid),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -939,16 +987,32 @@ mod tests {
             "powershell.exe",
         ] {
             let launch = Launch::new(config(program), true, "PC", None);
-            assert!(launch.integrated);
             assert_eq!(launch.config.program, program);
-            assert_eq!(launch.config.args[..2], ["-NoExit", "-EncodedCommand"]);
-            assert_eq!(launch.env.len(), 1);
-            let sid = launch
-                .env
-                .get(SESSION_ID_ENV)
-                .expect("must contain KEGON_SESSION_ID");
-            assert!(crate::terminal::osc::is_valid_session_id(sid));
-            assert_eq!(launch.session_id(), Some(sid.as_str()));
+            #[cfg(windows)]
+            {
+                assert!(launch.integrated);
+                assert_eq!(launch.integration_launch, ShellIntegrationLaunch::Injected);
+                assert_eq!(launch.config.args[..2], ["-NoExit", "-EncodedCommand"]);
+                assert_eq!(launch.env.len(), 1);
+                let sid = launch
+                    .env
+                    .get(SESSION_ID_ENV)
+                    .expect("must contain KEGON_SESSION_ID");
+                assert!(crate::terminal::osc::is_valid_session_id(sid));
+                assert_eq!(launch.session_id(), Some(sid.as_str()));
+            }
+            // Unix PowerShell integration is deferred to Slice 3: nothing is injected.
+            #[cfg(not(windows))]
+            {
+                assert!(!launch.integrated);
+                assert_eq!(
+                    launch.integration_launch,
+                    ShellIntegrationLaunch::Unsupported
+                );
+                assert!(launch.config.args.is_empty());
+                assert!(launch.env.is_empty());
+                assert_eq!(launch.session_id(), None);
+            }
         }
     }
 
@@ -967,9 +1031,16 @@ mod tests {
 
     #[test]
     fn cmd_gets_a_prompt_prefix_that_keeps_the_existing_prompt() {
-        let launch = Launch::new(config("C:\\Windows\\System32\\cmd.exe"), true, "PC", None);
-        assert!(launch.config.args.is_empty());
-        assert_eq!(launch.env["PROMPT"], "$E]9;9;$P$E\\$P$G");
+        // `\` separates the path only under Windows path syntax.
+        #[cfg(windows)]
+        {
+            let launch = Launch::new(config("C:\\Windows\\System32\\cmd.exe"), true, "PC", None);
+            assert!(launch.config.args.is_empty());
+            assert_eq!(launch.env["PROMPT"], "$E]9;9;$P$E\\$P$G");
+        }
+        let bare = Launch::new(config("cmd.exe"), true, "PC", None);
+        assert!(bare.config.args.is_empty());
+        assert_eq!(bare.env["PROMPT"], "$E]9;9;$P$E\\$P$G");
 
         let custom = Launch::new(config("cmd.exe"), true, "PC", Some("$T $P$G"));
         assert_eq!(custom.env["PROMPT"], "$E]9;9;$P$E\\$T $P$G");
@@ -1029,7 +1100,19 @@ mod tests {
     fn launch_from_settings_auto_auto() {
         let settings = crate::settings::TerminalSettings::default();
         let launch = Launch::from_settings(&settings, None).expect("should resolve auto launch");
+        // Windows resolves PowerShell or cmd.exe, both set up to report their directory.
+        #[cfg(windows)]
         assert!(launch.integrated);
+        // Unix shells have no Shell Integration until Slice 3.
+        #[cfg(not(windows))]
+        {
+            assert!(!launch.integrated);
+            assert_eq!(
+                launch.integration_launch,
+                ShellIntegrationLaunch::Unsupported
+            );
+            assert_eq!(launch.session_id(), None);
+        }
     }
 
     #[test]
@@ -1042,6 +1125,7 @@ mod tests {
         assert!(launch.env.is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn launch_from_settings_custom_cmd() {
         let mut settings = crate::settings::TerminalSettings::default();
@@ -1056,6 +1140,7 @@ mod tests {
         assert!(launch.env.contains_key("PROMPT"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn launch_from_settings_custom_powershell_and_disabled() {
         if let Some(pwsh_path) = installed::pwsh().or_else(installed::windows_powershell) {
@@ -1131,10 +1216,6 @@ mod tests {
             ShellKind::from_program("/usr/bin/pwsh"),
             ShellKind::PowerShell
         );
-        assert_eq!(
-            ShellKind::from_program(r"C:\Program Files\PowerShell\7\pwsh.exe"),
-            ShellKind::PowerShell
-        );
 
         assert_eq!(
             ShellKind::from_program("powershell"),
@@ -1144,17 +1225,28 @@ mod tests {
             ShellKind::from_program("powershell.exe"),
             ShellKind::WindowsPowerShell
         );
-        assert_eq!(
-            ShellKind::from_program(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
-            ShellKind::WindowsPowerShell
-        );
 
         assert_eq!(ShellKind::from_program("cmd"), ShellKind::Cmd);
         assert_eq!(ShellKind::from_program("cmd.exe"), ShellKind::Cmd);
-        assert_eq!(
-            ShellKind::from_program(r"C:\Windows\System32\cmd.exe"),
-            ShellKind::Cmd
-        );
+
+        // `\` separates the path only under Windows path syntax.
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                ShellKind::from_program(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+                ShellKind::PowerShell
+            );
+            assert_eq!(
+                ShellKind::from_program(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                ),
+                ShellKind::WindowsPowerShell
+            );
+            assert_eq!(
+                ShellKind::from_program(r"C:\Windows\System32\cmd.exe"),
+                ShellKind::Cmd
+            );
+        }
 
         assert_eq!(ShellKind::from_program("bash"), ShellKind::Bash);
         assert_eq!(ShellKind::from_program("/bin/bash"), ShellKind::Bash);
@@ -1174,6 +1266,10 @@ mod tests {
         assert_eq!(ShellKind::from_program("nu"), ShellKind::Other);
     }
 
+    // These three search directories with the host's `std::path` and `env::split_paths`
+    // (`;`-separated, `\`-joined only on Windows), so their Windows paths mean nothing elsewhere.
+    // The ComSpec fallbacks below do not touch paths and run everywhere.
+    #[cfg(windows)]
     #[test]
     fn windows_resolver_prefers_pwsh_in_path() {
         let env = MockEnvironment::new()
@@ -1188,6 +1284,7 @@ mod tests {
         assert_eq!(res.args, Vec::<String>::new());
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_resolver_finds_pwsh_in_program_files() {
         let env = MockEnvironment::new()
@@ -1201,6 +1298,7 @@ mod tests {
         assert_eq!(res.kind, ShellKind::PowerShell);
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_resolver_falls_back_to_powershell() {
         let env = MockEnvironment::new()
