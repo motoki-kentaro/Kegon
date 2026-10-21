@@ -5229,7 +5229,10 @@ mod tests {
             let mut term = session.term().lock();
             use alacritty_terminal::vte::ansi::Processor;
             let mut parser: Processor = Processor::new();
-            parser.advance(&mut *term, b"Hello World\r\n");
+            // The session runs a real shell, whose prompt may already be on row 0; clear the
+            // screen and home the cursor so "Hello" is what the selection below reads.
+            parser.advance(&mut *term, b"runner@host:~$ ");
+            parser.advance(&mut *term, b"\x1b[2J\x1b[HHello World\r\n");
         }
 
         assert!(!app.active_session().unwrap().has_selection());
