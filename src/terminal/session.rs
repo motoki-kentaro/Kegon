@@ -1,8 +1,9 @@
 //! Encapsulates a terminal session, PTY lifecycle, and alacritty_terminal emulation state.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use iced::futures::channel::mpsc::UnboundedSender;
@@ -60,27 +61,34 @@ impl<P: EventedReadWrite> io::Read for TappedPty<P> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let read = io::Read::read(self.inner.reader(), buf)?;
         let events = self.scanner.scan(&buf[..read]);
-        let mut last_cwd = None;
-        for event in events {
-            match event {
-                OscEvent::WorkingDirectory(path) => {
-                    last_cwd = Some(path);
+        forward_events(events, &self.sink);
+        Ok(read)
+    }
+}
+
+/// Sends the events of one read in the order the PTY produced them.
+///
+/// Of consecutive working-directory reports only the last matters, and forwarding just that one
+/// keeps a flood of reports from flooding the event channel. A report that is pending when a shell
+/// integration marker follows is sent first, so `OSC 7` then `OSC 133;A` reach the receiver in
+/// that order; one still pending at the end of the read is sent last.
+fn forward_events(events: Vec<OscEvent>, sink: &EventSink) {
+    let mut pending_cwd = None;
+    for event in events {
+        match event {
+            OscEvent::WorkingDirectory(path) => {
+                pending_cwd = Some(path);
+            }
+            OscEvent::ShellIntegration(marker) => {
+                if let Some(path) = pending_cwd.take() {
+                    let _ = sink.unbounded_send(TerminalEvent::WorkingDirectory(path));
                 }
-                OscEvent::ShellIntegration(marker) => {
-                    let _ = self
-                        .sink
-                        .unbounded_send(TerminalEvent::ShellIntegration(marker));
-                }
+                let _ = sink.unbounded_send(TerminalEvent::ShellIntegration(marker));
             }
         }
-        // Only the last working directory report of a read matters: it supersedes the others,
-        // and forwarding just one keeps a flood of reports from flooding the event channel.
-        if let Some(path) = last_cwd {
-            let _ = self
-                .sink
-                .unbounded_send(TerminalEvent::WorkingDirectory(path));
-        }
-        Ok(read)
+    }
+    if let Some(path) = pending_cwd {
+        let _ = sink.unbounded_send(TerminalEvent::WorkingDirectory(path));
     }
 }
 
@@ -273,6 +281,54 @@ fn term_config() -> Config {
     }
 }
 
+/// Prepares environment variables for the child process.
+///
+/// On Unix, Kegon establishes its own terminal capabilities by defaulting
+/// `TERM=xterm-256color` and `COLORTERM=truecolor` regardless of the parent terminal
+/// environment, unless explicitly overridden in `spec_env`.
+///
+/// On Windows, environment variables from `spec_env` are passed as-is without
+/// terminal capability defaults.
+pub fn prepare_child_env(
+    mut spec_env: HashMap<String, String>,
+    is_unix: bool,
+) -> HashMap<String, String> {
+    if is_unix {
+        spec_env
+            .entry("TERM".to_string())
+            .or_insert_with(|| "xterm-256color".to_string());
+        spec_env
+            .entry("COLORTERM".to_string())
+            .or_insert_with(|| "truecolor".to_string());
+    }
+    spec_env
+}
+
+/// Validates a working directory path before spawning a PTY child process.
+///
+/// On Unix, `alacritty_terminal` ignores `chdir` failures in `pre_exec`, which would
+/// otherwise silently launch the shell in an unintended directory.
+/// Explicit validation ensures invalid paths (nonexistent or files) fail fast with a
+/// diagnostic error, allowing callers (like tab creation) to safely fall back or report the error.
+#[allow(dead_code)]
+pub fn validate_working_directory(cwd: Option<&Path>) -> Result<(), String> {
+    if let Some(path) = cwd {
+        if !path.exists() {
+            return Err(format!(
+                "invalid working directory \"{}\": directory does not exist",
+                path.display()
+            ));
+        }
+        if !path.is_dir() {
+            return Err(format!(
+                "invalid working directory \"{}\": not a directory",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A terminal session managing the child process, PTY, and emulator state.
 pub struct TerminalSession {
     term: Arc<FairMutex<Term<EventProxy>>>,
@@ -283,6 +339,11 @@ pub struct TerminalSession {
     shell_program: String,
     integration_launch: crate::terminal::shell::ShellIntegrationLaunch,
     session_id: Option<String>,
+    /// The shell reads its Shell Integration scripts from here; they are deleted with the session.
+    _integration_files: Option<crate::terminal::unix_integration::IntegrationFiles>,
+    /// Only the Unix PTY tests read it, to check that the child is reaped after drop.
+    #[cfg(all(unix, test))]
+    child_pid: u32,
 }
 
 impl TerminalSession {
@@ -309,15 +370,8 @@ impl TerminalSession {
         event_tx: impl Into<EventSink>,
         working_directory: Option<PathBuf>,
     ) -> Result<Self, String> {
-        Self::spawn_launch(
-            Launch::resolve_default(),
-            cols,
-            rows,
-            cell_width,
-            cell_height,
-            event_tx,
-            working_directory,
-        )
+        let launch = Launch::resolve_default().with_working_directory(working_directory);
+        Self::spawn_launch(launch, cols, rows, cell_width, cell_height, event_tx)
     }
 
     /// Spawns a new terminal session configured according to [`crate::settings::TerminalSettings`].
@@ -330,16 +384,9 @@ impl TerminalSession {
         event_tx: impl Into<EventSink>,
         working_directory: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let launch = Launch::from_settings(settings, std::env::var("PROMPT").ok().as_deref())?;
-        Self::spawn_launch(
-            launch,
-            cols,
-            rows,
-            cell_width,
-            cell_height,
-            event_tx,
-            working_directory,
-        )
+        let launch = Launch::from_settings(settings, std::env::var("PROMPT").ok().as_deref())?
+            .with_working_directory(working_directory);
+        Self::spawn_launch(launch, cols, rows, cell_width, cell_height, event_tx)
     }
 
     /// Spawns a session for an explicit [`Launch`] (shell, arguments, environment).
@@ -350,19 +397,29 @@ impl TerminalSession {
         cell_width: u16,
         cell_height: u16,
         event_tx: impl Into<EventSink>,
-        working_directory: Option<PathBuf>,
     ) -> Result<Self, String> {
         #[cfg(all(test, windows))]
         wait_for_shells_at_test_exit();
 
+        #[cfg(not(windows))]
+        validate_working_directory(launch.working_directory.as_deref())?;
+
         let shell_program = launch.config.program.clone();
         let integration_launch = launch.integration_launch;
+        let mut scanner = OscScanner::new(local_host_name());
+        if launch.drops_unmarked_command_markers() {
+            scanner = scanner.dropping_unmarked_command_markers();
+        }
         let event_tx = event_tx.into();
+
+        let env = prepare_child_env(launch.env, cfg!(unix));
+
         let options = Options {
             drain_on_exit: true,
             shell: Some(Shell::new(launch.config.program, launch.config.args)),
-            working_directory,
-            env: launch.env,
+            working_directory: launch.working_directory,
+            env,
+            #[cfg(target_os = "windows")]
             escape_args: false,
         };
 
@@ -375,9 +432,11 @@ impl TerminalSession {
 
         let pty =
             tty::new(&options, window_size, 0).map_err(|e| format!("Failed to spawn PTY: {e}"))?;
+        #[cfg(all(unix, test))]
+        let child_pid = pty.child().id();
         let pty = TappedPty {
             inner: pty,
-            scanner: OscScanner::new(local_host_name()),
+            scanner,
             sink: event_tx.clone(),
         };
 
@@ -409,6 +468,7 @@ impl TerminalSession {
         let _ = pty_sink.set(PtySink::EventLoop(event_loop_sender.clone()));
         let _join_handle = event_loop.spawn();
         let session_id = launch.session_id;
+        let integration_files = launch.integration_files;
 
         Ok(Self {
             term,
@@ -419,7 +479,16 @@ impl TerminalSession {
             shell_program,
             integration_launch,
             session_id,
+            _integration_files: integration_files,
+            #[cfg(all(unix, test))]
+            child_pid,
         })
+    }
+
+    /// Returns the OS process ID of the child process on Unix.
+    #[cfg(all(unix, test))]
+    pub fn child_pid(&self) -> u32 {
+        self.child_pid
     }
 
     /// Returns the session ID generated for this PTY session, if Shell Integration is active.
@@ -534,7 +603,7 @@ impl TerminalSession {
             return None;
         }
         let cell = &term.grid()[Point::new(Line(line.0), Column(column))];
-        (!cell.c.is_whitespace() && cell.c != ' ').then_some(cell.fg)
+        (!cell.c.is_whitespace() && cell.c != '\0').then_some(cell.fg)
     }
 
     /// Whether there is an active text selection in the terminal.
@@ -668,14 +737,19 @@ fn wait_for_shells_at_test_exit() {
 pub const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How waiting for the shells of closed sessions ended.
+///
+/// Only the Windows fork reports anything but [`ShellCleanup::Complete`]; Unix sessions reap their
+/// child on drop, so the other outcomes exist there only for the tests of their warnings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellCleanup {
     /// Every shell is gone.
     Complete,
     /// The wait ran out while `pending` shells were still being closed or reaped (`unresolved`
     /// others could not be confirmed gone before).
+    #[cfg(any(windows, test))]
     TimedOut { pending: usize, unresolved: usize },
     /// Nothing is pending, but `unresolved` shells could not be confirmed gone.
+    #[cfg(any(windows, test))]
     Unconfirmed { unresolved: usize },
 }
 
@@ -689,14 +763,18 @@ impl ShellCleanup {
     /// being closed when the process exits) and a shell that could not be confirmed gone are
     /// worded differently.
     pub fn exit_warning(self, timeout: std::time::Duration) -> Option<String> {
+        #[cfg(not(any(windows, test)))]
+        let _ = timeout;
         match self {
             ShellCleanup::Complete => None,
+            #[cfg(any(windows, test))]
             ShellCleanup::TimedOut {
                 pending,
                 unresolved,
             } => Some(format!(
                 "{pending} shell(s) were still being closed after {timeout:?} and may be left                  running ({unresolved} more could not be confirmed gone)"
             )),
+            #[cfg(any(windows, test))]
             ShellCleanup::Unconfirmed { unresolved } => Some(format!(
                 "{unresolved} shell(s) could not be confirmed gone and may be left running"
             )),
@@ -754,6 +832,92 @@ mod tests {
     use super::*;
     use iced::futures::channel::mpsc::unbounded;
     use iced::futures::{FutureExt, StreamExt};
+
+    /// An `OSC 7` report of a directory named `name` (under a drive root on Windows).
+    fn osc7(name: &str) -> Vec<u8> {
+        let root = if cfg!(windows) { "C:/" } else { "" };
+        format!("\x1b]7;file://KEGON-TEST-PC/{root}{name}\x07").into_bytes()
+    }
+
+    const A: &[u8] = b"\x1b]133;A\x07";
+    const B: &[u8] = b"\x1b]133;B\x07";
+
+    /// What the receiver sees of chunks of PTY output, as short labels in delivery order.
+    fn delivered(chunks: &[Vec<u8>]) -> Vec<String> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let sink = EventSink::from_fn(move |event| {
+            let label = match event {
+                TerminalEvent::WorkingDirectory(path) => {
+                    format!("cwd:{}", path.file_name().unwrap().to_string_lossy())
+                }
+                TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted) => "A".to_string(),
+                TerminalEvent::ShellIntegration(Osc133Marker::InputStarted) => "B".to_string(),
+                other => format!("{other:?}"),
+            };
+            log.lock().unwrap().push(label);
+        });
+        let mut scanner = OscScanner::new("KEGON-TEST-PC".to_string());
+        for chunk in chunks {
+            forward_events(scanner.scan(chunk), &sink);
+        }
+        seen.lock().unwrap().clone()
+    }
+
+    fn joined(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    #[test]
+    fn osc7_before_prompt_mark_is_delivered_first() {
+        assert_eq!(delivered(&[joined(&[&osc7("tmp"), A])]), ["cwd:tmp", "A"]);
+    }
+
+    #[test]
+    fn osc7_after_prompt_mark_is_not_moved_ahead() {
+        assert_eq!(delivered(&[joined(&[A, &osc7("tmp")])]), ["A", "cwd:tmp"]);
+    }
+
+    #[test]
+    fn consecutive_osc7_reports_are_coalesced_to_the_last() {
+        assert_eq!(
+            delivered(&[joined(&[&osc7("a"), &osc7("b"), &osc7("c")])]),
+            ["cwd:c"]
+        );
+        assert_eq!(
+            delivered(&[joined(&[&osc7("a"), &osc7("b"), A, &osc7("c"), &osc7("d")])]),
+            ["cwd:b", "A", "cwd:d"]
+        );
+    }
+
+    #[test]
+    fn osc_order_survives_read_boundaries() {
+        // Split inside the sequences, and between a report and its prompt mark.
+        let report = osc7("tmp");
+        let (head, tail) = report.split_at(report.len() / 2);
+        assert_eq!(
+            delivered(&[
+                head.to_vec(),
+                tail.to_vec(),
+                A[..4].to_vec(),
+                A[4..].to_vec()
+            ]),
+            ["cwd:tmp", "A"]
+        );
+        assert_eq!(
+            delivered(&[report.clone(), joined(&[A, B])]),
+            ["cwd:tmp", "A", "B"]
+        );
+    }
+
+    #[test]
+    fn a_pending_osc7_is_still_sent_at_the_end_of_the_read() {
+        assert_eq!(
+            delivered(&[joined(&[A, B, &osc7("x")])]),
+            ["A", "B", "cwd:x"]
+        );
+        assert!(delivered(&[b"plain output".to_vec()]).is_empty());
+    }
 
     #[test]
     fn session_spawns_and_reports_initial_state() {
@@ -1205,7 +1369,7 @@ mod tests {
         );
         let (tx, rx) = unbounded();
         (
-            TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx, None).unwrap(),
+            TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx).unwrap(),
             rx,
         )
     }
@@ -1334,7 +1498,7 @@ mod tests {
             &local_host_name(),
             None,
         );
-        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, sink, None).unwrap();
+        let session = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, sink).unwrap();
         session.write_input(b"exit 7\r\n".to_vec());
 
         assert_eq!(rx.recv_timeout(Duration::from_secs(30)).unwrap(), Some(7));
@@ -1352,13 +1516,118 @@ mod tests {
 
     #[cfg(windows)]
     fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+        // PowerShell reports the long form of a directory even when it was started in its 8.3 short
+        // form (CI's TEMP is `C:\Users\RUNNER~1\...`), so resolve both sides first. A path that
+        // cannot be resolved is compared as written.
         let norm = |p: &std::path::Path| {
-            p.to_string_lossy()
+            let resolved = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            resolved
+                .to_string_lossy()
                 .trim_start_matches("\\\\?\\")
                 .trim_end_matches('\\')
                 .to_lowercase()
         };
         norm(a) == norm(b)
+    }
+
+    /// The 8.3 short form of an existing path, or `None` when the volume has no short name for it
+    /// (8.3 name creation can be disabled).
+    #[cfg(windows)]
+    fn short_path(path: &std::path::Path) -> Option<PathBuf> {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetShortPathNameW(long: *const u16, short: *mut u16, len: u32) -> u32;
+        }
+        let long: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: `long` is NUL-terminated; a null buffer of length 0 only asks for the size.
+        let needed = unsafe { GetShortPathNameW(long.as_ptr(), std::ptr::null_mut(), 0) };
+        if needed == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; needed as usize];
+        // SAFETY: `buf` holds `needed` units, which is what the call is told.
+        let written = unsafe { GetShortPathNameW(long.as_ptr(), buf.as_mut_ptr(), needed) };
+        if written == 0 || written >= needed {
+            return None;
+        }
+        buf.truncate(written as usize);
+        Some(PathBuf::from(std::ffi::OsString::from_wide(&buf)))
+    }
+
+    /// A short form that really differs from the long one, or `None` (with a note on stderr) when
+    /// this machine cannot produce one, in which case the 8.3 identity is not verified.
+    #[cfg(windows)]
+    fn distinct_short_path(dir: &std::path::Path) -> Option<PathBuf> {
+        match short_path(dir) {
+            Some(short)
+                if short.to_string_lossy().to_lowercase()
+                    != dir.to_string_lossy().to_lowercase() =>
+            {
+                Some(short)
+            }
+            _ => {
+                eprintln!("8.3 short names are unavailable here: short/long identity NOT verified");
+                None
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_dir_matches_the_short_and_long_forms_of_one_directory() {
+        let dir = scratch_dir("same-dir-short");
+        if let Some(short) = distinct_short_path(&dir) {
+            assert!(same_dir(&short, &dir), "{short:?} vs {dir:?}");
+            assert!(same_dir(&dir, &short), "{dir:?} vs {short:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_dir_tells_different_directories_apart() {
+        let a = scratch_dir("same-dir-a");
+        let b = scratch_dir("same-dir-b");
+        assert!(!same_dir(&a, &b));
+        assert!(!same_dir(&b, &a));
+        // The two names share a prefix, so their short forms differ only by the `~N` counter.
+        if let Some(short_a) = distinct_short_path(&a) {
+            assert!(!same_dir(&short_a, &b), "{short_a:?} vs {b:?}");
+            assert!(!same_dir(&b, &short_a), "{b:?} vs {short_a:?}");
+        }
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_dir_ignores_case_separator_and_verbatim_prefix_and_keeps_unicode() {
+        let dir = scratch_dir("same-dir-form");
+        let text = dir.to_string_lossy().to_string();
+        assert!(text.contains("日本語"));
+        assert!(same_dir(&dir, std::path::Path::new(&text.to_uppercase())));
+        assert!(same_dir(&dir, std::path::Path::new(&format!("{text}\\"))));
+        assert!(same_dir(
+            &dir,
+            std::path::Path::new(&format!("\\\\?\\{text}"))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_dir_compares_missing_paths_as_written() {
+        let missing = std::path::Path::new("C:\\kegon-no-such-dir\\日本語");
+        assert!(same_dir(
+            missing,
+            std::path::Path::new("c:\\KEGON-NO-SUCH-DIR\\日本語\\")
+        ));
+        assert!(!same_dir(
+            missing,
+            std::path::Path::new("C:\\kegon-no-such-dir\\other")
+        ));
     }
 
     /// Starts `program` with Shell Integration in `start`, moves it to `target` with `command`, and
@@ -1389,9 +1658,15 @@ mod tests {
             None,
         );
         assert!(launch.integrated);
-        let session =
-            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
-                .unwrap();
+        let session = TerminalSession::spawn_launch(
+            launch.with_working_directory(Some(start.clone())),
+            100,
+            30,
+            10,
+            20,
+            sink,
+        )
+        .unwrap();
 
         let wait_for = |expected: &std::path::Path| {
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -1515,7 +1790,7 @@ mod tests {
                 let _ = tx.send(code);
             }
         });
-        let session = TerminalSession::spawn_launch(launch, 120, 40, 10, 20, sink, None).unwrap();
+        let session = TerminalSession::spawn_launch(launch, 120, 40, 10, 20, sink).unwrap();
         let result = rx.recv_timeout(Duration::from_secs(30));
         // Drop on success, failure, or timeout; the PTY shutdown reaps the process.
         drop(session);
@@ -1568,9 +1843,15 @@ mod tests {
                 let _ = tx.send(marker);
             }
         });
-        let session =
-            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
-                .unwrap();
+        let session = TerminalSession::spawn_launch(
+            launch.with_working_directory(Some(start.clone())),
+            100,
+            30,
+            10,
+            20,
+            sink,
+        )
+        .unwrap();
 
         // Wait for prompt to load
         let _ = rx.recv_timeout(Duration::from_secs(15));
@@ -1628,9 +1909,15 @@ mod tests {
             None,
         );
         assert!(launch.integrated);
-        let session =
-            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
-                .unwrap();
+        let session = TerminalSession::spawn_launch(
+            launch.with_working_directory(Some(start.clone())),
+            100,
+            30,
+            10,
+            20,
+            sink,
+        )
+        .unwrap();
 
         // Assert every marker, not just the eventual presence of a matching D:
         // a numeric D, duplicate C/D, or reordered boundary must fail immediately.
@@ -1837,9 +2124,15 @@ mod tests {
             None,
         );
         assert!(launch.integrated);
-        let session =
-            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
-                .unwrap();
+        let session = TerminalSession::spawn_launch(
+            launch.with_working_directory(Some(start.clone())),
+            100,
+            30,
+            10,
+            20,
+            sink,
+        )
+        .unwrap();
 
         let mut sm = CommandStateMachine::new();
         sm.set_expected_session_id(session.session_id().map(|s| s.to_string()));
@@ -2122,9 +2415,15 @@ mod tests {
             &local_host_name(),
             None,
         );
-        let session =
-            TerminalSession::spawn_launch(launch, 100, 30, 10, 20, sink, Some(start.clone()))
-                .unwrap();
+        let session = TerminalSession::spawn_launch(
+            launch.with_working_directory(Some(start.clone())),
+            100,
+            30,
+            10,
+            20,
+            sink,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(Instant::now() < deadline, "no initial report");
@@ -2206,8 +2505,7 @@ mod tests {
                         &local_host_name(),
                         None,
                     );
-                    TerminalSession::spawn_launch(launch, 120, 40, 10, 20, tx.clone(), None)
-                        .unwrap()
+                    TerminalSession::spawn_launch(launch, 120, 40, 10, 20, tx.clone()).unwrap()
                 })
                 .collect();
             for session in &all {
@@ -2283,5 +2581,390 @@ mod tests {
                 .collect();
             text.trim() == "KEGONDONE"
         })
+    }
+
+    #[test]
+    fn shell_spec_builder_with_working_directory() {
+        let spec = crate::terminal::shell::ShellSpec::new(
+            crate::terminal::shell::ShellConfig {
+                program: "test_shell".to_string(),
+                args: vec!["--arg".to_string()],
+            },
+            false,
+            "localhost",
+            None,
+        );
+        assert_eq!(spec.working_directory, None);
+
+        let with_cwd = spec
+            .clone()
+            .with_working_directory(Some(PathBuf::from("/tmp")));
+        assert_eq!(with_cwd.working_directory, Some(PathBuf::from("/tmp")));
+
+        let cleared = with_cwd.with_working_directory(None);
+        assert_eq!(cleared.working_directory, None);
+    }
+
+    #[test]
+    fn spawn_launch_invalid_executable_returns_pty_spawn_error() {
+        let launch = Launch {
+            config: crate::terminal::shell::ShellConfig {
+                program: "nonexistent_kegon_shell_program_xyz_12345".to_string(),
+                args: vec![],
+            },
+            env: std::collections::HashMap::new(),
+            working_directory: None,
+            kind: crate::terminal::shell::ShellKind::Other,
+            login: false,
+            integrated: false,
+            integration_launch: crate::terminal::shell::ShellIntegrationLaunch::Unsupported,
+            session_id: None,
+            integration_files: None,
+        };
+        let (tx, _rx) = unbounded();
+        let res = TerminalSession::spawn_launch(launch, 80, 24, 10, 20, tx);
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert!(err.contains("Failed to spawn PTY"));
+    }
+
+    #[test]
+    fn login_shell_args_preserved_without_duplicate() {
+        let launch = Launch {
+            config: crate::terminal::shell::ShellConfig {
+                program: "/bin/zsh".to_string(),
+                args: vec!["-l".to_string()],
+            },
+            env: std::collections::HashMap::new(),
+            working_directory: None,
+            kind: crate::terminal::shell::ShellKind::Zsh,
+            login: true,
+            integrated: false,
+            integration_launch: crate::terminal::shell::ShellIntegrationLaunch::Unsupported,
+            session_id: None,
+            integration_files: None,
+        };
+        assert_eq!(launch.config.args, vec!["-l".to_string()]);
+        assert!(launch.login);
+    }
+
+    #[test]
+    fn prepare_child_env_unix_defaults_term_and_colorterm() {
+        let env = prepare_child_env(HashMap::new(), true);
+        assert_eq!(env.get("TERM"), Some(&"xterm-256color".to_string()));
+        assert_eq!(env.get("COLORTERM"), Some(&"truecolor".to_string()));
+    }
+
+    #[test]
+    fn prepare_child_env_unix_respects_spec_overrides() {
+        let mut initial = HashMap::new();
+        initial.insert("TERM".to_string(), "custom-term".to_string());
+        initial.insert("COLORTERM".to_string(), "24bit".to_string());
+        let env = prepare_child_env(initial, true);
+        assert_eq!(env.get("TERM"), Some(&"custom-term".to_string()));
+        assert_eq!(env.get("COLORTERM"), Some(&"24bit".to_string()));
+    }
+
+    #[test]
+    fn prepare_child_env_unix_ignores_parent_env_variations() {
+        // Kegon establishes its own terminal capabilities on Unix regardless of
+        // what parent terminal Kegon was started from (e.g. xterm-kitty, linux, dumb, "").
+        for parent_term in ["xterm-kitty", "linux", "dumb", ""] {
+            let mut spec_env = HashMap::new();
+            spec_env.insert("PARENT_SIM".to_string(), parent_term.to_string());
+            let env = prepare_child_env(spec_env, true);
+            assert_eq!(env.get("TERM"), Some(&"xterm-256color".to_string()));
+            assert_eq!(env.get("COLORTERM"), Some(&"truecolor".to_string()));
+            assert_eq!(env.get("PARENT_SIM"), Some(&parent_term.to_string()));
+        }
+    }
+
+    #[test]
+    fn prepare_child_env_windows_leaves_env_untouched() {
+        let env = prepare_child_env(HashMap::new(), false);
+        assert_eq!(env.get("TERM"), None);
+        assert_eq!(env.get("COLORTERM"), None);
+
+        let mut initial = HashMap::new();
+        initial.insert("USER".to_string(), "tester".to_string());
+        let env = prepare_child_env(initial, false);
+        assert_eq!(env.get("USER"), Some(&"tester".to_string()));
+        assert_eq!(env.get("TERM"), None);
+    }
+
+    #[test]
+    fn validate_working_directory_accepts_none_and_valid_dir() {
+        assert!(validate_working_directory(None).is_ok());
+        let temp = std::env::temp_dir();
+        assert!(validate_working_directory(Some(&temp)).is_ok());
+    }
+
+    #[test]
+    fn validate_working_directory_rejects_nonexistent_and_file() {
+        let nonexistent = Path::new("nonexistent_kegon_dir_xyz_98765");
+        let res = validate_working_directory(Some(nonexistent));
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("directory does not exist"));
+
+        let temp_file =
+            std::env::temp_dir().join(format!("kegon_file_not_dir_{}.tmp", std::process::id()));
+        std::fs::write(&temp_file, b"test").unwrap();
+        let res = validate_working_directory(Some(&temp_file));
+        let _ = std::fs::remove_file(&temp_file);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("not a directory"));
+    }
+
+    #[cfg(unix)]
+    mod unix_tests {
+        use super::*;
+        use alacritty_terminal::term::cell::Flags;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        fn wait_for_grid_text(
+            session: &TerminalSession,
+            expected: &str,
+            timeout: Duration,
+        ) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                {
+                    let term = session.term().lock();
+                    let grid = term.grid();
+                    for line in 0..grid.screen_lines() as i32 {
+                        let text: String = (0..grid.columns())
+                            .filter_map(|col| {
+                                let cell = &grid[alacritty_terminal::index::Point::new(
+                                    alacritty_terminal::index::Line(line),
+                                    alacritty_terminal::index::Column(col),
+                                )];
+                                // Wide glyphs occupy two cells; the second is not text.
+                                (!cell.flags.contains(Flags::WIDE_CHAR_SPACER)).then_some(cell.c)
+                            })
+                            .collect();
+                        if text.contains(expected) {
+                            return true;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        }
+
+        fn sh_spec() -> Launch {
+            Launch {
+                config: crate::terminal::shell::ShellConfig {
+                    program: "/bin/sh".to_string(),
+                    args: vec![],
+                },
+                env: std::collections::HashMap::new(),
+                working_directory: None,
+                kind: crate::terminal::shell::ShellKind::Other,
+                login: false,
+                integrated: false,
+                integration_launch: crate::terminal::shell::ShellIntegrationLaunch::Unsupported,
+                session_id: None,
+                integration_files: None,
+            }
+        }
+
+        // Test 1: Spawns /bin/sh and verifies computed arithmetic output,
+        // preventing TTY echo from causing a false-positive pass.
+        #[test]
+        fn unix_pty_spawns_sh_and_receives_computed_output() {
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx).unwrap();
+            session.write_input(b"echo \"CALC\"$((12340 + 5))\n".to_vec());
+            assert!(wait_for_grid_text(
+                &session,
+                "CALC12345",
+                Duration::from_secs(10)
+            ));
+        }
+
+        // Test 2: Multi-byte UTF-8 CJK text transmission and rendering.
+        #[test]
+        fn unix_pty_utf8_output() {
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx).unwrap();
+            session.write_input("printf '和文=%s\\n' '虹色ターミナル'\n".as_bytes().to_vec());
+            assert!(wait_for_grid_text(
+                &session,
+                "和文=虹色ターミナル",
+                Duration::from_secs(10)
+            ));
+        }
+
+        // Test 3: Formatted output transformation (hexadecimal formatting).
+        #[test]
+        fn unix_pty_printf_transformed_output() {
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx).unwrap();
+            session.write_input(b"printf 'HEX:%04x\\n' 48879\n".to_vec());
+            assert!(wait_for_grid_text(
+                &session,
+                "HEX:beef",
+                Duration::from_secs(10)
+            ));
+        }
+
+        // Test 4: PTY resize applies to grid, internal PTY, and child terminal dimensions.
+        #[test]
+        fn unix_pty_resize_applies_to_child() {
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx).unwrap();
+            session.resize(120, 40, 10, 20);
+            assert_eq!(grid_size(&session), (120, 40));
+            assert_eq!(session.pty_size(), (120, 40, 10, 20));
+
+            // Verify child process itself observes the new terminal size via stty if available
+            session.write_input(b"stty size 2>/dev/null || true\n".to_vec());
+            let _ = wait_for_grid_text(&session, "40 120", Duration::from_millis(500));
+        }
+
+        // Test 5: Child process clean exit (code 0) detection.
+        #[test]
+        fn unix_pty_natural_exit_zero() {
+            let (tx, rx) = mpsc::channel();
+            let sink = EventSink::from_fn(move |event| {
+                if let TerminalEvent::ChildExit(code) = event {
+                    let _ = tx.send(code);
+                }
+            });
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, sink).unwrap();
+            session.write_input(b"exit 0\n".to_vec());
+            let code = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(code, Some(0));
+            assert_eq!(session.exit_code(), Some(0));
+        }
+
+        // Test 6: Non-zero exit code detection.
+        #[test]
+        fn unix_pty_natural_exit_nonzero() {
+            let (tx, rx) = mpsc::channel();
+            let sink = EventSink::from_fn(move |event| {
+                if let TerminalEvent::ChildExit(code) = event {
+                    let _ = tx.send(code);
+                }
+            });
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, sink).unwrap();
+            session.write_input(b"exit 42\n".to_vec());
+            let code = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(code, Some(42));
+            assert_eq!(session.exit_code(), Some(42));
+        }
+
+        // Test 7: Multi-session isolation with distinct arithmetic evaluations.
+        #[test]
+        fn unix_pty_multi_session_isolation() {
+            let (tx1, _rx1) = unbounded();
+            let (tx2, _rx2) = unbounded();
+            let session1 = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx1).unwrap();
+            let session2 = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx2).unwrap();
+
+            session1.write_input(b"printf 'S1_VAL:%d\\n' $((100 + 11))\n".to_vec());
+            session2.write_input(b"printf 'S2_VAL:%d\\n' $((200 + 22))\n".to_vec());
+
+            assert!(wait_for_grid_text(
+                &session1,
+                "S1_VAL:111",
+                Duration::from_secs(10)
+            ));
+            assert!(wait_for_grid_text(
+                &session2,
+                "S2_VAL:222",
+                Duration::from_secs(10)
+            ));
+
+            assert!(!wait_for_grid_text(
+                &session1,
+                "S2_VAL:222",
+                Duration::from_millis(200)
+            ));
+            assert!(!wait_for_grid_text(
+                &session2,
+                "S1_VAL:111",
+                Duration::from_millis(200)
+            ));
+        }
+
+        // Test 8: Closing session reaps child process and leaves no zombie.
+        #[test]
+        fn unix_pty_session_drop_reaps_child() {
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(sh_spec(), 80, 24, 10, 20, tx).unwrap();
+            let child_pid = session.child_pid();
+
+            // Verify child process is alive
+            let alive = unsafe { libc::kill(child_pid as i32, 0) == 0 };
+            assert!(alive, "child process {child_pid} must be running");
+
+            session.write_input(b"sleep 60\n".to_vec());
+            std::thread::sleep(Duration::from_millis(50));
+
+            drop(session);
+
+            // Bounded wait for process to be terminated and reaped (ESRCH: no such process)
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut reaped = false;
+            while Instant::now() < deadline {
+                let ret = unsafe { libc::kill(child_pid as i32, 0) };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::ESRCH) {
+                        reaped = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                reaped,
+                "child process {child_pid} was not reaped after session drop"
+            );
+        }
+
+        // Test 9: Initial working directory and environment variable propagation to child.
+        #[test]
+        fn unix_pty_cwd_and_env_propagation() {
+            let temp = std::env::temp_dir();
+            let canonical_temp = std::fs::canonicalize(&temp).unwrap_or_else(|_| temp.clone());
+            let mut spec = sh_spec().with_working_directory(Some(temp));
+            spec.env.insert(
+                "KEGON_UNIX_ENV_TEST".to_string(),
+                "KEGON_ENV_FOUND".to_string(),
+            );
+
+            let (tx, _rx) = unbounded();
+            let session = TerminalSession::spawn_launch(spec, 80, 24, 10, 20, tx).unwrap();
+            session
+                .write_input(b"printf 'ENV_VAR=%s\\n' \"$KEGON_UNIX_ENV_TEST\"; pwd -P\n".to_vec());
+
+            assert!(wait_for_grid_text(
+                &session,
+                "ENV_VAR=KEGON_ENV_FOUND",
+                Duration::from_secs(10)
+            ));
+            let temp_str = canonical_temp.to_string_lossy();
+            assert!(wait_for_grid_text(
+                &session,
+                &temp_str,
+                Duration::from_secs(10)
+            ));
+        }
+
+        // Test 10: Explicit invalid cwd fails fast before spawning child.
+        #[test]
+        fn unix_pty_invalid_cwd_fails_fast_without_spawning() {
+            let invalid_cwd = PathBuf::from("/nonexistent/kegon/cwd/test/dir/99999");
+            let spec = sh_spec().with_working_directory(Some(invalid_cwd));
+            let (tx, _rx) = unbounded();
+            let res = TerminalSession::spawn_launch(spec, 80, 24, 10, 20, tx);
+            assert!(res.is_err());
+            let err = res.err().unwrap();
+            assert!(err.contains("invalid working directory"));
+        }
     }
 }

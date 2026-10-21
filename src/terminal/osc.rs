@@ -50,6 +50,7 @@ pub struct OscScanner {
     state: Framing,
     payload: Vec<u8>,
     overlong: bool,
+    drop_unmarked_command_markers: bool,
 }
 
 impl OscScanner {
@@ -60,7 +61,19 @@ impl OscScanner {
             state: Framing::Ground,
             payload: Vec::new(),
             overlong: false,
+            drop_unmarked_command_markers: false,
         }
+    }
+
+    /// Makes the scanner drop `OSC 133;C` and `OSC 133;D` that carry no `kegon.*` parameter at all.
+    ///
+    /// For a shell that Kegon has integrated: it identifies each of its own command markers, so a
+    /// marker without any identity is the shell's own (fish 4 prints them by itself) and would be
+    /// taken for a second, unverified command beside Kegon's. A marker with `kegon.*` parameters,
+    /// however malformed, is still reported, so the state machine decides about it.
+    pub fn dropping_unmarked_command_markers(mut self) -> Self {
+        self.drop_unmarked_command_markers = true;
+        self
     }
 
     /// Feeds PTY output chunks and returns the recognized OSC events in order.
@@ -160,6 +173,15 @@ impl OscScanner {
             }
             "133" => {
                 let marker = parse_osc133(rest)?;
+                if self.drop_unmarked_command_markers
+                    && matches!(
+                        marker,
+                        Osc133Marker::CommandStarted | Osc133Marker::CommandFinished(_)
+                    )
+                    && !carries_kegon_parameter(rest)
+                {
+                    return None;
+                }
                 Some(OscEvent::ShellIntegration(marker))
             }
             "1337" => {
@@ -169,6 +191,13 @@ impl OscScanner {
             _ => None,
         }
     }
+}
+
+/// Whether any parameter of an `OSC 133` payload (the text after `133;`) is a `kegon.*` one.
+fn carries_kegon_parameter(rest: &str) -> bool {
+    rest.split(';')
+        .skip(1)
+        .any(|param| param.trim().starts_with("kegon."))
 }
 
 /// Maximum allowed length in characters for a session ID.
@@ -690,7 +719,11 @@ mod tests {
             events,
             vec![
                 OscEvent::ShellIntegration(Osc133Marker::PromptStarted),
-                OscEvent::WorkingDirectory(PathBuf::from(r"C:\works\kegon")),
+                OscEvent::WorkingDirectory(PathBuf::from(if cfg!(windows) {
+                    r"C:\works\kegon"
+                } else {
+                    "/C:/works/kegon"
+                })),
                 OscEvent::ShellIntegration(Osc133Marker::InputStarted),
                 OscEvent::ShellIntegration(Osc133Marker::CommandStarted),
                 OscEvent::ShellIntegration(Osc133Marker::CommandFinished(Some(0))),
@@ -1190,5 +1223,204 @@ mod tests {
         assert!(base64_decode("=m9v").is_none());
         assert!(base64_decode("Z=9v").is_none());
         assert!(base64_decode("Zm=v").is_none());
+    }
+
+    // --- native OSC 133 of an integrated fish (T-2, T-3) -----------------------------------
+
+    use crate::terminal::integration::{
+        CommandStateMachine, CompletionReason, MetadataCorrelation, VerifiedCommandEvent,
+    };
+
+    const SID: &str = "kegon-1-abc";
+
+    fn markers(scanner: &mut OscScanner, bytes: &[u8]) -> Vec<Osc133Marker> {
+        scanner
+            .scan(bytes)
+            .into_iter()
+            .filter_map(|event| match event {
+                OscEvent::ShellIntegration(marker) => Some(marker),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fish_scanner() -> OscScanner {
+        OscScanner::new(HOST.into()).dropping_unmarked_command_markers()
+    }
+
+    /// What fish 4.0.2 and the Kegon hooks print for one command line, in the observed order.
+    fn fish_command_line(exit: i32, status: &str) -> Vec<u8> {
+        format!(
+            "\x1b]133;C;cmdline_url=true\x07\
+             \x1b]133;C;kegon.v=1;kegon.sid={SID};kegon.seq=1\x07\
+             \x1b]133;D;{exit}\x07\
+             \x1b]133;D;{exit};kegon.v=1;kegon.sid={SID};kegon.seq=1;kegon.ps={status}\x07\
+             \x1b]7;file://{HOST}/tmp\x07\x1b]133;A\x07\x1b]133;A;special_key=1\x07"
+        )
+        .into_bytes()
+    }
+
+    fn finished_results(
+        stream: &[u8],
+        scanner: &mut OscScanner,
+    ) -> Vec<crate::terminal::integration::CommandExecutionResult> {
+        let mut sm = CommandStateMachine::new();
+        sm.set_expected_session_id(Some(SID.to_string()));
+        markers(scanner, stream)
+            .into_iter()
+            .filter_map(|marker| match sm.transition(marker) {
+                Some(VerifiedCommandEvent::CommandFinished {
+                    execution_result, ..
+                }) => Some(execution_result),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn integrated_fish_native_command_markers_are_dropped_and_kegons_kept() {
+        let mut scanner = fish_scanner();
+        let found = markers(&mut scanner, &fish_command_line(0, "success"));
+        assert_eq!(found.len(), 4, "{found:?}");
+        assert!(matches!(
+            found[0],
+            Osc133Marker::CommandStartedWithMetadata(_)
+        ));
+        assert!(matches!(
+            found[1],
+            Osc133Marker::CommandFinishedWithMetadata(Some(0), _)
+        ));
+        // Both prompt marks pass: the native one is harmless (see the state machine test below).
+        assert_eq!(found[2], Osc133Marker::PromptStarted);
+        assert_eq!(found[3], Osc133Marker::PromptStarted);
+    }
+
+    #[test]
+    fn integrated_fish_command_line_is_one_matched_result() {
+        for (exit, status, shell_status) in [
+            (0, "success", ShellReportedStatus::Success),
+            (1, "failure", ShellReportedStatus::Failure),
+            (127, "failure", ShellReportedStatus::Failure),
+        ] {
+            let results = finished_results(&fish_command_line(exit, status), &mut fish_scanner());
+            assert_eq!(results.len(), 1, "{results:?}");
+            assert_eq!(results[0].shell_status, shell_status);
+            assert_eq!(results[0].osc133_exit, Some(exit));
+            assert_eq!(results[0].completion, CompletionReason::DObserved);
+            assert_eq!(results[0].correlation, MetadataCorrelation::Matched);
+        }
+    }
+
+    #[test]
+    fn unfiltered_scanner_keeps_the_native_markers_and_the_mismatch() {
+        // The filter is what separates the two: without it the native C makes Kegon's a duplicate.
+        let results = finished_results(
+            &fish_command_line(0, "success"),
+            &mut OscScanner::new(HOST.into()),
+        );
+        assert_eq!(results[0].correlation, MetadataCorrelation::Mismatched);
+        assert_eq!(results[0].shell_status, ShellReportedStatus::Unknown);
+    }
+
+    #[test]
+    fn native_prompt_marks_do_not_repeat_a_verified_command_or_dopamine_event() {
+        // After a finished command the native A arrives in the Prompt state: a second
+        // PromptStarted, no command event at all.
+        let mut sm = CommandStateMachine::new();
+        sm.set_expected_session_id(Some(SID.to_string()));
+        let mut scanner = fish_scanner();
+        let events: Vec<_> = markers(&mut scanner, &fish_command_line(0, "success"))
+            .into_iter()
+            .filter_map(|marker| sm.transition(marker))
+            .collect();
+        let commands = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    VerifiedCommandEvent::CommandStarted { .. }
+                        | VerifiedCommandEvent::CommandFinished { .. }
+                )
+            })
+            .count();
+        assert_eq!(commands, 2, "one start and one finish: {events:?}");
+        assert_eq!(
+            events.last(),
+            Some(&VerifiedCommandEvent::PromptStarted),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn filter_keeps_markers_with_foreign_or_broken_kegon_parameters() {
+        let mut scanner = fish_scanner();
+        // Another tab's identity: complete metadata, so the state machine rejects it.
+        let foreign = markers(
+            &mut scanner,
+            b"\x1b]133;C;kegon.v=1;kegon.sid=other-tab;kegon.seq=1\x07",
+        );
+        assert!(matches!(
+            foreign[..],
+            [Osc133Marker::CommandStartedWithMetadata(_)]
+        ));
+        // Broken or partial metadata is no complete envelope but is still Kegon's business.
+        for bad in [
+            &b"\x1b]133;C;kegon.v=1\x07"[..],
+            b"\x1b]133;C;kegon.v=1;kegon.sid=bad sid;kegon.seq=1\x07",
+            b"\x1b]133;C;kegon.v=9;kegon.sid=a;kegon.seq=1\x07",
+            b"\x1b]133;C;kegon.v=1;kegon.v=1;kegon.sid=a;kegon.seq=1\x07",
+            b"\x1b]133;D;0;kegon.v=1\x07",
+            b"\x1b]133;D;kegon.v=1;kegon.sid=a\x07",
+        ] {
+            assert_eq!(
+                markers(&mut scanner, bad).len(),
+                1,
+                "dropped {:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // A look-alike is not a parameter: only the structured `kegon.` key counts.
+        assert!(markers(&mut scanner, b"\x1b]133;C;cmdline_url=kegon.sid\x07").is_empty());
+        assert!(markers(&mut scanner, b"\x1b]133;D;0;mykegon.v=1\x07").is_empty());
+    }
+
+    #[test]
+    fn filter_never_touches_other_osc() {
+        let mut scanner = fish_scanner();
+        assert_eq!(
+            scanner.scan(b"\x1b]133;A;special_key=1\x07\x1b]133;B\x07"),
+            vec![
+                OscEvent::ShellIntegration(Osc133Marker::PromptStarted),
+                OscEvent::ShellIntegration(Osc133Marker::InputStarted),
+            ]
+        );
+        // The URI path of an absolute directory: Windows needs a drive letter (`/tmp` is not an
+        // absolute path there, so the report is rightly rejected); elsewhere `/tmp` is fine.
+        let dir = if cfg!(windows) { "/C:/tmp" } else { "/tmp" };
+        assert_eq!(
+            scanner
+                .scan(format!("\x1b]7;file://{HOST}{dir}\x07").as_bytes())
+                .len(),
+            1
+        );
+        let b64 = "a2Vnb24udj0xO2tlZ29uLnNpZD1hO2tlZ29uLnNlcT0x";
+        let status = format!("\x1b]1337;SetUserVar=kegon_status={b64}\x07");
+        assert_eq!(scanner.scan(status.as_bytes()).len(), 1);
+    }
+
+    #[test]
+    fn default_scanner_reports_unmarked_command_markers() {
+        // Bash, zsh, PowerShell, a disabled or unsupported shell: nothing is filtered.
+        let mut scanner = OscScanner::new(HOST.into());
+        assert_eq!(
+            markers(
+                &mut scanner,
+                b"\x1b]133;C;cmdline_url=true\x07\x1b]133;D;0\x07"
+            ),
+            vec![
+                Osc133Marker::CommandStarted,
+                Osc133Marker::CommandFinished(Some(0))
+            ]
+        );
     }
 }

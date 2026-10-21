@@ -19,7 +19,7 @@ sys-locale = "0.3"
 # Terminal core emulation and system clipboard
 # alacritty_terminal is pinned to Kegon's patched fork (upstream 0.26.0 + ConPTY handle-leak fixes); see docs/architecture/terminal.md.
 alacritty_terminal = { git = "https://github.com/motoki-kentaro/alacritty", rev = "758174acb2bf184cc55f177a56b8cf3292967f9f" }
-arboard = "3.6.1"
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 # Event types in the PTY wrapper that taps shell output (must match alacritty_terminal's version).
 polling = "3"
 # Application settings serialization, TOML parsing, and cross-platform config paths
@@ -39,3 +39,6 @@ winresource = "0.1"
 [dev-dependencies]
 # Lists the message IDs in a Fluent resource, for the i18n completeness tests.
 fluent-syntax = "0.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

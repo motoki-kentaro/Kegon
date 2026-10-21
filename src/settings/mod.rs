@@ -977,10 +977,6 @@ timeout_seconds = 120
             Err(ShellPathError::NotAbsolute)
         );
         assert_eq!(
-            validate_shell_path("/pwsh.exe"),
-            Err(ShellPathError::NotAbsolute)
-        );
-        assert_eq!(
             validate_shell_path(r"\Windows\System32\cmd.exe"),
             Err(ShellPathError::NotAbsolute)
         );
@@ -995,27 +991,67 @@ timeout_seconds = 120
             Err(ShellPathError::HasArguments)
         );
 
-        // Non-existent file
-        assert_eq!(
-            validate_shell_path(r"C:\Windows\System32\nonexistent_shell_98765.exe"),
-            Err(ShellPathError::NotFound)
-        );
+        #[cfg(windows)]
+        {
+            // A root without a drive is relative to the current drive.
+            assert_eq!(
+                validate_shell_path("/pwsh.exe"),
+                Err(ShellPathError::NotAbsolute)
+            );
 
-        // Directory
-        assert_eq!(
-            validate_shell_path(r"C:\Windows"),
-            Err(ShellPathError::IsDirectory)
-        );
+            // Non-existent file
+            assert_eq!(
+                validate_shell_path(r"C:\Windows\System32\nonexistent_shell_98765.exe"),
+                Err(ShellPathError::NotFound)
+            );
 
-        // Non-executable extension
-        assert_eq!(
-            validate_shell_path(r"C:\Windows\System32\drivers\etc\hosts"),
-            Err(ShellPathError::NotExecutable)
-        );
+            // Directory
+            assert_eq!(
+                validate_shell_path(r"C:\Windows"),
+                Err(ShellPathError::IsDirectory)
+            );
 
-        // Valid system cmd.exe (always exists on Windows)
-        let valid = validate_shell_path(r"C:\Windows\System32\cmd.exe");
-        assert!(valid.is_ok(), "{valid:?}");
+            // Non-executable extension
+            assert_eq!(
+                validate_shell_path(r"C:\Windows\System32\drivers\etc\hosts"),
+                Err(ShellPathError::NotExecutable)
+            );
+
+            // Valid system cmd.exe (always exists on Windows)
+            let valid = validate_shell_path(r"C:\Windows\System32\cmd.exe");
+            assert!(valid.is_ok(), "{valid:?}");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // A root is absolute here, so a missing file is reported as such.
+            assert_eq!(
+                validate_shell_path("/pwsh.exe"),
+                Err(ShellPathError::NotFound)
+            );
+            assert_eq!(
+                validate_shell_path("/nonexistent_dir_98765/shell"),
+                Err(ShellPathError::NotFound)
+            );
+
+            // Directory
+            assert_eq!(validate_shell_path("/"), Err(ShellPathError::IsDirectory));
+
+            // A regular file without an execute bit
+            let dir = tempfile_dir("validate_shell_path_rules");
+            let plain = dir.join("not_executable");
+            fs::write(&plain, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+            let result = validate_shell_path(plain.to_str().unwrap());
+            let _ = fs::remove_dir_all(&dir);
+            assert_eq!(result, Err(ShellPathError::NotExecutable));
+
+            // Valid system shell (POSIX requires /bin/sh)
+            let valid = validate_shell_path("/bin/sh");
+            assert!(valid.is_ok(), "{valid:?}");
+        }
     }
 
     fn tempfile_dir(prefix: &str) -> std::path::PathBuf {

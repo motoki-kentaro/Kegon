@@ -85,7 +85,9 @@ fn path_from_decoded(decoded: &str) -> Result<PathBuf, CwdRejection> {
         && bytes[1].is_ascii_alphabetic()
         && bytes[2] == b':'
         && bytes.get(3).is_none_or(|b| *b == b'/');
-    if is_drive {
+    // Drive letters are a Windows convention. Elsewhere `C:\dir` would be a relative path, so
+    // `/C:/dir` stays the absolute path it literally names (RFC 8089).
+    if cfg!(windows) && is_drive {
         // `/C:` alone means the drive root.
         let mut path = decoded[1..].replace('/', "\\");
         if path.len() == 2 {
@@ -287,20 +289,52 @@ mod tests {
 
     const HOST: &str = "KEGON-PC";
 
+    /// The path a `file:///C:/…` report names here: a drive path on Windows, and the absolute
+    /// path `/C:/…` it literally is elsewhere.
+    fn drive(windows: &str, unix: &str) -> PathBuf {
+        PathBuf::from(if cfg!(windows) { windows } else { unix })
+    }
+
     #[test]
     fn parses_a_drive_path() {
         assert_eq!(
             parse_osc7_uri("file://KEGON-PC/C:/Users/me", HOST),
-            Ok(PathBuf::from("C:\\Users\\me"))
+            Ok(drive("C:\\Users\\me", "/C:/Users/me"))
         );
         assert_eq!(
             parse_osc7_uri("file:///d:/", HOST),
-            Ok(PathBuf::from("d:\\"))
+            Ok(drive("d:\\", "/d:/"))
         );
         assert_eq!(
             parse_osc7_uri("file://localhost/D:", HOST),
-            Ok(PathBuf::from("D:\\"))
+            Ok(drive("D:\\", "/D:"))
         );
+    }
+
+    #[test]
+    fn accepted_reports_are_always_absolute() {
+        for uri in [
+            "file://KEGON-PC/C:/Users/me",
+            "file:///d:/",
+            "file://localhost/D:",
+            "file:///home/me",
+            "file:///relative",
+        ] {
+            if let Ok(path) = parse_osc7_uri(uri, HOST) {
+                assert!(path.is_absolute(), "{uri:?} gave relative {path:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn parses_a_posix_path_outside_windows() {
+        let parsed = parse_osc7_uri("file://KEGON-PC/home/me/%E6%97%A5%E6%9C%AC", HOST);
+        if cfg!(windows) {
+            // No drive: not an absolute path on Windows.
+            assert_eq!(parsed, Err(CwdRejection::NotAbsolute));
+        } else {
+            assert_eq!(parsed, Ok(PathBuf::from("/home/me/日本")));
+        }
     }
 
     #[test]
@@ -310,7 +344,7 @@ mod tests {
                 "file://kegon-pc/E:/My%20Projects/%E6%97%A5%E6%9C%AC%E8%AA%9E",
                 HOST
             ),
-            Ok(PathBuf::from("E:\\My Projects\\日本語"))
+            Ok(drive("E:\\My Projects\\日本語", "/E:/My Projects/日本語"))
         );
     }
 
@@ -352,9 +386,16 @@ mod tests {
             "file:///C:/x#frag",
             "file:///C:/x%00y",
             "file:///C:/x%0Ay",
-            "file:///relative",
         ] {
             assert!(parse_osc7_uri(bad, HOST).is_err(), "accepted {bad:?}");
+        }
+        // `/relative` has no drive, so Windows has no absolute path for it; on Unix it is the
+        // absolute directory `/relative` (RFC 8089), not a relative one.
+        let rooted = parse_osc7_uri("file:///relative", HOST);
+        if cfg!(windows) {
+            assert_eq!(rooted, Err(CwdRejection::NotAbsolute));
+        } else {
+            assert_eq!(rooted, Ok(PathBuf::from("/relative")));
         }
     }
 
@@ -385,13 +426,13 @@ mod tests {
         let found = scan_all(&[
             b"out\x1b]7;file://KEGON-PC/C:/a\x1b\\more\x1b]7;file://KEGON-PC/C:/b\x07tail",
         ]);
-        assert_eq!(found, [PathBuf::from("C:\\a"), PathBuf::from("C:\\b")]);
+        assert_eq!(found, [drive("C:\\a", "/C:/a"), drive("C:\\b", "/C:/b")]);
     }
 
     #[test]
     fn scanner_handles_a_report_split_across_reads() {
         let found = scan_all(&[b"\x1b]7;file://KEGON-PC/C:/sp", b"lit%20dir\x1b", b"\\"]);
-        assert_eq!(found, [PathBuf::from("C:\\split dir")]);
+        assert_eq!(found, [drive("C:\\split dir", "/C:/split dir")]);
     }
 
     #[test]
@@ -426,7 +467,7 @@ mod tests {
     #[test]
     fn a_new_osc_after_an_interrupted_one_is_still_read() {
         let found = scan_all(&[b"\x1b]7;file://KEGON-PC/C:/a\x1b]7;file://KEGON-PC/C:/b\x07"]);
-        assert_eq!(found, [PathBuf::from("C:\\b")]);
+        assert_eq!(found, [drive("C:\\b", "/C:/b")]);
     }
 
     #[test]
@@ -442,7 +483,7 @@ mod tests {
         // Closing the overlong sequence reports nothing, and the next one works normally.
         assert!(scanner.scan(b"\x07").is_empty());
         let found = scanner.scan(b"\x1b]7;file://KEGON-PC/C:/ok\x07");
-        assert_eq!(found, [PathBuf::from("C:\\ok")]);
+        assert_eq!(found, [drive("C:\\ok", "/C:/ok")]);
     }
 
     #[test]

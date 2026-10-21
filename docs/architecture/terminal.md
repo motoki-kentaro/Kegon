@@ -291,6 +291,7 @@ How shells are made to report (`shell::Launch`), without touching profiles, exec
 | --- | --- |
 | PowerShell 7 / Windows PowerShell 5.1 | `-NoExit -EncodedCommand`: after the user's profile, wraps the existing `prompt` function and prepends an invisible OSC 7. Runs inside `try`/`catch`, so a failure leaves the shell as the profile made it. |
 | `cmd.exe` | Child-only `PROMPT` environment variable prefixed with an `OSC 9;9` sequence; an existing `PROMPT` is kept after it. |
+| bash / zsh / fish (Unix only, Issue #73) | A private per-session directory with hook scripts, loaded *after* the user's own startup files; see [Unix Shell Integration](#unix-shell-integration-issue-73). |
 | Anything else, or a shell started with custom arguments | Started exactly as before; no directory reports, so new tabs use the default directory. |
 
 Set `KEGON_SHELL_INTEGRATION=0` to disable it.
@@ -349,3 +350,28 @@ Kegon tracks the execution lifecycle of commands within shell sessions using sta
 - `alacritty_terminal` is licensed under **Apache-2.0**.
 - `arboard` is dual-licensed under **MIT OR Apache-2.0**.
 - Third-party notices and licenses are documented in `THIRD_PARTY_NOTICES.md`.
+
+## Unix Shell Integration (Issue #73)
+
+On Linux and macOS, bash, zsh and fish are integrated; every other shell (`sh`, `dash`, `pwsh`, unknown executables) is started plain and reports `Unsupported`. `Disabled` (the setting or `KEGON_SHELL_INTEGRATION=0`) always starts the shell exactly as the resolver chose. The same names on Windows (Git or MSYS builds) are never integrated.
+
+**Protocol.** The scripts speak the dialect PowerShell already uses, so the state machine, the registry and the Dopamine Mode are unchanged: `C` is `133;C;kegon.v=1;kegon.sid=<sid>;kegon.seq=<n>`, and `D` is `133;D;<exit code>;kegon.v=1;kegon.sid=<sid>;kegon.seq=<n>;kegon.ps=<success|failure>`. Unlike PowerShell, a Unix shell knows the exit code, so one `D` carries both the code and the correlated status (no separate `OSC 1337`). `A` (and `B`, except in fish) and `OSC 7` mark the prompt and the directory. A command line is one command (`seq`) however many commands it holds: `true; false` and pipelines yield one `C` and one `D` (the last command's status). An empty line yields no `C`/`D`. Ctrl+C ends the command with the shell's status (130), a failure.
+
+**Injection.** Nothing in `$HOME` is written. `unix_integration::prepare` creates `<XDG_RUNTIME_DIR or temp>/kegon-shell-<sid>` (mode 0700; `mkdir` fails on an existing name, even a symlink) with files created `create_new`, mode 0600, and the session owns the directory: it is removed when the session is dropped or the launch fails.
+
+| Shell | How the script is loaded | User files and hooks |
+| --- | --- | --- |
+| bash (non-login) | `--rcfile <dir>/bash.sh` | bash itself reads the system file first (`SYS_BASHRC`, `/etc/bash.bashrc` on Debian; checked with `--rcfile`: it still runs, exactly once), then the script sources `~/.bashrc` in place of the file `--rcfile` replaced. It prepends `__kegon_precmd` and appends `__kegon_arm` to `PROMPT_COMMAND` (array form on bash 5.1+), chains an existing `DEBUG` trap, and `__kegon_arm` adds the input-start mark to the *final* `PS1` (so a `PROMPT_COMMAND` that reassigns `PS1` cannot drop it). |
+| bash (login) | none | A login bash ignores `--rcfile`, and imitating a login shell would lose `shopt login_shell`, `logout` and `.bash_logout`. It is started exactly as the resolver chose (`-l`) and reports `Unsupported`; the user's login contract wins over the Dopamine Mode. (Possible later: bootstrap through an exported `PROMPT_COMMAND`, which keeps a true login but is lost silently if a startup file assigns `PROMPT_COMMAND`.) |
+| zsh | `ZDOTDIR=<dir>` with stand-in `.zshenv`, `.zprofile`, `.zshrc` | Each forwards to the user's file in their own `ZDOTDIR` (kept in `KEGON_USER_ZDOTDIR`), at top level so `typeset` stays global. After the user's `.zshrc` it appends to `preexec_functions` and installs `precmd_functions`, then gives `ZDOTDIR` back, so `.zlogin` and later shells read the user's files. zsh runs a function named `precmd` before `precmd_functions`, and what it runs replaces `$?`: if the user defined one, it is copied (`functions -c`) to `__kegon_user_precmd` and placed right behind our hook, which therefore reads the status first (same order, still one call). A `precmd` defined after startup cannot be recovered for that one command, which is then reported with an unknown status (never a success) and absorbed from then on. |
+| fish | `--init-command 'source "$KEGON_FISH_INIT"'` | fish runs it after `config.fish`. It uses `--on-event fish_preexec` / `fish_prompt` handlers, which coexist with the user's. `fish_prompt` is not wrapped (a wrapper cannot hand a multi-element `$pipestatus` on again), so the user's prompt and right prompt are untouched; the prompt mark `A` is printed by the handler and there is no input-start mark `B`. fish 4 prints its own, identity-less OSC 133 (`A`, `C`, `D`) beside Kegon's and fish 4.0.2 has no `fish_features` switch for it (`fish_features` is left alone), so for an integrated fish session the PTY tap drops the `C` / `D` that carry no `kegon.*` parameter; the native `A` is passed on (a second `PromptStarted` is harmless). Markers with any `kegon.*` parameter, however wrong, still reach the state machine. |
+
+Login: `ShellSpec.args` stays the only source. zsh and fish keep the resolver's `-l`; a login bash is not integrated at all; no adapter adds `-l` or touches `argv[0]`. Only no arguments, or exactly the resolver's `-l` with the login intent (zsh, fish), are integrated; any other argument leaves the shell plain (`Unsupported`).
+
+**Invariant.** `integration_launch == Injected` implies `integrated` and a `session_id`, equal to `KEGON_SESSION_ID` in the spec's environment. If the scripts cannot be written, the shell starts plain as `Unsupported`. The scripts copy the session id into a non-exported variable and `unset` the environment variable before any user file runs, so only this shell emits markers; as everywhere, the id is a correlation handle, not a secret.
+
+**Limits.**
+- bash counts a command line from the first `DEBUG` trap after the prompt. A `bind -x` handler or a `trap` that runs commands at the prompt can be taken for the command line; the cycle still yields one `C` and one `D`. If a tool replaces `PROMPT_COMMAND` after startup, or removes the trap, the shell stops reporting for that session. An exported `PROMPT_COMMAND` is inherited by child bash shells, where the hook functions do not exist.
+- The scripts are written for bash 3.2 (macOS `/bin/bash`) and later, zsh 5.1 (`printf -v`) and later, and fish with `--init-command` and `fish_prompt` events (3.0+). Only bash 5.2 (MSYS, on a Windows ConPTY and on pipes) has been run so far; zsh, fish and bash 3.2 are untested until the real-machine run (`cargo test --locked -- --ignored unix_shell`).
+- Ctrl+C of a running command is a failure with status 130; an abandoned line is not a command.
+- Child processes that print a hand-written `OSC 133` cannot be told apart at the byte level; without the matching `sid` and `seq` they never become a verified success (see the trust boundaries above).
