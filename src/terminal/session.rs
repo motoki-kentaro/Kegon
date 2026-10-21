@@ -1516,13 +1516,118 @@ mod tests {
 
     #[cfg(windows)]
     fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+        // PowerShell reports the long form of a directory even when it was started in its 8.3 short
+        // form (CI's TEMP is `C:\Users\RUNNER~1\...`), so resolve both sides first. A path that
+        // cannot be resolved is compared as written.
         let norm = |p: &std::path::Path| {
-            p.to_string_lossy()
+            let resolved = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            resolved
+                .to_string_lossy()
                 .trim_start_matches("\\\\?\\")
                 .trim_end_matches('\\')
                 .to_lowercase()
         };
         norm(a) == norm(b)
+    }
+
+    /// The 8.3 short form of an existing path, or `None` when the volume has no short name for it
+    /// (8.3 name creation can be disabled).
+    #[cfg(windows)]
+    fn short_path(path: &std::path::Path) -> Option<PathBuf> {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetShortPathNameW(long: *const u16, short: *mut u16, len: u32) -> u32;
+        }
+        let long: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: `long` is NUL-terminated; a null buffer of length 0 only asks for the size.
+        let needed = unsafe { GetShortPathNameW(long.as_ptr(), std::ptr::null_mut(), 0) };
+        if needed == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; needed as usize];
+        // SAFETY: `buf` holds `needed` units, which is what the call is told.
+        let written = unsafe { GetShortPathNameW(long.as_ptr(), buf.as_mut_ptr(), needed) };
+        if written == 0 || written >= needed {
+            return None;
+        }
+        buf.truncate(written as usize);
+        Some(PathBuf::from(std::ffi::OsString::from_wide(&buf)))
+    }
+
+    /// A short form that really differs from the long one, or `None` (with a note on stderr) when
+    /// this machine cannot produce one, in which case the 8.3 identity is not verified.
+    #[cfg(windows)]
+    fn distinct_short_path(dir: &std::path::Path) -> Option<PathBuf> {
+        match short_path(dir) {
+            Some(short)
+                if short.to_string_lossy().to_lowercase()
+                    != dir.to_string_lossy().to_lowercase() =>
+            {
+                Some(short)
+            }
+            _ => {
+                eprintln!("8.3 short names are unavailable here: short/long identity NOT verified");
+                None
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_dir_matches_the_short_and_long_forms_of_one_directory() {
+        let dir = scratch_dir("same-dir-short");
+        if let Some(short) = distinct_short_path(&dir) {
+            assert!(same_dir(&short, &dir), "{short:?} vs {dir:?}");
+            assert!(same_dir(&dir, &short), "{dir:?} vs {short:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_dir_tells_different_directories_apart() {
+        let a = scratch_dir("same-dir-a");
+        let b = scratch_dir("same-dir-b");
+        assert!(!same_dir(&a, &b));
+        assert!(!same_dir(&b, &a));
+        // The two names share a prefix, so their short forms differ only by the `~N` counter.
+        if let Some(short_a) = distinct_short_path(&a) {
+            assert!(!same_dir(&short_a, &b), "{short_a:?} vs {b:?}");
+            assert!(!same_dir(&b, &short_a), "{b:?} vs {short_a:?}");
+        }
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_dir_ignores_case_separator_and_verbatim_prefix_and_keeps_unicode() {
+        let dir = scratch_dir("same-dir-form");
+        let text = dir.to_string_lossy().to_string();
+        assert!(text.contains("日本語"));
+        assert!(same_dir(&dir, std::path::Path::new(&text.to_uppercase())));
+        assert!(same_dir(&dir, std::path::Path::new(&format!("{text}\\"))));
+        assert!(same_dir(
+            &dir,
+            std::path::Path::new(&format!("\\\\?\\{text}"))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_dir_compares_missing_paths_as_written() {
+        let missing = std::path::Path::new("C:\\kegon-no-such-dir\\日本語");
+        assert!(same_dir(
+            missing,
+            std::path::Path::new("c:\\KEGON-NO-SUCH-DIR\\日本語\\")
+        ));
+        assert!(!same_dir(
+            missing,
+            std::path::Path::new("C:\\kegon-no-such-dir\\other")
+        ));
     }
 
     /// Starts `program` with Shell Integration in `start`, moves it to `target` with `command`, and
