@@ -48,12 +48,29 @@ impl SystemClipboard {
     }
 }
 
+/// arboard 3.6.1 corrupts the heap on Windows (STATUS_HEAP_CORRUPTION) when two threads use the
+/// OS clipboard at once, so every test that touches it takes this lock first.
+#[cfg(test)]
+static OS_CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold the guard in the first local of the test: it is dropped last, after the clipboard.
+///
+/// A poisoned lock only means an earlier clipboard test already failed, and that failure is
+/// reported on its own, so the next test still runs instead of failing with a `PoisonError`.
+#[cfg(test)]
+pub(crate) fn lock_os_clipboard() -> std::sync::MutexGuard<'static, ()> {
+    OS_CLIPBOARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn clipboard_instantiates_without_panic() {
+        let _os_clipboard = lock_os_clipboard();
         let mut cb = SystemClipboard::new();
         // Accessing clipboard should not panic regardless of environment.
         let _ = cb.get_text();
@@ -61,6 +78,7 @@ mod tests {
 
     #[test]
     fn missing_backend_does_not_panic_and_retries() {
+        let _os_clipboard = lock_os_clipboard();
         let mut cb = SystemClipboard { clipboard: None };
         cb.set_text("");
         let _ = cb.get_text();

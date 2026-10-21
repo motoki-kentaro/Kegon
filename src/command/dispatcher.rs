@@ -84,6 +84,8 @@ mod tests {
 
     #[test]
     fn copy_or_interrupt_with_selection_copies_text() {
+        // Copying writes to the real OS clipboard; see `lock_os_clipboard`.
+        let _os_clipboard = crate::terminal::clipboard::lock_os_clipboard();
         let (tx, _rx) = unbounded();
         let session = TerminalSession::spawn(80, 24, 10, 20, tx).unwrap();
         {
