@@ -61,27 +61,34 @@ impl<P: EventedReadWrite> io::Read for TappedPty<P> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let read = io::Read::read(self.inner.reader(), buf)?;
         let events = self.scanner.scan(&buf[..read]);
-        let mut last_cwd = None;
-        for event in events {
-            match event {
-                OscEvent::WorkingDirectory(path) => {
-                    last_cwd = Some(path);
+        forward_events(events, &self.sink);
+        Ok(read)
+    }
+}
+
+/// Sends the events of one read in the order the PTY produced them.
+///
+/// Of consecutive working-directory reports only the last matters, and forwarding just that one
+/// keeps a flood of reports from flooding the event channel. A report that is pending when a shell
+/// integration marker follows is sent first, so `OSC 7` then `OSC 133;A` reach the receiver in
+/// that order; one still pending at the end of the read is sent last.
+fn forward_events(events: Vec<OscEvent>, sink: &EventSink) {
+    let mut pending_cwd = None;
+    for event in events {
+        match event {
+            OscEvent::WorkingDirectory(path) => {
+                pending_cwd = Some(path);
+            }
+            OscEvent::ShellIntegration(marker) => {
+                if let Some(path) = pending_cwd.take() {
+                    let _ = sink.unbounded_send(TerminalEvent::WorkingDirectory(path));
                 }
-                OscEvent::ShellIntegration(marker) => {
-                    let _ = self
-                        .sink
-                        .unbounded_send(TerminalEvent::ShellIntegration(marker));
-                }
+                let _ = sink.unbounded_send(TerminalEvent::ShellIntegration(marker));
             }
         }
-        // Only the last working directory report of a read matters: it supersedes the others,
-        // and forwarding just one keeps a flood of reports from flooding the event channel.
-        if let Some(path) = last_cwd {
-            let _ = self
-                .sink
-                .unbounded_send(TerminalEvent::WorkingDirectory(path));
-        }
-        Ok(read)
+    }
+    if let Some(path) = pending_cwd {
+        let _ = sink.unbounded_send(TerminalEvent::WorkingDirectory(path));
     }
 }
 
@@ -399,6 +406,10 @@ impl TerminalSession {
 
         let shell_program = launch.config.program.clone();
         let integration_launch = launch.integration_launch;
+        let mut scanner = OscScanner::new(local_host_name());
+        if launch.drops_unmarked_command_markers() {
+            scanner = scanner.dropping_unmarked_command_markers();
+        }
         let event_tx = event_tx.into();
 
         let env = prepare_child_env(launch.env, cfg!(unix));
@@ -425,7 +436,7 @@ impl TerminalSession {
         let child_pid = pty.child().id();
         let pty = TappedPty {
             inner: pty,
-            scanner: OscScanner::new(local_host_name()),
+            scanner,
             sink: event_tx.clone(),
         };
 
@@ -821,6 +832,92 @@ mod tests {
     use super::*;
     use iced::futures::channel::mpsc::unbounded;
     use iced::futures::{FutureExt, StreamExt};
+
+    /// An `OSC 7` report of a directory named `name` (under a drive root on Windows).
+    fn osc7(name: &str) -> Vec<u8> {
+        let root = if cfg!(windows) { "C:/" } else { "" };
+        format!("\x1b]7;file://KEGON-TEST-PC/{root}{name}\x07").into_bytes()
+    }
+
+    const A: &[u8] = b"\x1b]133;A\x07";
+    const B: &[u8] = b"\x1b]133;B\x07";
+
+    /// What the receiver sees of chunks of PTY output, as short labels in delivery order.
+    fn delivered(chunks: &[Vec<u8>]) -> Vec<String> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let sink = EventSink::from_fn(move |event| {
+            let label = match event {
+                TerminalEvent::WorkingDirectory(path) => {
+                    format!("cwd:{}", path.file_name().unwrap().to_string_lossy())
+                }
+                TerminalEvent::ShellIntegration(Osc133Marker::PromptStarted) => "A".to_string(),
+                TerminalEvent::ShellIntegration(Osc133Marker::InputStarted) => "B".to_string(),
+                other => format!("{other:?}"),
+            };
+            log.lock().unwrap().push(label);
+        });
+        let mut scanner = OscScanner::new("KEGON-TEST-PC".to_string());
+        for chunk in chunks {
+            forward_events(scanner.scan(chunk), &sink);
+        }
+        seen.lock().unwrap().clone()
+    }
+
+    fn joined(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    #[test]
+    fn osc7_before_prompt_mark_is_delivered_first() {
+        assert_eq!(delivered(&[joined(&[&osc7("tmp"), A])]), ["cwd:tmp", "A"]);
+    }
+
+    #[test]
+    fn osc7_after_prompt_mark_is_not_moved_ahead() {
+        assert_eq!(delivered(&[joined(&[A, &osc7("tmp")])]), ["A", "cwd:tmp"]);
+    }
+
+    #[test]
+    fn consecutive_osc7_reports_are_coalesced_to_the_last() {
+        assert_eq!(
+            delivered(&[joined(&[&osc7("a"), &osc7("b"), &osc7("c")])]),
+            ["cwd:c"]
+        );
+        assert_eq!(
+            delivered(&[joined(&[&osc7("a"), &osc7("b"), A, &osc7("c"), &osc7("d")])]),
+            ["cwd:b", "A", "cwd:d"]
+        );
+    }
+
+    #[test]
+    fn osc_order_survives_read_boundaries() {
+        // Split inside the sequences, and between a report and its prompt mark.
+        let report = osc7("tmp");
+        let (head, tail) = report.split_at(report.len() / 2);
+        assert_eq!(
+            delivered(&[
+                head.to_vec(),
+                tail.to_vec(),
+                A[..4].to_vec(),
+                A[4..].to_vec()
+            ]),
+            ["cwd:tmp", "A"]
+        );
+        assert_eq!(
+            delivered(&[report.clone(), joined(&[A, B])]),
+            ["cwd:tmp", "A", "B"]
+        );
+    }
+
+    #[test]
+    fn a_pending_osc7_is_still_sent_at_the_end_of_the_read() {
+        assert_eq!(
+            delivered(&[joined(&[A, B, &osc7("x")])]),
+            ["A", "B", "cwd:x"]
+        );
+        assert!(delivered(&[b"plain output".to_vec()]).is_empty());
+    }
 
     #[test]
     fn session_spawns_and_reports_initial_state() {

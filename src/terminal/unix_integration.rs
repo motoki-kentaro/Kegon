@@ -39,8 +39,6 @@ const FISH_INIT_COMMAND: &str = "source \"$KEGON_FISH_INIT\"";
 pub struct UserEnv {
     /// `ZDOTDIR` as the user has it, if set.
     pub zdotdir: Option<String>,
-    /// `fish_features` as the user has it, if set.
-    pub fish_features: Option<String>,
 }
 
 impl UserEnv {
@@ -48,7 +46,6 @@ impl UserEnv {
     pub fn from_process() -> Self {
         Self {
             zdotdir: std::env::var("ZDOTDIR").ok(),
-            fish_features: std::env::var("fish_features").ok(),
         }
     }
 }
@@ -176,17 +173,9 @@ pub fn prepare(
                 FISH_INIT_ENV.to_string(),
                 script.to_string_lossy().into_owned(),
             );
-            // fish 4 marks prompts with OSC 133 by itself; its markers carry no session identity
-            // and would be taken for a second, unverified integration.
-            env.insert(
-                "fish_features".to_string(),
-                match user.fish_features.as_deref().map(str::trim) {
-                    Some(features) if !features.is_empty() => {
-                        format!("{features},no-mark-prompt")
-                    }
-                    _ => "no-mark-prompt".to_string(),
-                },
-            );
+            // fish 4 marks prompts and commands with OSC 133 by itself, without an identity. Its
+            // `fish_features` has no switch for that in 4.0.2, so `fish_features` is left alone and
+            // the session drops fish's own C and D markers instead (`OscScanner`).
             let mut fish_args = args.to_vec();
             fish_args.push("--init-command".to_string());
             fish_args.push(FISH_INIT_COMMAND.to_string());
@@ -333,7 +322,6 @@ mod tests {
         let base = scratch("zsh");
         let user = UserEnv {
             zdotdir: Some("/home/me/.config/zsh".to_string()),
-            fish_features: None,
         };
         let login = prepare(
             ShellKind::Zsh,
@@ -359,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn fish_runs_a_fixed_init_command_and_turns_its_own_prompt_marks_off() {
+    fn fish_runs_a_fixed_init_command_and_leaves_fish_features_alone() {
         let base = scratch("fish");
         let fish = plan(ShellKind::Fish, &["-l"], true, &base).unwrap();
         assert_eq!(fish.args, ["-l", "--init-command", FISH_INIT_COMMAND]);
@@ -367,23 +355,8 @@ mod tests {
             fish.env[FISH_INIT_ENV],
             fish.files.path().join("kegon.fish").to_str().unwrap()
         );
-        assert_eq!(fish.env["fish_features"], "no-mark-prompt");
-
-        let user = UserEnv {
-            zdotdir: None,
-            fish_features: Some("qmark-noglob".to_string()),
-        };
-        let kept = prepare(
-            ShellKind::Fish,
-            &[],
-            false,
-            "host",
-            "kegon-1-def",
-            &user,
-            &base,
-        )
-        .unwrap();
-        assert_eq!(kept.env["fish_features"], "qmark-noglob,no-mark-prompt");
+        // The user's own `fish_features` reaches fish untouched: nothing is set or appended.
+        assert!(!fish.env.contains_key("fish_features"));
         fs::remove_dir_all(base).unwrap();
     }
 

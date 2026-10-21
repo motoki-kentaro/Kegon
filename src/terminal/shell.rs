@@ -381,6 +381,18 @@ pub struct ShellSpec {
 pub type Launch = ShellSpec;
 
 impl ShellSpec {
+    /// Whether the shell's own `OSC 133;C` / `D` (those without a `kegon.*` parameter) must be
+    /// kept away from the command state machine.
+    ///
+    /// Only for a fish that Kegon actually integrated, under a session identity: fish 4 prints
+    /// identity-less command markers by itself beside Kegon's own, which would turn Kegon's into a
+    /// duplicate. Every other shell and every launch without integration reports all markers.
+    pub fn drops_unmarked_command_markers(&self) -> bool {
+        self.kind == ShellKind::Fish
+            && self.integration_launch == ShellIntegrationLaunch::Injected
+            && self.session_id.is_some()
+    }
+
     /// Creates a ShellSpec directly (used by existing tests and callers).
     #[allow(dead_code)]
     pub fn new(
@@ -1949,6 +1961,57 @@ mod tests {
 
         let config_view = spec.config();
         assert_eq!(config_view.program, "pwsh.exe");
+    }
+
+    #[test]
+    fn only_an_injected_fish_with_an_identity_drops_unmarked_command_markers() {
+        let mut spec = ShellSpec::new(config("pwsh.exe"), true, "MY-PC", None);
+        let mut with = |kind, launch, sid: Option<&str>| {
+            spec.kind = kind;
+            spec.integration_launch = launch;
+            spec.session_id = sid.map(str::to_string);
+            spec.drops_unmarked_command_markers()
+        };
+        let injected = ShellIntegrationLaunch::Injected;
+        assert!(with(ShellKind::Fish, injected, Some("kegon-1-a")));
+        // Not injected, or no identity to expect: nothing is filtered.
+        assert!(!with(
+            ShellKind::Fish,
+            ShellIntegrationLaunch::Disabled,
+            None
+        ));
+        assert!(!with(
+            ShellKind::Fish,
+            ShellIntegrationLaunch::Unsupported,
+            None
+        ));
+        assert!(!with(ShellKind::Fish, injected, None));
+        // Other shells, injected or not.
+        for kind in [
+            ShellKind::Bash,
+            ShellKind::Zsh,
+            ShellKind::PowerShell,
+            ShellKind::Cmd,
+        ] {
+            assert!(!with(kind, injected, Some("kegon-1-a")), "{kind:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_unix_launches_drop_unmarked_markers_only_for_integrated_fish() {
+        let auto = ShellIntegrationMode::Auto;
+        let fish = unix_spec("/usr/bin/fish", &[], false, auto.clone());
+        assert_eq!(fish.integration_launch, ShellIntegrationLaunch::Injected);
+        assert!(fish.drops_unmarked_command_markers());
+        let login = unix_spec("/usr/bin/fish", &["-l"], true, auto.clone());
+        assert!(login.drops_unmarked_command_markers());
+        let disabled = unix_spec("/usr/bin/fish", &[], false, ShellIntegrationMode::Disabled);
+        assert!(!disabled.drops_unmarked_command_markers());
+        for shell in ["/bin/bash", "/usr/bin/zsh"] {
+            let spec = unix_spec(shell, &[], false, auto.clone());
+            assert!(!spec.drops_unmarked_command_markers(), "{shell}");
+        }
     }
 }
 

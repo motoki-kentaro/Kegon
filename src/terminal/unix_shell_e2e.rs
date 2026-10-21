@@ -242,22 +242,36 @@ impl Run {
         let mut outcome = Outcome::default();
         let deadline = Instant::now() + WAIT;
         while !done(&self.sm, &outcome) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.rx.recv_timeout(left) {
-                Ok(Seen::Marker(marker)) => match self.sm.transition(marker) {
-                    Some(VerifiedCommandEvent::CommandStarted { .. }) => outcome.started += 1,
-                    Some(VerifiedCommandEvent::PromptStarted) => outcome.prompts += 1,
-                    Some(VerifiedCommandEvent::CommandFinished {
-                        execution_result, ..
-                    }) => outcome.finished.push(execution_result),
-                    _ => {}
-                },
-                Ok(Seen::Directory(path)) => self.directories.push(path),
-                Ok(Seen::Exit(_)) => {}
-                Err(_) => panic!("timed out waiting for {what}; screen:\n{}", self.screen()),
-            }
+            self.absorb_next(what, deadline, &mut outcome);
         }
         outcome
+    }
+
+    /// Takes the next event off the channel (or panics at `deadline`) and applies it.
+    fn absorb_next(&mut self, what: &str, deadline: Instant, outcome: &mut Outcome) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match self.rx.recv_timeout(left) {
+            Ok(Seen::Marker(marker)) => match self.sm.transition(marker) {
+                Some(VerifiedCommandEvent::CommandStarted { .. }) => outcome.started += 1,
+                Some(VerifiedCommandEvent::PromptStarted) => outcome.prompts += 1,
+                Some(VerifiedCommandEvent::CommandFinished {
+                    execution_result, ..
+                }) => outcome.finished.push(execution_result),
+                _ => {}
+            },
+            Ok(Seen::Directory(path)) => self.directories.push(path),
+            Ok(Seen::Exit(_)) => {}
+            Err(_) => panic!("timed out waiting for {what}; screen:\n{}", self.screen()),
+        }
+    }
+
+    /// Waits, within the usual timeout, until a working directory report has arrived.
+    fn wait_for_directory(&mut self) {
+        let deadline = Instant::now() + WAIT;
+        let mut outcome = Outcome::default();
+        while self.directories.is_empty() {
+            self.absorb_next("the working directory report", deadline, &mut outcome);
+        }
     }
 
     fn wait_for_prompt(&mut self) {
@@ -331,6 +345,8 @@ fn assert_integration(name: &str, kind: ShellKind) {
     // First prompt: A and B arrive, the directory is reported, the user's own hook still runs.
     run.wait_for_prompt();
     run.wait_for_screen("USER_HOOK_RAN");
+    // The report is awaited on its own: the first prompt marker does not wait for it.
+    run.wait_for_directory();
     let reported = run
         .directories
         .last()
@@ -381,8 +397,12 @@ fn assert_integration(name: &str, kind: ShellKind) {
     run.wait_for_screen("E2E_ENV_VALUE");
 
     // Ctrl+C ends a long command with a failure, never a success.
-    run.session.write_input(b"sleep 30\r".to_vec());
+    // `C` is announced before the command is forked, so an interrupt sent on seeing it can beat the
+    // command into the foreground. The command says itself when it runs.
+    run.session
+        .write_input(b"sh -c 'printf \"KEGON_E2E_%s\\n\" RUNNING; exec sleep 30'\r".to_vec());
     run.pump_until("sleep to start", |sm, _| sm.is_executing());
+    run.wait_for_screen("KEGON_E2E_RUNNING");
     run.session.write_input(vec![0x03]);
     let interrupted = run.pump_until("the interrupted command", |_, o| !o.finished.is_empty());
     let result = interrupted.finished[0];
@@ -426,16 +446,56 @@ fn assert_disabled(name: &str, kind: ShellKind) {
     );
     assert_eq!(run.session.session_id(), None);
     assert!(run.scripts.is_none());
+    // Nothing of Kegon's reached the shell's environment.
+    run.session.write_input(
+        b"printenv KEGON_SESSION_ID KEGON_FISH_INIT KEGON_USER_ZDOTDIR fish_features \
+>/dev/null 2>&1 && echo ENVCHECK_LE\"\"AK || echo ENVCHECK_CLE\"\"AN\r"
+            .to_vec(),
+    );
+    run.wait_for_screen("ENVCHECK_CLEAN");
+    assert!(!run.screen().contains("ENVCHECK_LEAK"), "{}", run.screen());
     run.session
         .write_input(b"echo DISABLED_STILL_WORKS\r".to_vec());
     run.wait_for_screen("DISABLED_STILL_WORKS");
-    // A plain shell emits no markers at all.
+    run.session.write_input(b"true\r".to_vec());
     std::thread::sleep(Duration::from_millis(500));
+
+    let mut sm = CommandStateMachine::new();
+    sm.set_expected_session_id(None);
     while let Ok(seen) = run.rx.try_recv() {
+        let Seen::Marker(marker) = seen else { continue };
+        // Whatever the shell prints by itself carries no Kegon correlation metadata ...
         assert!(
-            !matches!(seen, Seen::Marker(_)),
-            "unexpected marker: {seen:?}"
+            matches!(
+                marker,
+                Osc133Marker::PromptStarted
+                    | Osc133Marker::InputStarted
+                    | Osc133Marker::CommandStarted
+                    | Osc133Marker::CommandFinished(_)
+            ),
+            "Kegon metadata from a shell Kegon did not inject: {marker:?}"
         );
+        // ... and bash and zsh print nothing at all. fish 4 marks its prompts by itself.
+        assert!(
+            kind == ShellKind::Fish,
+            "a plain {name} emitted a marker: {marker:?}"
+        );
+        // ... and never becomes a trusted success.
+        if let Some(VerifiedCommandEvent::CommandFinished {
+            execution_result, ..
+        }) = sm.transition(marker)
+        {
+            assert_ne!(
+                execution_result.shell_status,
+                ShellReportedStatus::Success,
+                "{execution_result:?}"
+            );
+            assert_ne!(
+                execution_result.correlation,
+                MetadataCorrelation::Matched,
+                "{execution_result:?}"
+            );
+        }
     }
 }
 
