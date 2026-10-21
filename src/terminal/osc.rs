@@ -1394,8 +1394,13 @@ mod tests {
                 OscEvent::ShellIntegration(Osc133Marker::InputStarted),
             ]
         );
+        // The URI path of an absolute directory: Windows needs a drive letter (`/tmp` is not an
+        // absolute path there, so the report is rightly rejected); elsewhere `/tmp` is fine.
+        let dir = if cfg!(windows) { "/C:/tmp" } else { "/tmp" };
         assert_eq!(
-            scanner.scan(b"\x1b]7;file://KEGON-TEST-PC/tmp\x07").len(),
+            scanner
+                .scan(format!("\x1b]7;file://{HOST}{dir}\x07").as_bytes())
+                .len(),
             1
         );
         let b64 = "a2Vnb24udj0xO2tlZ29uLnNpZD1hO2tlZ29uLnNlcT0x";
