@@ -5,7 +5,7 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb};
 use std::cell::RefCell;
 
 use iced::advanced::svg::{Handle as SvgHandle, Svg};
-use iced::alignment::{Horizontal, Vertical};
+use iced::alignment::Vertical;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Program, Text};
 use iced::{Color, Font, Point, Rectangle, Size, Theme};
@@ -158,6 +158,34 @@ pub fn resolve_cell_font(base_font: Font, flags: Flags) -> Font {
         cell_font.style = iced::font::Style::Italic;
     }
     cell_font
+}
+
+/// The [`Text`] every terminal text path draws with: a cell, the character under the cursor, and the
+/// IME preedit.
+///
+/// The alignment is deliberately `Alignment::Default`, never an explicit `Left`. With an explicit
+/// alignment iced's `text::align` skips the relayout a right-to-left line needs, and cosmic-text, laying
+/// the line out against the unbounded `max_width`, starts it at x = infinity: Hebrew and Arabic cells
+/// then draw nothing (#75). `Default` still puts left-to-right text at the left edge.
+fn terminal_text(
+    content: String,
+    position: Point,
+    color: Color,
+    font: Font,
+    metrics: &TerminalCellMetrics,
+) -> Text {
+    Text {
+        content,
+        position,
+        color,
+        size: metrics.font_size.into(),
+        font,
+        align_x: iced::advanced::text::Alignment::Default,
+        align_y: Vertical::Top,
+        line_height: iced::widget::text::LineHeight::Absolute(metrics.cell_height.into()),
+        shaping: iced::widget::text::Shaping::Advanced,
+        max_width: f32::INFINITY,
+    }
 }
 
 /// Paints the rectangles of a built-in glyph.
@@ -400,21 +428,7 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
                 } else {
                     let cell_font = resolve_cell_font(font, cell.flags);
 
-                    let text = Text {
-                        content: content_str,
-                        position: cell_pos,
-                        color: fg,
-                        size: metrics.font_size.into(),
-                        font: cell_font,
-                        align_x: Horizontal::Left.into(),
-                        align_y: Vertical::Top,
-                        line_height: iced::widget::text::LineHeight::Absolute(
-                            metrics.cell_height.into(),
-                        ),
-                        shaping: iced::widget::text::Shaping::Advanced,
-                        max_width: f32::INFINITY,
-                    };
-                    frame.fill_text(text);
+                    frame.fill_text(terminal_text(content_str, cell_pos, fg, cell_font, metrics));
                 }
             }
 
@@ -514,21 +528,13 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
             if let Some((content_str, cell_flags)) = cursor_cell_info {
                 let cell_font = resolve_cell_font(font, cell_flags);
 
-                let text = Text {
-                    content: content_str,
-                    position: cursor_pos,
-                    color: colors.background,
-                    size: metrics.font_size.into(),
-                    font: cell_font,
-                    align_x: Horizontal::Left.into(),
-                    align_y: Vertical::Top,
-                    line_height: iced::widget::text::LineHeight::Absolute(
-                        metrics.cell_height.into(),
-                    ),
-                    shaping: iced::widget::text::Shaping::Advanced,
-                    max_width: f32::INFINITY,
-                };
-                frame.fill_text(text);
+                frame.fill_text(terminal_text(
+                    content_str,
+                    cursor_pos,
+                    colors.background,
+                    cell_font,
+                    metrics,
+                ));
             }
         } else {
             let cursor_path = Path::rectangle(cursor_pos, Size::new(cursor_width, cursor_height));
@@ -555,19 +561,13 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
             );
 
             // Preedit text
-            let text = Text {
-                content: preedit.to_string(),
-                position: preedit_pos,
-                color: colors.preedit_foreground,
-                size: metrics.font_size.into(),
+            frame.fill_text(terminal_text(
+                preedit.to_string(),
+                preedit_pos,
+                colors.preedit_foreground,
                 font,
-                align_x: Horizontal::Left.into(),
-                align_y: Vertical::Top,
-                line_height: iced::widget::text::LineHeight::Absolute(metrics.cell_height.into()),
-                shaping: iced::widget::text::Shaping::Advanced,
-                max_width: f32::INFINITY,
-            };
-            frame.fill_text(text);
+                metrics,
+            ));
 
             // Preedit underline
             let line_path = Path::line(
@@ -853,5 +853,97 @@ mod tests {
         }
         assert!(builtin_for(true, '\u{2588}', true, &grid, 0, 0).is_none());
         assert!(builtin_for(true, '\u{2588}', false, &grid, 0, 0).is_some());
+    }
+
+    /// Lays out `text` the way iced does for a terminal [`Text`] (the cache's buffer setup and
+    /// `text::align`), and returns the x of every glyph, or `None` when there is no font to lay out with.
+    fn laid_out_glyph_xs(text: &Text) -> Option<Vec<f32>> {
+        use gtext::cosmic_text as ct;
+        use iced::advanced::graphics::text as gtext;
+
+        let mut fs = ct::FontSystem::new();
+        if fs.db().is_empty() {
+            return None;
+        }
+        let mut buffer = ct::Buffer::new(&mut fs, ct::Metrics::new(f32::from(text.size), 18.0));
+        buffer.set_size(&mut fs, Some(text.max_width), Some(f32::INFINITY.min(1e9)));
+        buffer.set_text(
+            &mut fs,
+            &text.content,
+            &gtext::to_attributes(text.font),
+            gtext::to_shaping(text.shaping, &text.content),
+            None,
+        );
+        gtext::align(&mut buffer, &mut fs, text.align_x);
+        Some(
+            buffer
+                .layout_runs()
+                .flat_map(|run| run.glyphs.iter().map(|g| g.x).collect::<Vec<_>>())
+                .collect(),
+        )
+    }
+
+    fn sample_text(content: &str) -> Text {
+        let metrics = TerminalCellMetrics::default();
+        terminal_text(
+            content.to_string(),
+            Point::ORIGIN,
+            Color::WHITE,
+            Font::MONOSPACE,
+            &metrics,
+        )
+    }
+
+    #[test]
+    fn terminal_text_never_pins_an_explicit_alignment() {
+        let text = sample_text("A");
+        assert_eq!(text.align_x, iced::advanced::text::Alignment::Default);
+        assert_eq!(text.max_width, f32::INFINITY);
+    }
+
+    #[test]
+    fn terminal_text_keeps_every_script_glyph_at_a_finite_x() {
+        let samples = [
+            ("ascii", "A"),
+            ("japanese", "日本語"),
+            ("armenian", "ԱԲԳ"),
+            ("hebrew single", "א"),
+            ("hebrew", "שלום"),
+            ("arabic single", "ا"),
+            ("arabic", "العربية"),
+            ("persian", "فارسی"),
+            ("thai", "สวัสดี"),
+            ("devanagari", "नमस्ते"),
+        ];
+        for (name, content) in samples {
+            let Some(xs) = laid_out_glyph_xs(&sample_text(content)) else {
+                eprintln!("no system fonts; layout check skipped");
+                return;
+            };
+            assert!(!xs.is_empty(), "{name}: no glyphs were laid out");
+            assert!(
+                xs.iter().all(|x| x.is_finite() && *x >= 0.0),
+                "{name}: glyph x must be finite, got {xs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_left_alignment_would_push_rtl_glyphs_to_infinity() {
+        // Documents the failure the helper avoids; if iced fixes it, this test can go.
+        let mut text = sample_text("שלום");
+        text.align_x = iced::advanced::text::Alignment::Left;
+        let Some(xs) = laid_out_glyph_xs(&text) else {
+            return;
+        };
+        assert!(xs.iter().any(|x| !x.is_finite()), "{xs:?}");
+    }
+
+    #[test]
+    fn left_to_right_text_starts_at_the_left_edge() {
+        let Some(xs) = laid_out_glyph_xs(&sample_text("A")) else {
+            return;
+        };
+        assert_eq!(xs, vec![0.0]);
     }
 }
