@@ -28,6 +28,8 @@ toml = "0.8"
 dirs = "5.0"
 # Cross-platform system font enumeration and font file/face metadata parsing
 fontdb = "0.23"
+# Unicode extended grapheme cluster boundaries for emoji render runs (see terminal::cluster).
+unicode-segmentation = "1.13"
 ttf-parser = "0.25"
 # Low-latency game-grade audio engine for Dopamine Mode
 kira = { version = "0.12.5", default-features = false, features = ["cpal"] }
