@@ -4,6 +4,7 @@
 //! `Alignment::Default` and `Shaping::Advanced` as `terminal::renderer::terminal_text`:
 //!   * `cell` rows: one `Text` per cell (what Kegon does today),
 //!   * `run`  rows: cells joined into one `Text` while the previous cell ends in U+200D.
+//!
 //! The grid is never altered; the faint vertical lines are cell boundaries, the red block is a cursor.
 //!
 //! `cargo run --example zwj_render -- <out.png> [scale]` renders, saves a screenshot, and exits.
