@@ -9,7 +9,8 @@
 //! A run is produced only when all of these hold:
 //!   * the Unicode extended grapheme cluster (UAX #29, `unicode-segmentation`) spans two or more
 //!     adjacent drawn cells and starts and ends exactly on cell boundaries;
-//!   * the cluster is an emoji sequence (every base is an emoji code point, no Regional Indicator);
+//!   * the cluster is an emoji sequence (every base is an emoji code point, no Regional Indicator) or
+//!     a flag: exactly two Regional Indicators (#82; see `ClusterRun::is_flag`);
 //!   * every character cell in it has the same foreground, background, selection state and text
 //!     attributes. Any mismatch leaves the cells to the ordinary per-cell path; colours are never merged.
 //!
@@ -99,6 +100,14 @@ pub struct ClusterRun {
     pub selected: bool,
 }
 
+impl ClusterRun {
+    /// Whether this run is a flag: exactly two Regional Indicators. A flag is told apart from the ZWJ and
+    /// skin-tone sequences by its text alone, so a renderer can give flags a font of their own.
+    pub fn is_flag(&self) -> bool {
+        is_flag_pair(&self.text)
+    }
+}
+
 /// Finds the multi-cell emoji sequences in one physical row. `row` must be in column order.
 pub fn detect_cluster_runs(row: &[ClusterCell]) -> Vec<ClusterRun> {
     let mut runs = Vec::new();
@@ -143,7 +152,7 @@ fn detect_in_chain(chain: &[&ClusterCell], runs: &mut Vec<ClusterRun>) {
             continue; // Starts or ends inside a cell.
         };
         let last = end_index - 1;
-        if first == last || !is_emoji_sequence(grapheme) {
+        if first == last || !(is_flag_pair(grapheme) || is_emoji_sequence(grapheme)) {
             continue;
         }
         let members = &chain[first..=last];
@@ -234,19 +243,53 @@ fn may_join(cell: &Cell) -> bool {
 
 /// Finds the runs of a whole screen. `cells` yields `(line, column, cell, selected)` in row-major
 /// order. Only rows with a joining character are converted, so ordinary text costs one cheap scan.
+///
+/// Flags are not reported: until a renderer can give them a colour font, a flag run would only draw its
+/// two letters closer together than the per-cell path does. See `detect_screen_runs_with_flags`.
 pub fn detect_screen_runs<'a>(
     cells: impl Iterator<Item = (i32, usize, &'a Cell, bool)>,
+) -> Vec<PositionedRun> {
+    detect_screen(cells, false)
+}
+
+/// As `detect_screen_runs`, and also reports the flag runs (`ClusterRun::is_flag`).
+pub fn detect_screen_runs_with_flags<'a>(
+    cells: impl Iterator<Item = (i32, usize, &'a Cell, bool)>,
+) -> Vec<PositionedRun> {
+    detect_screen(cells, true)
+}
+
+/// The runs a frame draws. With `flag_support` a flag is a run when the closure accepts its text (the
+/// pair can really be drawn in a flag font); a flag it rejects, and every flag without `flag_support`,
+/// is left to the per-cell path. ZWJ and skin-tone runs are the same either way.
+pub fn detect_frame_runs<'a>(
+    cells: impl Iterator<Item = (i32, usize, &'a Cell, bool)>,
+    flag_support: Option<&dyn Fn(&str) -> bool>,
+) -> Vec<PositionedRun> {
+    let Some(supported) = flag_support else {
+        return detect_screen_runs(cells);
+    };
+    let mut runs = detect_screen_runs_with_flags(cells);
+    runs.retain(|p| !p.run.is_flag() || supported(&p.run.text));
+    runs
+}
+
+fn detect_screen<'a>(
+    cells: impl Iterator<Item = (i32, usize, &'a Cell, bool)>,
+    flags: bool,
 ) -> Vec<PositionedRun> {
     fn flush(
         line: Option<i32>,
         row: &mut Vec<ClusterCell>,
         joins: bool,
+        flags: bool,
         out: &mut Vec<PositionedRun>,
     ) {
         if let (Some(line), true) = (line, joins) {
             out.extend(
                 detect_cluster_runs(row)
                     .into_iter()
+                    .filter(|run| flags || !run.is_flag())
                     .map(|run| PositionedRun { line, run }),
             );
         }
@@ -259,14 +302,14 @@ pub fn detect_screen_runs<'a>(
     let mut joins = false;
     for (line, col, cell, selected) in cells {
         if current != Some(line) {
-            flush(current, &mut row, joins, &mut out);
+            flush(current, &mut row, joins, flags, &mut out);
             current = Some(line);
             joins = false;
         }
-        joins |= may_join(cell);
+        joins |= may_join(cell) || (flags && is_regional_indicator(cell.c));
         row.push(ClusterCell::from_grid_cell(col, cell, selected));
     }
-    flush(current, &mut row, joins, &mut out);
+    flush(current, &mut row, joins, flags, &mut out);
     out
 }
 
@@ -288,6 +331,16 @@ fn is_emoji_sequence(grapheme: &str) -> bool {
         }
     }
     joined && bases > 0
+}
+
+/// Exactly two Regional Indicators: what UAX #29 makes of a national flag (`🇯🇵`). A longer RI string is
+/// cut into such pairs by the grapheme segmentation, and a lone RI is a single cell, never a run.
+fn is_flag_pair(grapheme: &str) -> bool {
+    let mut chars = grapheme.chars();
+    matches!(
+        (chars.next(), chars.next(), chars.next()),
+        (Some(a), Some(b), None) if is_regional_indicator(a) && is_regional_indicator(b)
+    )
 }
 
 fn is_skin_modifier(c: char) -> bool {
@@ -455,10 +508,124 @@ mod tests {
         assert_eq!(spans(&r), [(4, 8, TECH)]);
     }
 
+    const JP: &str = "🇯🇵";
+    const US: &str = "🇺🇸";
+    const GB: &str = "🇬🇧";
+    const DE: &str = "🇩🇪";
+    const RI_J: &str = "\u{1F1EF}";
+    const RI_P: &str = "\u{1F1F5}";
+
     #[test]
-    fn regional_indicator_flags_are_not_runs() {
-        assert!(runs(20, "🇯🇵").is_empty());
-        assert!(runs(20, "x🇯🇵🇺🇸y").is_empty());
+    fn flags_are_two_cell_runs() {
+        for flag in [JP, US, GB, DE] {
+            let r = runs(20, flag);
+            assert_eq!(spans(&r), [(0, 2, flag)], "{flag}");
+            assert!(r[0].is_flag());
+        }
+    }
+
+    #[test]
+    fn a_flag_keeps_the_following_text_at_its_column() {
+        let t = term(20, &format!("A{JP}B"));
+        let cells = row(&t, 0);
+        let r = detect_cluster_runs(&cells);
+        assert_eq!(spans(&r), [(1, 3, JP)]);
+        assert_eq!(cells[r[0].end_col].c, 'B');
+    }
+
+    #[test]
+    fn a_lone_regional_indicator_is_not_a_run() {
+        assert!(runs(20, RI_J).is_empty());
+        assert!(runs(20, &format!("A{RI_J}B")).is_empty());
+        assert!(runs(20, &format!("{RI_J} {RI_P}")).is_empty());
+    }
+
+    #[test]
+    fn regional_indicator_strings_are_paired_from_the_start() {
+        let ri = |n: usize| ["🇯", "🇵", "🇺", "🇸", "🇩"][..n].concat();
+        assert_eq!(spans(&runs(20, &ri(3))), [(0, 2, JP)]);
+        assert_eq!(spans(&runs(20, &ri(4))), [(0, 2, JP), (2, 4, US)]);
+        let five = runs(20, &ri(5));
+        assert_eq!(spans(&five), [(0, 2, JP), (2, 4, US)]);
+        assert!(five.iter().all(ClusterRun::is_flag));
+    }
+
+    #[test]
+    fn different_flags_in_a_row_stay_separate_runs() {
+        let r = runs(20, &format!("{JP}{US}{GB}"));
+        assert_eq!(spans(&r), [(0, 2, JP), (2, 4, US), (4, 6, GB)]);
+    }
+
+    #[test]
+    fn flags_beside_zwj_sequences_stay_separate_and_are_told_apart() {
+        let r = runs(30, &format!("{JP}{TECH}{US}"));
+        assert_eq!(spans(&r), [(0, 2, JP), (2, 6, TECH), (6, 8, US)]);
+        let kinds: Vec<_> = r.iter().map(ClusterRun::is_flag).collect();
+        assert_eq!(kinds, [true, false, true]);
+    }
+
+    #[test]
+    fn emoji_sequences_are_never_flags() {
+        for s in [FAMILY, TECH, ASTRONAUT, TECH_SKIN, RAINBOW, THUMBS_SKIN] {
+            let r = runs(30, s);
+            assert_eq!(r.len(), 1, "{s}");
+            assert!(!r[0].is_flag(), "{s}");
+        }
+    }
+
+    #[test]
+    fn a_regional_indicator_in_a_longer_cluster_is_not_a_flag() {
+        // A ZWJ joins the pair to a following emoji: one cluster of more than two code points.
+        let r = runs(30, &format!("{JP}\u{200D}👩"));
+        assert!(r.iter().all(|r| !r.is_flag()));
+    }
+
+    #[test]
+    fn flag_colour_attribute_and_background_mismatch_fall_back_to_cells() {
+        assert!(runs(20, "\x1b[38;2;255;0;0m🇯\x1b[38;2;0;255;0m🇵\x1b[0m").is_empty());
+        assert!(runs(20, "\x1b[41m🇯\x1b[42m🇵\x1b[0m").is_empty());
+        assert!(runs(20, "\x1b[1m🇯\x1b[0m🇵").is_empty());
+        assert!(runs(20, "🇯\x1b[4m🇵\x1b[0m").is_empty());
+        let uniform = runs(20, &format!("\x1b[38;2;1;2;3;48;2;4;5;6;1m{JP}\x1b[0m"));
+        assert_eq!(spans(&uniform), [(0, 2, JP)]);
+    }
+
+    #[test]
+    fn flag_selection_boundary_falls_back_but_a_whole_selection_stays_a_run() {
+        let mut cells = row(&term(20, JP), 0);
+        cells[1].selected = true;
+        assert!(detect_cluster_runs(&cells).is_empty());
+        cells[0].selected = true;
+        let r = detect_cluster_runs(&cells);
+        assert_eq!(spans(&r), [(0, 2, JP)]);
+        assert!(r[0].selected);
+    }
+
+    #[test]
+    fn a_flag_at_the_row_end_is_a_run_and_a_wrapped_one_is_not() {
+        assert_eq!(spans(&runs(4, &format!("ab{JP}"))), [(2, 4, JP)]);
+        // The first indicator ends row 0 and the second starts row 1: never joined across rows.
+        let t = term(3, &format!("ab{JP}"));
+        assert!(detect_cluster_runs(&row(&t, 0)).is_empty());
+        assert!(detect_cluster_runs(&row(&t, 1)).is_empty());
+        assert!(screen_runs_with_flags(&t, |_| false).is_empty());
+    }
+
+    #[test]
+    fn flags_do_not_change_the_grid_or_the_copy_text() {
+        let t = term(20, &format!("A{JP}B"));
+        let cell = &t.grid()[Point::new(Line(0), Column(1))];
+        assert_eq!((cell.c, cell.zerowidth()), ('\u{1F1EF}', None));
+        assert!(!cell.flags.contains(Flags::WIDE_CHAR));
+        let start = Point::new(Line(0), Column(0));
+        let end = Point::new(Line(0), Column(3));
+        assert_eq!(t.bounds_to_string(start, end), format!("A{JP}B"));
+    }
+
+    #[test]
+    fn rtl_text_beside_a_flag_is_left_alone() {
+        let r = runs(30, &format!("שלום {JP} مرحبا"));
+        assert_eq!(spans(&r), [(5, 7, JP)]);
     }
 
     #[test]
@@ -587,6 +754,17 @@ mod tests {
         )
     }
 
+    fn screen_runs_with_flags(
+        t: &Term<Quiet>,
+        selected: impl Fn(Point) -> bool,
+    ) -> Vec<PositionedRun> {
+        detect_screen_runs_with_flags(
+            t.grid()
+                .display_iter()
+                .map(|c| (c.point.line.0, c.point.column.0, c.cell, selected(c.point))),
+        )
+    }
+
     fn roles(t: &Term<Quiet>, runs: &[PositionedRun], line: i32) -> Vec<&'static str> {
         let mut lookup = RunLookup::new(runs);
         // Earlier lines are swept first, as `display_iter` does.
@@ -674,5 +852,112 @@ mod tests {
             .map(|p| (p.line, p.run.start_col, p.run.end_col))
             .collect();
         assert_eq!(at, [(1, 0, 6)]);
+    }
+
+    #[test]
+    fn the_renderer_entry_point_still_ignores_flags() {
+        let t = term(30, &format!("A{JP}B {TECH} {US}"));
+        let plain = screen_runs(&t, |_| false);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].run.text, TECH);
+        let all = screen_runs_with_flags(&t, |_| false);
+        let texts: Vec<_> = all.iter().map(|p| p.run.text.as_str()).collect();
+        assert_eq!(texts, [JP, TECH, US]);
+    }
+
+    #[test]
+    fn a_flag_is_found_from_either_of_its_cells() {
+        let t = term(14, &format!("A{JP}B"));
+        let runs = screen_runs_with_flags(&t, |_| false);
+        assert_eq!(
+            roles(&t, &runs, 0)[..4],
+            ["plain", "start", "member", "plain"]
+        );
+        for col in 1..3 {
+            let run = run_covering(&runs, 0, col).expect("covered");
+            assert_eq!(run.text, JP);
+            assert!(run.is_flag());
+        }
+        assert!(run_covering(&runs, 0, 0).is_none());
+        assert!(run_covering(&runs, 0, 3).is_none());
+    }
+
+    #[test]
+    fn flag_selection_at_screen_level_follows_the_same_rule() {
+        let t = term(14, &format!("A{JP}B"));
+        assert!(screen_runs_with_flags(&t, |p| p.column.0 == 2).is_empty());
+        let whole = screen_runs_with_flags(&t, |p| (1..3).contains(&p.column.0));
+        assert_eq!(whole.len(), 1);
+    }
+
+    fn frame_runs(
+        t: &Term<Quiet>,
+        flag_support: Option<&dyn Fn(&str) -> bool>,
+    ) -> Vec<PositionedRun> {
+        detect_frame_runs(
+            t.grid()
+                .display_iter()
+                .map(|c| (c.point.line.0, c.point.column.0, c.cell, false)),
+            flag_support,
+        )
+    }
+
+    fn texts(runs: &[PositionedRun]) -> Vec<&str> {
+        runs.iter().map(|p| p.run.text.as_str()).collect()
+    }
+
+    #[test]
+    fn frame_runs_without_flag_support_leave_every_flag_to_the_cells() {
+        let t = term(40, &format!("A{JP}B {TECH} {US}{GB}"));
+        assert_eq!(texts(&frame_runs(&t, None)), [TECH]);
+    }
+
+    #[test]
+    fn frame_runs_with_flag_support_draw_each_pair_as_its_own_run() {
+        let t = term(40, &format!("A{JP}B {TECH} {US}{GB}"));
+        let all = |_: &str| true;
+        assert_eq!(texts(&frame_runs(&t, Some(&all))), [JP, TECH, US, GB]);
+    }
+
+    #[test]
+    fn frame_runs_drop_only_the_flags_the_font_cannot_draw() {
+        let t = term(40, &format!("{JP}{US} {TECH} {GB}"));
+        let not_us = |text: &str| text != US;
+        let r = frame_runs(&t, Some(&not_us));
+        assert_eq!(texts(&r), [JP, TECH, GB]);
+        // The rejected flag's cells are plain again, and the ones beside it keep their roles.
+        assert_eq!(roles(&t, &r, 0)[..4], ["start", "member", "plain", "plain"]);
+    }
+
+    #[test]
+    fn frame_runs_leave_zwj_and_skin_runs_alone_whatever_the_flag_font_says() {
+        let t = term(60, &format!("{FAMILY} {TECH} {TECH_SKIN} {THUMBS_SKIN}"));
+        let none = |_: &str| false;
+        let all = |_: &str| true;
+        let expected = [FAMILY, TECH, TECH_SKIN, THUMBS_SKIN];
+        assert_eq!(texts(&frame_runs(&t, None)), expected);
+        assert_eq!(texts(&frame_runs(&t, Some(&none))), expected);
+        assert_eq!(texts(&frame_runs(&t, Some(&all))), expected);
+    }
+
+    #[test]
+    fn frame_flag_runs_follow_the_selection_rule() {
+        let t = term(14, &format!("A{JP}B"));
+        let all = |_: &str| true;
+        let detect = |sel: fn(usize) -> bool| {
+            detect_frame_runs(
+                t.grid().display_iter().map(|c| {
+                    (
+                        c.point.line.0,
+                        c.point.column.0,
+                        c.cell,
+                        sel(c.point.column.0),
+                    )
+                }),
+                Some(&all),
+            )
+        };
+        assert!(detect(|c| c == 2).is_empty());
+        assert_eq!(detect(|c| (1..3).contains(&c)).len(), 1);
     }
 }

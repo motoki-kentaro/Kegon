@@ -10,6 +10,7 @@ pub mod clipboard;
 pub mod cluster;
 pub mod cwd;
 pub mod dopamine;
+pub mod flag_font;
 pub mod glyph;
 pub mod input;
 pub mod input_event;
