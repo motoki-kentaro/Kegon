@@ -7,6 +7,7 @@
 
 pub mod arbitration;
 pub mod clipboard;
+pub mod cluster;
 pub mod cwd;
 pub mod dopamine;
 pub mod glyph;

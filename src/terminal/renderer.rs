@@ -11,6 +11,7 @@ use iced::widget::canvas::{self, Frame, Geometry, Path, Program, Text};
 use iced::{Color, Font, Point, Rectangle, Size, Theme};
 
 use crate::font::{TerminalCellMetrics, TerminalFontConfig};
+use crate::terminal::cluster::{CellRole, RunLookup, detect_screen_runs, run_covering};
 use crate::terminal::glyph::{self, CellGrid};
 use crate::terminal::session::TerminalSession;
 use crate::terminal::tile_cache::TileCache;
@@ -362,6 +363,17 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         let content = term.renderable_content();
         let cursor_point = content.cursor.point;
         let mut cursor_cell_info: Option<(String, Flags)> = None;
+        // Where the cursor character is redrawn from: the run start when the cursor is inside a run.
+        let mut cursor_text_origin: Option<Point> = None;
+
+        // Emoji sequences the grid spreads over several cells are drawn as one `Text` from their first
+        // cell (#74). Detection is render-only; the grid and the logical cursor are never touched.
+        let selection = content.selection;
+        let runs = detect_screen_runs(term.grid().display_iter().map(|c| {
+            let selected = selection.is_some_and(|r| r.contains(c.point));
+            (c.point.line.0, c.point.column.0, c.cell, selected)
+        }));
+        let mut run_lookup = RunLookup::new(&runs);
 
         // 1. Draw Cell Backgrounds, Characters, and Text Line Attributes
         for cell in content.display_iter {
@@ -399,9 +411,27 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
             let is_wide_spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
             let is_hidden = cell.flags.contains(Flags::HIDDEN);
+            let run_role = run_lookup.role(line_index, cell.point.column.0);
 
-            // Draw character text unless wide char spacer or hidden
-            if !is_wide_spacer && !is_hidden && cell.c != ' ' && cell.c != '\0' {
+            // Draw character text unless wide char spacer or hidden. A later cell of a run has no text
+            // of its own: the run's first cell drew all of it.
+            if let CellRole::Start(run) = run_role
+                && !is_wide_spacer
+                && !is_hidden
+            {
+                frame.fill_text(terminal_text(
+                    run.text.clone(),
+                    cell_pos,
+                    fg,
+                    resolve_cell_font(font, run.flags),
+                    metrics,
+                ));
+            } else if matches!(run_role, CellRole::Plain)
+                && !is_wide_spacer
+                && !is_hidden
+                && cell.c != ' '
+                && cell.c != '\0'
+            {
                 let mut content_str = cell.c.to_string();
                 if let Some(zw) = cell.zerowidth() {
                     for &c in zw {
@@ -479,6 +509,18 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
             }
         }
 
+        // A cursor inside a run keeps the run whole: its background is the logical cell, and the run's
+        // text is redrawn once from the run start, exactly as a single cell's character is.
+        if let Some(run) = run_covering(&runs, cursor_point.line.0, cursor_point.column.0)
+            && !run.flags.contains(Flags::HIDDEN)
+        {
+            cursor_cell_info = Some((run.text.clone(), run.flags));
+            cursor_text_origin = Some(Point::new(
+                run.start_col as f32 * metrics.cell_width,
+                cursor_point.line.0 as f32 * metrics.cell_height,
+            ));
+        }
+
         // 2. Draw Terminal Cursor & Cursor Character
         let cursor_pos = Point::new(
             cursor_point.column.0 as f32 * metrics.cell_width,
@@ -530,7 +572,7 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
                 frame.fill_text(terminal_text(
                     content_str,
-                    cursor_pos,
+                    cursor_text_origin.unwrap_or(cursor_pos),
                     colors.background,
                     cell_font,
                     metrics,
