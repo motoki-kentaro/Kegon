@@ -11,7 +11,8 @@ use iced::widget::canvas::{self, Frame, Geometry, Path, Program, Text};
 use iced::{Color, Font, Point, Rectangle, Size, Theme};
 
 use crate::font::{TerminalCellMetrics, TerminalFontConfig};
-use crate::terminal::cluster::{CellRole, RunLookup, detect_screen_runs, run_covering};
+use crate::terminal::cluster::{CellRole, ClusterRun, RunLookup, detect_frame_runs, run_covering};
+use crate::terminal::flag_font;
 use crate::terminal::glyph::{self, CellGrid};
 use crate::terminal::session::TerminalSession;
 use crate::terminal::tile_cache::TileCache;
@@ -159,6 +160,15 @@ pub fn resolve_cell_font(base_font: Font, flags: Flags) -> Font {
         cell_font.style = iced::font::Style::Italic;
     }
     cell_font
+}
+
+/// The font a run is drawn with: a flag always with the flag font, any other run as a cell is.
+fn run_font(base_font: Font, run: &ClusterRun) -> Font {
+    if run.is_flag() {
+        flag_font::font()
+    } else {
+        resolve_cell_font(base_font, run.flags)
+    }
 }
 
 /// The [`Text`] every terminal text path draws with: a cell, the character under the cursor, and the
@@ -365,14 +375,21 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
         let mut cursor_cell_info: Option<(String, Flags)> = None;
         // Where the cursor character is redrawn from: the run start when the cursor is inside a run.
         let mut cursor_text_origin: Option<Point> = None;
+        let mut cursor_run_font: Option<Font> = None;
 
         // Emoji sequences the grid spreads over several cells are drawn as one `Text` from their first
         // cell (#74). Detection is render-only; the grid and the logical cursor are never touched.
         let selection = content.selection;
-        let runs = detect_screen_runs(term.grid().display_iter().map(|c| {
-            let selected = selection.is_some_and(|r| r.contains(c.point));
-            (c.point.line.0, c.point.column.0, c.cell, selected)
-        }));
+        // Flags join them only when the flag font can draw them (#82); otherwise they stay per cell.
+        let flag_support: Option<&dyn Fn(&str) -> bool> =
+            flag_font::supports_flags().then_some(&flag_font::supports_flag);
+        let runs = detect_frame_runs(
+            term.grid().display_iter().map(|c| {
+                let selected = selection.is_some_and(|r| r.contains(c.point));
+                (c.point.line.0, c.point.column.0, c.cell, selected)
+            }),
+            flag_support,
+        );
         let mut run_lookup = RunLookup::new(&runs);
 
         // 1. Draw Cell Backgrounds, Characters, and Text Line Attributes
@@ -423,7 +440,7 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
                     run.text.clone(),
                     cell_pos,
                     fg,
-                    resolve_cell_font(font, run.flags),
+                    run_font(font, run),
                     metrics,
                 ));
             } else if matches!(run_role, CellRole::Plain)
@@ -515,6 +532,7 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
             && !run.flags.contains(Flags::HIDDEN)
         {
             cursor_cell_info = Some((run.text.clone(), run.flags));
+            cursor_run_font = Some(run_font(font, run));
             cursor_text_origin = Some(Point::new(
                 run.start_col as f32 * metrics.cell_width,
                 cursor_point.line.0 as f32 * metrics.cell_height,
@@ -568,7 +586,8 @@ impl<'a, Message> Program<Message> for TerminalProgram<'a> {
 
             // Re-render character under focused block cursor using contrasting background color
             if let Some((content_str, cell_flags)) = cursor_cell_info {
-                let cell_font = resolve_cell_font(font, cell_flags);
+                let cell_font =
+                    cursor_run_font.unwrap_or_else(|| resolve_cell_font(font, cell_flags));
 
                 frame.fill_text(terminal_text(
                     content_str,
@@ -849,6 +868,43 @@ mod tests {
         let font_bold_italic = resolve_cell_font(base, Flags::BOLD | Flags::ITALIC);
         assert_eq!(font_bold_italic.weight, iced::font::Weight::Bold);
         assert_eq!(font_bold_italic.style, iced::font::Style::Italic);
+    }
+
+    fn run(text: &str, flags: Flags) -> ClusterRun {
+        ClusterRun {
+            start_col: 0,
+            end_col: 2,
+            text: text.to_string(),
+            fg: AnsiColor::Named(NamedColor::Foreground),
+            bg: AnsiColor::Named(NamedColor::Background),
+            flags,
+            selected: false,
+        }
+    }
+
+    #[test]
+    fn a_flag_run_is_drawn_with_the_flag_font_whatever_the_cell_attributes() {
+        let flag = run("\u{1F1EF}\u{1F1F5}", Flags::empty());
+        assert_eq!(run_font(Font::MONOSPACE, &flag), flag_font::font());
+        let bold = run("\u{1F1EF}\u{1F1F5}", Flags::BOLD | Flags::ITALIC);
+        assert_eq!(run_font(Font::MONOSPACE, &bold), flag_font::font());
+    }
+
+    #[test]
+    fn other_runs_keep_the_cell_font() {
+        for (text, flags) in [
+            ("👨\u{200D}👩\u{200D}👧\u{200D}👦", Flags::empty()),
+            ("👩\u{200D}💻", Flags::BOLD),
+            ("👍\u{1F3FD}", Flags::ITALIC),
+        ] {
+            let r = run(text, flags);
+            assert_eq!(
+                run_font(Font::MONOSPACE, &r),
+                resolve_cell_font(Font::MONOSPACE, flags),
+                "{text}"
+            );
+            assert_ne!(run_font(Font::MONOSPACE, &r), flag_font::font());
+        }
     }
 
     fn grid() -> CellGrid {
